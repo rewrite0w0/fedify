@@ -2,6 +2,7 @@ import fetchMock from "fetch-mock";
 import { deepStrictEqual, ok, rejects } from "node:assert";
 import { test } from "node:test";
 import preloadedContexts from "./contexts.ts";
+import cidV1Context from "./contexts/cid-v1.json" with { type: "json" };
 import { getDocumentLoader, getRemoteDocument } from "./docloader.ts";
 import { FetchError } from "./request.ts";
 import { UrlError } from "./url.ts";
@@ -387,6 +388,46 @@ test("getDocumentLoader()", async (t) => {
         document,
       });
     }
+  });
+
+  // Controlled Identifiers v1.0 requires JSON-LD processors to treat this
+  // context URL as already resolved.  A temporary W3C outage must not prevent
+  // an otherwise valid document from being processed.
+  // See: https://www.w3.org/TR/cid-1.0/#json-ld-context
+  //      https://github.com/fedify-dev/fedify/issues/932
+  fetchMock.get("https://www.w3.org/ns/cid/v1", { status: 503 });
+  await t.test("preloaded CID v1 context", async () => {
+    const url = "https://www.w3.org/ns/cid/v1";
+    deepStrictEqual(await fetchDocumentLoader(url), {
+      contextUrl: null,
+      documentUrl: url,
+      document: cidV1Context,
+    });
+  });
+
+  // The <https://w3id.org/fep/ef61> URL redirects to a Codeberg Pages host
+  // which suffers recurring outages; while it is unreachable, expanding any
+  // document referencing it fails before application handlers run.  It has to
+  // be resolved from the built-in copy rather than over the network.
+  // See: https://github.com/fedify-dev/fedify/issues/982
+  await t.test("preloaded FEP-ef61 context", async () => {
+    const url = "https://w3id.org/fep/ef61";
+    ok(url in preloadedContexts);
+    deepStrictEqual(await fetchDocumentLoader(url), {
+      contextUrl: null,
+      documentUrl: url,
+      document: {
+        "@context": {
+          gateways: {
+            "@id": "https://w3id.org/fep/ef61/gateways",
+            "@type": "@id",
+            "@container": "@list",
+          },
+          digestMultibase:
+            "https://www.w3.org/ns/credentials/v2#digestMultibase",
+        },
+      },
+    });
   });
 
   await t.test("deny non-HTTP/HTTPS", async () => {

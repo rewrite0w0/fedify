@@ -5,6 +5,7 @@
 import activitystreams from "./contexts/activitystreams.json" with {
   type: "json",
 };
+import cidV1Context from "./contexts/cid-v1.json" with { type: "json" };
 import didV1 from "./contexts/did-v1.json" with { type: "json" };
 import fep5711 from "./contexts/fep-5711.json" with { type: "json" };
 import fep7aa9 from "./contexts/fep-7aa9.json" with { type: "json" };
@@ -39,6 +40,22 @@ const preloadedContexts: Record<string, unknown> = {
   "https://gotosocial.org/ns": gotosocial,
   "https://w3id.org/fep/5711": fep5711,
   "https://w3id.org/fep/7aa9": fep7aa9,
+
+  // Controlled Identifiers v1.0 requires JSON-LD processors to treat this
+  // context URL as already resolved.  We ship the official W3C context so that
+  // controlled identifier documents can be processed without depending on the
+  // availability of the remote context server.
+  // See: https://www.w3.org/TR/cid-1.0/#json-ld-context
+  //      https://github.com/fedify-dev/fedify/issues/932
+  "https://www.w3.org/ns/cid/v1": cidV1Context,
+
+  // The FEP-ef61 context.  The w3id.org URL redirects to Codeberg Pages, which
+  // suffers recurring outages; while it is unreachable, every document
+  // referencing this URL fails JSON-LD expansion before application handlers
+  // run.  We ship a built-in copy so that portable objects can be processed
+  // without depending on the availability of the remote context server.
+  // See: https://w3id.org/fep/ef61
+  //      https://github.com/fedify-dev/fedify/issues/982
   "https://w3id.org/fep/ef61": fepEf61,
 
   // Lemmy's context document is served as application/json without the JSON-LD
