@@ -12,7 +12,7 @@ experimental = true
 
 [tools]
 bun = "1.2.22"
-deno = "2.8.3"
+deno = "2.9.5"
 node = "22"
 pnpm = "10.28.0"
 "aqua:dahlia/hongdown" = "0.5.3"
@@ -67,8 +67,8 @@ run = "deno run --allow-read --allow-env --allow-run --allow-write scripts/insta
 # Install Node.js dependencies with pnpm.  pnpm's root `prepare` lifecycle
 # script builds all packages, so this also produces the initial dist/ output.
 # Depend on `deno-cache` (which depends on `codegen`) so the providers run
-# serially (codegen, then the Deno pre-cache, then pnpm install) instead of pnpm
-# racing codegen over node_modules under Deno's `nodeModulesDir: auto`.
+# serially (codegen, then the Deno pre-cache, then pnpm install).  This ensures
+# generated sources exist before pnpm's prepare lifecycle builds the packages.
 #
 # This is a custom provider (not named `pnpm`, which is a reserved built-in
 # provider whose freshness only watches the root package.json and lockfile) so
@@ -272,8 +272,11 @@ description = "Run the test suite using Node.js"
 depends = ["build"]
 # See the note on `build`: Nushell keeps the single-quoted pnpm filter working
 # on Windows, where `cmd` would otherwise pass it through literally.
+# Keep package-level concurrency bounded because each `node --test` command
+# also starts test workers.  Running every package at once can exhaust CI
+# runner resources and make timing-sensitive tests fail under contention.
 shell = "nu -c"
-run = "pnpm run --recursive --parallel --filter '!{docs}' --config.enable-pre-post-scripts=false test"
+run = "pnpm run --recursive --parallel --workspace-concurrency=4 --filter '!{docs}' --config.enable-pre-post-scripts=false test"
 
 [tasks."test:bun"]
 description = "Run the test suite using Bun"
