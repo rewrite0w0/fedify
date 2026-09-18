@@ -10,6 +10,25 @@ To be released.
 
 ### @fedify/fedify
 
+ -  Changed cached actor public keys and remembered per-origin HTTP Message
+    Signatures specs to expire, so a `KvStore` that never sees an explicit
+    clear no longer accumulates entries for actors and origins that have
+    stopped federating.  Keys expire after 30 days and specs after 90 days
+    by default, and both windows are configurable through the new
+    `FederationOptions.publicKeyTtl` and
+    `FederationOptions.httpMessageSignaturesSpecTtl` options.
+    [[#1017], [#1027] by Heewon Chae\]
+
+     -  Shortening a window trades storage for remote requests: an expired
+        key has to be refetched before the next signature verification, and
+        an expired spec has to be relearned by double-knocking on the next
+        delivery.  Refetching fails while the peer is unavailable, so a very
+        short window makes verification depend on the peer being reachable.
+     -  Entries written by earlier versions of Fedify have no expiry and are
+        left as they are; they gain one the next time they are written.  See
+        the new *Clearing legacy cache entries* section of the
+        [key–value store guide] to clear them proactively instead of waiting.
+
  -  Fixed `verifyProof()` so Ed25519 JCS proofs authenticate every received
     proof option except `proofValue`, including `expires`, `domain`,
     `challenge`, `nonce`, and extension options.  It now rejects expired or
@@ -108,6 +127,7 @@ To be released.
     `esnext.temporal` lib reference.
     [[#823], [#925]]
 
+[key–value store guide]: https://fedify.dev/manual/kv
 [FEP-ef61]: https://w3id.org/fep/ef61
 [FEP-8b32]: https://w3id.org/fep/8b32
 [FEP-fe34]: https://w3id.org/fep/fe34
@@ -133,6 +153,8 @@ To be released.
 [#930]: https://github.com/fedify-dev/fedify/issues/930
 [#934]: https://github.com/fedify-dev/fedify/pull/934
 [#968]: https://github.com/fedify-dev/fedify/pull/968
+[#1017]: https://github.com/fedify-dev/fedify/issues/1017
+[#1027]: https://github.com/fedify-dev/fedify/pull/1027
 
 ### @fedify/astro
 
@@ -250,6 +272,10 @@ To be released.
 
 ### @fedify/netlify
 
+ -  Added `NetlifyBlobsKvStore`, a Netlify Blobs-backed key–value store with
+    expiration, prefix listing, and atomic compare-and-set operations.  Netlify
+    deployments can now persist Fedify state and preserve ordered queue
+    delivery without a separate database.  [[#1010], [#1029] by Jiwon Kwon\]
  -  Added the new *@fedify/netlify* package for processing Fedify message queue
     jobs with Netlify Async Workloads.  It provides `NetlifyMessageQueue` for
     durable event submission and `createNetlifyQueueHandler()` for Netlify
@@ -257,6 +283,9 @@ To be released.
     non-retryable malformed-event handling, durable per-key FIFO ordering, and
     explicit recovery for unobservable dead-letter failures.
     [[#930], [#934]]
+
+[#1010]: https://github.com/fedify-dev/fedify/issues/1010
+[#1029]: https://github.com/fedify-dev/fedify/pull/1029
 
 ### @fedify/pglite
 
@@ -415,6 +444,34 @@ To be released.
 [#913]: https://github.com/fedify-dev/fedify/pull/913
 [#924]: https://github.com/fedify-dev/fedify/pull/924
 [#935]: https://github.com/fedify-dev/fedify/pull/935
+
+
+Version 2.3.7
+-------------
+
+Released on September 15, 2026.
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` storing values as JSONB strings rather than JSONB
+    objects when it was constructed with the `initialized: true` option.  The
+    option skipped the driver's JSON serialization probe along with the table's
+    schema DDL, so every value was serialized twice and every later read of the
+    row returned a string, including reads from a store that never passed the
+    option.  The option now skips only the DDL.
+    [[#1031], [#1033] by Heewon Chae\]
+ -  Fixed `PostgresMessageQueue` storing messages as JSONB strings rather than
+    JSONB objects when it was constructed with the `initialized: true` option.
+    The option skipped the driver's JSON serialization probe along with the
+    table's schema DDL, so every message was serialized twice and a listener
+    received a string with no recognizable task type, silently dropping the
+    queued work.  The option now skips only the DDL.
+    [[#1014], [#1032] by Heewon Chae\]
+
+[#1014]: https://github.com/fedify-dev/fedify/issues/1014
+[#1031]: https://github.com/fedify-dev/fedify/issues/1031
+[#1032]: https://github.com/fedify-dev/fedify/issues/1032
+[#1033]: https://github.com/fedify-dev/fedify/issues/1033
 
 
 Version 2.3.6
@@ -1213,6 +1270,29 @@ Released on June 25, 2026.
 [#756]: https://github.com/fedify-dev/fedify/pull/756
 
 
+Version 2.2.12
+--------------
+
+Released on September 15, 2026.
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` storing values as JSONB strings rather than JSONB
+    objects when it was constructed with the `initialized: true` option.  The
+    option skipped the driver's JSON serialization probe along with the table's
+    schema DDL, so every value was serialized twice and every later read of the
+    row returned a string, including reads from a store that never passed the
+    option.  The option now skips only the DDL.
+    [[#1031], [#1033] by Heewon Chae\]
+ -  Fixed `PostgresMessageQueue` storing messages as JSONB strings rather than
+    JSONB objects when it was constructed with the `initialized: true` option.
+    The option skipped the driver's JSON serialization probe along with the
+    table's schema DDL, so every message was serialized twice and a listener
+    received a string with no recognizable task type, silently dropping the
+    queued work.  The option now skips only the DDL.
+    [[#1014], [#1032] by Heewon Chae\]
+
+
 Version 2.2.11
 --------------
 
@@ -1803,6 +1883,29 @@ Released on April 28, 2026.
 [#706]: https://github.com/fedify-dev/fedify/issues/706
 [#715]: https://github.com/fedify-dev/fedify/pull/715
 [#722]: https://github.com/fedify-dev/fedify/pull/722
+
+
+Version 2.1.23
+--------------
+
+Released on September 15, 2026.
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` storing values as JSONB strings rather than JSONB
+    objects when it was constructed with the `initialized: true` option.  The
+    option skipped the driver's JSON serialization probe along with the table's
+    schema DDL, so every value was serialized twice and every later read of the
+    row returned a string, including reads from a store that never passed the
+    option.  The option now skips only the DDL.
+    [[#1031], [#1033] by Heewon Chae\]
+ -  Fixed `PostgresMessageQueue` storing messages as JSONB strings rather than
+    JSONB objects when it was constructed with the `initialized: true` option.
+    The option skipped the driver's JSON serialization probe along with the
+    table's schema DDL, so every message was serialized twice and a listener
+    received a string with no recognizable task type, silently dropping the
+    queued work.  The option now skips only the DDL.
+    [[#1014], [#1032] by Heewon Chae\]
 
 
 Version 2.1.22
@@ -2552,6 +2655,29 @@ Released on March 24, 2026.
 [#586]: https://github.com/fedify-dev/fedify/issues/586
 [#597]: https://github.com/fedify-dev/fedify/pull/597
 [#599]: https://github.com/fedify-dev/fedify/pull/599
+
+
+Version 2.0.27
+--------------
+
+Released on September 15, 2026.
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` storing values as JSONB strings rather than JSONB
+    objects when it was constructed with the `initialized: true` option.  The
+    option skipped the driver's JSON serialization probe along with the table's
+    schema DDL, so every value was serialized twice and every later read of the
+    row returned a string, including reads from a store that never passed the
+    option.  The option now skips only the DDL.
+    [[#1031], [#1033] by Heewon Chae\]
+ -  Fixed `PostgresMessageQueue` storing messages as JSONB strings rather than
+    JSONB objects when it was constructed with the `initialized: true` option.
+    The option skipped the driver's JSON serialization probe along with the
+    table's schema DDL, so every message was serialized twice and a listener
+    received a string with no recognizable task type, silently dropping the
+    queued work.  The option now skips only the DDL.
+    [[#1014], [#1032] by Heewon Chae\]
 
 
 Version 2.0.26
