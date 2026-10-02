@@ -1,6 +1,6 @@
 {
   "name": "@fedify/vocab-runtime",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "homepage": "https://fedify.dev/",
   "repository": {
     "type": "git",
@@ -52,6 +52,26 @@
       "require": "./dist/internal/jsonld-cache.cjs",
       "default": "./dist/internal/jsonld-cache.js"
     },
+    "./internal/portable-dereference": {
+      "types": {
+        "import": "./dist/internal/portable-dereference.d.ts",
+        "require": "./dist/internal/portable-dereference.d.cts",
+        "default": "./dist/internal/portable-dereference.d.ts"
+      },
+      "import": "./dist/internal/portable-dereference.js",
+      "require": "./dist/internal/portable-dereference.cjs",
+      "default": "./dist/internal/portable-dereference.js"
+    },
+    "./internal/signed-representation": {
+      "types": {
+        "import": "./dist/internal/signed-representation.d.ts",
+        "require": "./dist/internal/signed-representation.d.cts",
+        "default": "./dist/internal/signed-representation.d.ts"
+      },
+      "import": "./dist/internal/signed-representation.js",
+      "require": "./dist/internal/signed-representation.cjs",
+      "default": "./dist/internal/signed-representation.js"
+    },
     "./temporal": {
       "types": {
         "import": "./dist/temporal.d.ts",
@@ -70,7 +90,9 @@
     "prepack": "pnpm build",
     "prepublish": "pnpm build",
     "pretest": "pnpm build",
-    "test": "cd dist/tests && node --test"
+    "test": "cd dist/tests && node --test",
+    "pretest:bun": "pnpm build",
+    "test:bun": "node scripts/test-bun.mjs"
   },
   "keywords": [
     "Fedify",
@@ -84,7 +106,8 @@
   },
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^24.2.1",
+    "@fedify/fixture": "workspace:*",
+    "@types/node": "catalog:",
     "fetch-mock": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:"

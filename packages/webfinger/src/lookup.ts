@@ -16,6 +16,7 @@ import {
   type TracerProvider,
 } from "@opentelemetry/api";
 import metadata from "../deno.json" with { type: "json" };
+import { BodyTooLargeError, MAX_BODY_SIZE, readBoundedText } from "./body.ts";
 import type { ResourceDescriptor } from "./jrd.ts";
 
 const logger = getLogger(["fedify", "webfinger", "lookup"]);
@@ -31,10 +32,10 @@ const DEFAULT_MAX_REDIRECTION = 5;
  *  -  `not_found`: the remote responded with HTTP `404 Not Found` or
  *     `410 Gone`.  Recorded together with `http.response.status_code`.
  *  -  `invalid`: the remote responded with content Fedify could not parse
- *     into a {@link ResourceDescriptor} (JSON parse failure), the
- *     redirect chain exceeded `maxRedirection`, the remote redirected to
- *     a different protocol, or the queried `acct:` resource itself was
- *     malformed.
+ *     into a {@link ResourceDescriptor} (JSON parse failure or a body over
+ *     the size limit), the redirect chain exceeded `maxRedirection`, the
+ *     remote redirected to a different protocol, or the queried `acct:`
+ *     resource itself was malformed.
  *  -  `network_error`: no HTTP response was received (the URL was
  *     rejected as a private address, `fetch()` threw, or an `AbortError`
  *     cancelled the request).
@@ -321,10 +322,17 @@ async function lookupWebFingerInternal(
         await validatePublicUrl(url.href);
       } catch (e) {
         if (e instanceof UrlError) {
-          logger.error(
-            "Invalid URL for WebFinger resource descriptor: {error}",
-            { error: e },
-          );
+          if (e.reason === "dns") {
+            logger.debug("DNS lookup failed for {url}", {
+              url: url.href,
+              error: e,
+            });
+          } else {
+            logger.error(
+              "Invalid URL for WebFinger resource descriptor: {error}",
+              { error: e },
+            );
+          }
           return { resource: null, result: "network_error", remoteHost };
         }
         throw e;
@@ -430,7 +438,9 @@ async function lookupWebFingerInternal(
       };
     }
     try {
-      const parsed = await response.json() as ResourceDescriptor;
+      const parsed = JSON.parse(
+        await readBoundedText(response, MAX_BODY_SIZE, url),
+      ) as ResourceDescriptor;
       return {
         resource: parsed,
         result: "found",
@@ -438,6 +448,14 @@ async function lookupWebFingerInternal(
         remoteHost,
       };
     } catch (e) {
+      if (e instanceof BodyTooLargeError) {
+        return {
+          resource: null,
+          result: "invalid",
+          statusCode: response.status,
+          remoteHost,
+        };
+      }
       if (e instanceof SyntaxError) {
         logger.debug(
           "Failed to parse WebFinger resource descriptor as JSON: {error}",

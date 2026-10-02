@@ -37,6 +37,76 @@ why some activities are rejected, you can turn on [logging](./log.md) for
 [Linked Data Signatures]: https://web.archive.org/web/20170923124140/https://w3c-dvcg.github.io/ld-signatures/
 [FEP-8b32]: https://w3id.org/fep/8b32
 
+### Compound portable objects
+
+The inbox independently verifies every JSON map with an [FEP-ef61] portable
+`id` or `@id`, i.e., an `ap:` or `ap+ef61:` URI or a compatible identifier,
+including embedded collections, with the
+[map-local compound-proof profile](./send.md#compound-portable-objects).  A
+valid proof on the outer activity does not authenticate an unsigned or invalid
+portable object embedded within it.  The gateway trust allowance for an
+unsigned top-level portable collection does not apply inside a compound
+document; an embedded portable collection needs its own proof and `@context`.
+The only maps exempt from this are keys embedded in the `publicKey` or
+`assertionMethod` of a verified portable actor whose IDs are the actor's
+compatible identifiers or `ap:` or `ap+ef61:` URIs plus non-empty fragments,
+such as its gateway keys
+or the keys an [FEP-ae97] client makes for it, which the actor's proof covers.
+Their IDs are compared as they are written, so an ID that only becomes
+the actor's after URL parsing, e.g., through dot segments, is not exempt.
+The exemption only spares such a key its own proof; which keys may verify
+signatures is decided separately.
+
+This check uses the received JSON after the normal outer authentication and
+actor ownership checks.  Since a Linked Data Signature is made after the
+Object Integrity Proofs, the check excludes the top-level `signature` property,
+whatever its value, from every proof input, as the verification of the
+activity's own proof does.  A `signature` property of an embedded map stays
+part of the input of that map's proof.  Fedify consumes a deferred
+signature nonce only after the entire compound document passes verification.
+It also verifies the complete result before dispatching the activity through a
+queue, route, or listener.  Unsupported proof shapes and documents that exceed
+the inspection or verification limits receive `401 Unauthorized`.  Fedify does
+not dispatch any part of those documents to application code.
+
+[FEP-ef61]: https://w3id.org/fep/ef61
+[FEP-ae97]: https://w3id.org/fep/ae97
+
+### Portable actors
+
+*This behavior is available since Fedify 2.4.0.*
+
+An activity whose actor is an [FEP-ef61] portable actor, i.e., has an `ap:` or
+`ap+ef61:` ID, or a [compatible identifier] such as
+`https://example.com/.well-known/apgateway/did:key:z6Mk.../actor`, is accepted
+only if its Object Integrity Proof made by the actor's DID is valid.  An HTTP
+Signature or a Linked Data Signature does not authenticate it, not even an HTTP
+Signature made with one of the actor's
+[gateway keys](./actor.md#gateway-keys-of-portable-actors), which only tells
+which gateway sent the request, or with a key of the actor itself at an `ap:`
+key ID.  Such an activity without a valid proof is
+rejected with `401 Unauthorized`.  Conversely, an activity with a valid proof
+is accepted even if the gateway that sent it did not sign the request with
+a key the actor lists.
+
+The same goes for an activity whose own ID is portable: its Object Integrity
+Proof has to be made by the DID of its ID, so an activity whose ID names
+a DID other than the one that signed it is rejected, even if its actor is
+authenticated.  Compatible identifiers of the same portable object on
+different gateways are the same object, so the gateways in an activity's ID
+and its actor's ID may differ.
+
+A compatible identifier stands for the portable object it contains, whatever
+server serves it, so Fedify treats such an actor as a portable actor rather
+than as an ordinary actor of the gateway's origin.  An actor that publishes
+compatible identifiers without signing its activities, which FEP-ef61 does not
+allow, is therefore rejected; so are actors whose DIDs use key types that
+Fedify cannot verify, such as the ML-DSA-44 `did:key` DIDs that [tootik]
+optionally supports.
+
+[compatible identifier]: https://w3id.org/fep/ef61#compatible-ids
+[tootik]: https://github.com/dimkr/tootik
+
 ### `Accept-Signature` challenges
 
 *This API is available since Fedify 2.1.0.*
@@ -78,6 +148,123 @@ protection.  Nonces expire after `nonceTtlSeconds` (default: 5 minutes).
 
 [`Accept-Signature`]: https://www.rfc-editor.org/rfc/rfc9421#section-5.1
 [RFC 9421 §5]: https://www.rfc-editor.org/rfc/rfc9421#section-5
+
+### Requests with several RFC 9421 signatures
+
+*This API is available since Fedify 2.4.0.*
+
+An [RFC 9421] request can carry several signatures, and each of them may make
+Fedify fetch the key that it names from a URL of the sender's choosing.  So
+that a single request cannot make Fedify fetch any number of keys, Fedify
+verifies only the first three signatures in the order of the
+`Signature-Input` header, and ignores the rest as if they were absent:
+
+ -  A signature counts even if it fails before its key is fetched, e.g.,
+    because it is too old, its `Signature` member is missing, or it does not
+    match the `Content-Digest` header.
+ -  A key is looked up only once for all the signatures that name it.
+ -  A valid signature after the first three does not authenticate the
+    request.
+
+Senders usually put a single signature on a request, so this rarely matters.
+If you need to accept more signatures, or fewer, set the `maxHttpSignatures`
+option when creating a `Federation`; it also applies to
+`~RequestContext.getSignedKey()` and `~RequestContext.getSignedKeyOwner()`:
+
+~~~~ typescript
+import { createFederation } from "@fedify/fedify";
+
+const federation = createFederation<void>({
+  // ... other options ...
+  maxHttpSignatures: 1,
+});
+~~~~
+
+This limits the number of signatures, not the number of requests that looking
+up a single key takes, e.g., to fetch the owner of the key, nor the time they
+take.  Draft cavage [HTTP Signatures] carry a single signature, and activities
+authenticated by their [Linked Data Signatures] or Object Integrity Proofs do
+not rely on the request's signatures, so they are not affected.
+
+
+Observing inbox requests
+------------------------
+
+*This API is available since Fedify 2.4.0.*
+
+Register `onRequestFinished()` to record the result of each inbox delivery,
+including rejected requests.  The callback receives a `RequestContext` and an
+`InboxRequestReport`.  It runs once after processing and is awaited before
+`Federation.fetch()` returns a response or rethrows an exception:
+
+~~~~ typescript twoslash
+import type { Federation, InboxRequestReport } from "@fedify/fedify";
+declare const federation: Federation<void>;
+declare function saveReport(report: InboxRequestReport): Promise<void>;
+// ---cut-before---
+federation
+  .setInboxListeners("/users/{identifier}/inbox", "/inbox")
+  .onRequestFinished(async (ctx, report) => {
+    await saveReport(report);
+  });
+~~~~
+
+`report.inbox` identifies the personal, shared, or portable inbox and its local
+recipient identifier.  Shared inboxes have a `null` recipient.  The hook also
+covers failures while preparing document loaders or resolving a portable
+recipient.  Inbox collection requests, unmatched routes, programmatic
+`routeActivity()` calls, and queue workers do not invoke it.
+
+`report.payload` is either `unavailable` or `parsed`, whose `value` contains the
+original JSON.  A parsed JSON `null` is distinct from an unavailable body.
+`report.activity` contains the `Activity` obtained by the existing processing
+flow, if any.  Observation does not parse the body again or fetch more objects.
+
+`report.attempts` retains each logical evaluation of HTTP Signatures, Linked
+Data Signatures, or Object Integrity Proofs.  An attempt's `checks` describes
+the signatures/proofs evaluated, including the declared key ID and the actual
+`CryptoKey` objects used.  A stale cached key and its fresh replacement are
+both retained in `triedKeys`.  Refresh failure retains the key already tried.
+A verified check's `key` is the successful entry in `triedKeys`, and a verified
+attempt's `signatures` references its successful checks directly.  Attempts
+can repeat a mechanism when additional portable proof policy is evaluated.
+The subject includes its ID and an RFC 6901 JSON Pointer when known; the root
+pointer is `""`.
+
+Cryptographic checks and authentication are separate.  For example, valid
+proofs can leave an actor attribution uncovered, or a valid HTTP Signature can
+fail the actor ownership or nonce check.  Such checks remain `verified` in a
+rejected attempt or request.  Linked Data Signature failure followed by HTTP
+success retains both attempts.  Consult `report.authentication` for the final
+`verified`, `rejected`, `skipped`, or `notDetermined` decision.  `skipped` means
+processing reached the signature bypass; an earlier parse or preparation
+failure leaves authentication `notDetermined`.
+
+Key snapshots have `URL | null` IDs and either `ownerId` for a
+`cryptographicKey` or `controllerId` for a `multikey`.  These URL objects are
+independent of the vocabulary key objects.  The declared key ID is a
+`string | null`, preserving its spelling even when invalid.  Keys and their
+owner/controller claims remain untrusted until the final authentication
+checks accept them.  A readonly report does not freeze its `Activity`,
+`CryptoKey`, or error objects.
+
+`report.outcome` records a response status and disposition (`processed`,
+`enqueued`, `duplicate`, `unhandled`, `rejected`, `customResponse`, or
+`failed`), or the original exception and its processing stage.  An `enqueued`
+result reports producer acceptance, not later worker success.  A custom `202`
+returned by `onUnverifiedActivity()` remains unauthenticated.  The report
+contains no live `Response` to consume or alter.
+
+Errors from the observer are logged and swallowed, preserving the delivery's
+original response or exception.  The callback does not make database writes
+and queue acceptance atomic.  Calling `onRequestFinished()` again replaces the
+previous callback; a federation built from a builder retains the callback
+registered when it was built.  Reports and key objects are never serialized
+into queue messages.
+
+The hook runs independently of [OpenTelemetry sampling](./opentelemetry.md).
+Use it when your application needs every delivery's result or actual public
+keys for later inspection.
 
 
 Handling unverified activities
@@ -721,6 +908,211 @@ ctx.getInboxUri()
 ~~~~
 
 
+Portable inboxes
+----------------
+
+*This API is available since Fedify 2.4.0.*
+
+An [FEP-ef61] portable actor, whose ID is an `ap+ef61:` URI with a [DID]
+instead of a host, has a portable inbox like
+`ap+ef61://did:key:z6Mk.../users/alice/inbox`, and lists the servers that
+store its data in its `gateways` property.  Every gateway of the actor has to
+accept deliveries to the inbox through its `/.well-known/apgateway` endpoint:
+
+~~~~ http
+POST /.well-known/apgateway/did:key:z6Mk.../users/alice/inbox HTTP/1.1
+Host: example.com
+Content-Type: application/activity+json
+~~~~
+
+Fedify handles such a request with the same inbox listeners as ordinary
+deliveries, so you do not need a separate API for portable inboxes.  The path
+after the DID has to match the inbox path you passed to
+`~Federatable.setInboxListeners()`, e.g., `/users/{identifier}/inbox`, and
+the `~Context.getPortableInboxUri()` method builds such a portable inbox ID
+for the actor dispatcher to use, just like `~Context.getPortableActorUri()`
+builds the actor's portable ID:
+
+~~~~ typescript twoslash
+import { type Federation, signObject } from "@fedify/fedify";
+import { Follow, Person } from "@fedify/vocab";
+const federation = null as unknown as Federation<void>;
+interface User { username: string; did: string }
+async function findUser(_username: string): Promise<User | null> {
+  return null;
+}
+async function getPortableKey(
+  _did: string,
+): Promise<{ privateKey: CryptoKey; keyId: URL }> {
+  return null!;
+}
+// ---cut-before---
+federation.setActorDispatcher(
+  "/users/{identifier}",
+  async (ctx, identifier) => {
+    const user = await findUser(identifier);
+    if (user == null) return null;
+    const { privateKey, keyId } = await getPortableKey(user.did);
+    return await signObject(
+      new Person({
+        // ap+ef61://did:key:z6Mk.../users/alice
+        id: ctx.getPortableActorUri(identifier, user.did),
+        // ap+ef61://did:key:z6Mk.../users/alice/inbox
+        inbox: ctx.getPortableInboxUri(identifier, user.did),
+        gateways: [
+          new URL("https://example.com"),
+          new URL("https://other.example"),
+        ],
+      }),
+      privateKey,
+      keyId,  // e.g., did:key:z6Mk...#z6Mk...
+    );
+  },
+);
+
+federation
+  .setInboxListeners("/users/{identifier}/inbox", "/inbox")
+  .on(Follow, async (ctx, follow) => {
+    // Called for deliveries to both /users/alice/inbox and
+    // /.well-known/apgateway/did:key:z6Mk.../users/alice/inbox:
+    console.log(ctx.recipient);  // "alice"
+  });
+~~~~
+
+Fedify accepts a delivery to a portable inbox only if the actor dispatcher,
+called with the identifier in the inbox path, returns an actor such that:
+
+ -  its ID is a portable ID, or a [compatible
+    identifier](./actor.md#compatible-identifiers-as-actor-ids), with the same
+    DID as the requested inbox;
+ -  its `inbox` is the requested portable inbox, or a compatible identifier of
+    it on any gateway; and
+ -  its `gateways` include the origin of this server, i.e.,
+    `~Context.canonicalOrigin`.
+
+Otherwise, Fedify responds with `404 Not Found`, as FEP-ef61 requires of
+a server that does not accept deliveries on behalf of the actor, so
+applications that do not have portable actors are unaffected.  A malformed
+DID or path results in `400 Bad Request`.  Only personal inboxes are
+reachable through the gateway endpoint; the shared inbox is not.
+
+The actor is looked up by the identifier alone, as for ordinary deliveries,
+and the actor document is trusted as your application returns it.  So make
+sure that the identifier determines a single actor regardless of the DID in
+the request path, and that the actor's `gateways` list only servers you
+intend to deliver to.
+
+Once accepted, the delivery goes through the same pipeline as ordinary
+deliveries: signature verification, including the FEP-ef61 proof policy for
+portable activities and objects (see the [*Compound portable objects*
+section](#compound-portable-objects)), [activity
+idempotency](#activity-idempotency), queueing, and inbox listeners.
+Activities delivered to a portable inbox do not have to be portable; an
+ordinary activity signed with HTTP Signatures is accepted as well.
+
+> [!NOTE]
+> The listener idempotency described in the [*Activity idempotency*
+> section](#activity-idempotency) suppresses a duplicate delivery only after
+> an earlier delivery of the same activity has been processed successfully,
+> and only if their idempotency keys match, e.g., the activity ID, the
+> recipient, and the origin of the request with the default `"per-inbox"`
+> strategy.
+
+[DID]: https://www.w3.org/TR/did-core/
+
+### Forwarding to other gateways
+
+FEP-ef61 recommends that a gateway forward an activity received in a portable
+inbox to the inboxes of the same actor on its other gateways, so that every
+gateway stores the actor's data, but forbids forwarding an activity from
+an inbox more than once.  Fedify does so automatically for an accepted
+delivery, including a duplicate one and one that is queued or has no inbox
+listener for its type, but not when an inbox listener fails, in which case
+the sender retries it.  All of the following have to hold as well:
+
+ -  The activity is authenticated by its own [Object Integrity
+    Proof](./send.md#object-integrity-proofs) or Linked Data Signature, not
+    only by HTTP Signatures, since the other gateways have to authenticate
+    the activity by itself: an HTTP Signature on a forwarded request, if any,
+    is made by this server, not by the activity's actor.
+ -  The `~FederationOptions.skipSignatureVerification` option is not turned on.
+ -  The activity has an `id`.
+ -  The key–value store supports `~KvStore.cas()`.  Otherwise, Fedify logs
+    a warning and does not forward any activity, since it could not ensure
+    that each activity is forwarded at most once.
+
+The activity is sent as received to the compatible inbox URL on each gateway
+other than this server, e.g.,
+`https://other.example/.well-known/apgateway/did:key:z6Mk.../users/alice/inbox`,
+to at most 10 gateways per delivery by default.  An activity is told apart by
+its canonical portable ID, so it is not forwarded again when it arrives with
+a compatible identifier on another gateway instead of its `ap:` ID, or vice
+versa.  With an outbox queue,
+forwarding is queued like other outgoing activities and retried on failures.
+Without one, the requests are made immediately, and Fedify waits for them for
+up to 10 seconds by default before responding to the delivery.
+
+Forwarded requests are signed with HTTP Signatures by this server's [gateway
+key](./actor.md#gateway-keys-of-portable-actors) for the actor, as some
+servers reject unsigned requests even if the activity has a valid proof.
+It takes the first RSA key pair that `~Context.getActorKeyPairs()` returns for
+the identifier in the inbox path, and only if
+`~ActorCallbackSetters.mapPortableActorId()` maps the identifier to the same
+portable actor as the recipient.  Otherwise, e.g., without a key pairs
+dispatcher, a portable actor ID mapper, or an RSA key pair, the requests are
+sent without HTTP Signatures.  The other gateways can verify the signature
+only if the actor document they get from this server is signed by the actor's
+DID, embeds the key as a `Multikey` in its `assertionMethod`, and lists this
+server in its `gateways`.  They accept the activity for its proof either way.
+
+Fedify does not forward an activity back to the gateway that forwarded it,
+if it can tell which gateway that is: a delivery signed with HTTP Signatures
+by one of the actor's other gateways, with the gateway key for the recipient
+actor, as Fedify signs forwarded requests.  The signature has to cover the
+method, the target URI, and the body of the request, i.e., `@method`,
+`@target-uri`, and `content-digest` for [RFC 9421], or
+`(request-target)`, `host`, and `digest` for draft-cavage HTTP Signatures.
+Verifying it means fetching the actor document from that gateway, as gateway
+keys are not cached, so Fedify verifies at most one signature per delivery,
+and only one that names a gateway that the activity has not been forwarded to
+yet.  If the signature is invalid, the key cannot be fetched, the actor
+document does not vouch for the key, or the verification does not finish in
+time, the delivery is still accepted for the activity's own proof, and the
+activity is forwarded to that gateway as well.
+
+Fedify remembers each gateway that it has forwarded an activity to, or has
+received the activity from as above, for 30 days by default under the
+`~FederationKvPrefixes.portableInboxForwarding` key prefix, and never forwards
+the same activity from the same inbox to the same gateway again within that
+period, even if the forwarding failed.  So forwarding is best effort;
+configure an [outbox queue](./mq.md) to retry transient failures.
+A gateway that the activity is forwarded back to drops it the same way, which
+ends the forwarding.
+
+The limits above can be changed with the
+[`portableInboxForwarding`](./federation.md#portableinboxforwarding) option,
+which can also turn off forwarding:
+
+~~~~ typescript twoslash
+import { createFederation, MemoryKvStore } from "@fedify/fedify";
+
+const federation = createFederation<void>({
+  kv: new MemoryKvStore(),
+  portableInboxForwarding: { maxTargets: 0 },  // Turns off forwarding
+});
+~~~~
+
+> [!WARNING]
+> Fedify tells which gateway it is by `~Context.canonicalOrigin`, which comes
+> from the `Host` of the request unless you configure the
+> [`origin`](./federation.md#explicitly-setting-the-canonical-origin) option.
+> If you run a gateway, configure the `origin` option, or make sure that your
+> server or reverse proxy validates the `Host` header.  Otherwise, a request
+> with a spoofed `Host` naming another gateway of the actor can make this
+> server skip forwarding to that gateway and forward the activity to itself
+> instead, in which case inbox listeners may process the activity twice.
+
+
 Manual routing
 --------------
 
@@ -785,7 +1177,10 @@ for await (const item of context.traverseCollection(collection)) {
 >     by its actor.
 >
 >  -  The `Activity` is dereferenceable by its `~Object.id` and
->     the dereferenced object has an actor that belongs to the same origin
->     as the `Activity` object.
+>     the dereferenced object has actors that all belong to the same origin
+>     as the `Activity` object.  For [FEP-ef61] portable IDs, i.e., `ap:`
+>     and `ap+ef61:` URIs and compatible identifiers, the origin is the DID
+>     rather than the gateway, so a portable `Activity` has to be performed by
+>     actors of its own DID.
 
 <!-- cSpell: ignore cavage -->

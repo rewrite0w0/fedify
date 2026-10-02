@@ -14,9 +14,34 @@ const XSD_ANY_URI = "http://www.w3.org/2001/XMLSchema#anyURI";
 const FEDIFY_URL = "fedify:url";
 const INTERNAL_RUNTIME_IMPORTS = [
   "compactJsonLdCache",
+  "createScopedContextLoader",
   "getJsonLdContext",
+  "getPortableActorGateways",
   "isTrustedIriOrigin",
   "normalizeJsonLdIris",
+].join(",\n    ");
+const PORTABLE_DEREFERENCE_IMPORTS = [
+  "copyPortableProvenance",
+  "createSnapshotContextLoader",
+  "dereferencePortableIri",
+  "getPortableResponseClaim",
+  "getReferrerGateways",
+  "isPortableIri",
+  "isPortableMode",
+  "isUnsecuredPortableObject",
+  "isUnverifiedPortableClaim",
+  "markUnverifiedPortableClaim",
+  "mustDereferencePortableObject",
+  "parseCompatibleEf61Reference",
+  "type PortableResponseClaim",
+  "recordPortableReferrer",
+  "rejectMalformedCompatibleReference",
+  "warnUnverifiableEmbeddedObject",
+].join(",\n    ");
+const SIGNED_REPRESENTATION_IMPORTS = [
+  "enterSignedValueScope",
+  "resolveSignedValues",
+  "retainedSignedValueRef",
 ].join(",\n    ");
 const RUNTIME_IMPORTS = [
   "canParseDecimal",
@@ -37,6 +62,7 @@ const RUNTIME_IMPORTS = [
   "parseGatewayUrl",
   "parseIri",
   "parseJsonLdId",
+  "type PortableObjectVerifier",
   "type RemoteDocument",
 ].join(",\n    ");
 
@@ -86,6 +112,7 @@ async function* generateClass(
     readonly #documentLoader?: DocumentLoader;
     readonly #contextLoader?: DocumentLoader;
     readonly #tracerProvider?: TracerProvider;
+    readonly #verifyPortableObject?: PortableObjectVerifier;
     readonly #warning?: {
       category: string[];
       message: string;
@@ -106,6 +133,10 @@ async function* generateClass(
 
     protected get _tracerProvider(): TracerProvider | undefined {
         return this.#tracerProvider;
+    }
+
+    protected get _verifyPortableObject(): PortableObjectVerifier | undefined {
+      return this.#verifyPortableObject;
     }
 
     protected get _warning(): {
@@ -268,10 +299,29 @@ export async function* generateClasses(
     from "@opentelemetry/api";\n`;
   yield `import {\n    ${RUNTIME_IMPORTS}\n} from "@fedify/vocab-runtime";\n`;
   yield `import {\n    ${INTERNAL_RUNTIME_IMPORTS}\n} from "@fedify/vocab-runtime/internal/jsonld-cache";\n`;
+  yield `import {\n    ${PORTABLE_DEREFERENCE_IMPORTS}\n} from "@fedify/vocab-runtime/internal/portable-dereference";\n`;
+  yield `import {\n    ${SIGNED_REPRESENTATION_IMPORTS}\n} from "@fedify/vocab-runtime/internal/signed-representation";\n`;
   yield `import {
     isTemporalDuration,
     isTemporalInstant,
 } from "@fedify/vocab-runtime/temporal";\n`;
+  yield `
+function canDecodeIri(iri: string): boolean {
+  try { parseIri(iri); return true; } catch { return iri.startsWith("at://"); }
+}
+
+function decodeIri(iri: string): URL {
+  return !URL.canParse(iri) && iri.startsWith("at://")
+    ? new URL("at://" + encodeURIComponent(iri.substring(5)))
+    : parseIri(iri);
+}
+
+function inspectIri(iri: URL): string {
+  // Inspecting an object must not throw, even for a URL that cannot be
+  // formatted as an IRI, e.g., a malformed portable ID:
+  try { return formatIri(iri); } catch { return iri.href; }
+}
+`;
   yield `
 function isValidLanguageTag(language: string): boolean {
   try {
@@ -283,6 +333,44 @@ function isValidLanguageTag(language: string): boolean {
   }
 }
 `;
+  // Contexts are activated by expanded property IRIs left after compaction.
+  const extraContexts = Object.fromEntries(
+    Object.values(types).flatMap((type) =>
+      type.properties.flatMap((property) =>
+        property.extraContext == null
+          ? []
+          : [[property.uri, property.extraContext]]
+      )
+    ),
+  );
+  if (Object.keys(extraContexts).length > 0) {
+    yield `
+const extraPropertyContexts: Readonly<Record<string, string>> =
+  ${JSON.stringify(extraContexts)};
+
+function getExtraContexts(document: unknown): string[] {
+  const contexts = new Set<string>();
+  const pending: unknown[] = [document];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (value == null || typeof value !== "object") continue;
+    if (Array.isArray(value)) {
+      for (const item of value) pending.push(item);
+      continue;
+    }
+    if ("@value" in value) continue;
+    for (const [key, child] of globalThis.Object.entries(value)) {
+      if (key === "@context") continue;
+      if (globalThis.Object.hasOwn(extraPropertyContexts, key)) {
+        contexts.add(extraPropertyContexts[key]);
+      }
+      pending.push(child);
+    }
+  }
+  return [...contexts];
+}
+`;
+  }
   yield "\n\n";
   const portableIriKeys = new Set(["@id", "id"]);
   for (const type of Object.values(types)) {

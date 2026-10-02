@@ -1,12 +1,13 @@
 {
   "name": "@fedify/lint",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "license": "MIT",
   "exports": {
     ".": "./src/mod.ts",
     "./oxlint": "./src/oxlint.ts"
   },
   "imports": {
+    "@fedify/fixture": "jsr:@fedify/fixture@^2.2.14",
     "eslint": "npm:eslint@^9.0.0",
     "estree": "npm:@types/estree@^1.0.8",
     "oxlint": "npm:oxlint@^1.66.0"

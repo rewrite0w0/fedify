@@ -74,6 +74,29 @@ export type ActorHandleMapper<TContextData> = (
 ) => string | null | Promise<string | null>;
 
 /**
+ * A callback that maps an actor's internal identifier to the ID of the
+ * [FEP-ef61] portable actor it dispatches, or `null` if the actor is not
+ * portable.
+ *
+ * The returned ID is an `ap:` or `ap+ef61:` URI, e.g.,
+ * `ap+ef61://did:key:z6Mk.../actors/alice`, or its compatible identifier.
+ * It must be the same ID that the actor dispatcher puts in the actor's `id`,
+ * and must not have a fragment.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
+ *
+ * @template TContextData The context data to pass to the {@link Context}.
+ * @param context The context.
+ * @param identifier The actor's internal identifier.
+ * @returns The portable actor's ID, or `null` if the actor is not portable.
+ * @since 2.4.0
+ */
+export type PortableActorIdMapper<TContextData> = (
+  context: Context<TContextData>,
+  identifier: string,
+) => URL | null | Promise<URL | null>;
+
+/**
  * A callback that maps a WebFinger query to the corresponding actor's
  * internal identifier or username, or `null` if the query is not found.
  * @template TContextData The context data to pass to the {@link Context}.
@@ -93,7 +116,11 @@ export type ActorAliasMapper<TContextData> = (
   | Promise<{ identifier: string } | { username: string } | null>;
 
 /**
- * A callback that dispatches an object.
+ * A callback that dispatches an object or a {@link Tombstone}.
+ *
+ * Return a {@link Tombstone} if the object has been deleted; Fedify then
+ * responds with `410 Gone` and the serialized tombstone.  Return `null` if
+ * the object is not found.
  *
  * @template TContextData The context data to pass to the {@link Context}.
  * @template TObject The type of object to dispatch.
@@ -107,7 +134,7 @@ export type ObjectDispatcher<
 > = (
   context: RequestContext<TContextData>,
   values: Record<TParam, string>,
-) => TObject | null | Promise<TObject | null>;
+) => TObject | Tombstone | null | Promise<TObject | Tombstone | null>;
 
 /**
  * A callback that dispatches a collection.
@@ -234,6 +261,69 @@ export type MediaUploaderCallback<TContextData> = (
   file: File,
   object: Object,
 ) => Object | URL | Promise<Object | URL>;
+
+/**
+ * A request for a resource addressed by a hashlink, which an
+ * [FEP-ef61](https://w3id.org/fep/ef61) gateway serves at
+ * `/.well-known/apgateway/hl:<digestMultibase>`.
+ *
+ * Fedify validates the hashlink before creating this object, so the digest is
+ * always a well-formed SHA-256 multihash.
+ *
+ * @since 2.4.0
+ */
+export interface HashlinkMediaRequest {
+  /**
+   * The requested hashlink, i.e., `hl:` followed by
+   * {@link HashlinkMediaRequest.digestMultibase}, after percent-decoding and
+   * with its scheme lowercased.
+   */
+  readonly hashlink: `hl:${string}`;
+
+  /**
+   * The multibase-encoded multihash as requested, which is the value that
+   * publishers put in the `digestMultibase` property.  The same digest can be
+   * encoded in several multibase encodings; use
+   * {@link HashlinkMediaRequest.digest} as a storage key to find a resource
+   * regardless of the encoding.
+   */
+  readonly digestMultibase: string;
+
+  /** The hash algorithm of the digest. */
+  readonly algorithm: "sha2-256";
+
+  /** The raw 32-byte SHA-256 digest of the resource. */
+  readonly digest: Uint8Array;
+
+  /**
+   * The multihash decoded from
+   * {@link HashlinkMediaRequest.digestMultibase}, i.e., the hash algorithm
+   * code and the digest length followed by the digest.
+   */
+  readonly multihash: Uint8Array;
+}
+
+/**
+ * A callback that serves a resource addressed by a hashlink through the
+ * [FEP-ef61](https://w3id.org/fep/ef61) gateway endpoint.
+ *
+ * The returned response is sent as is, so the callback can stream its body
+ * and set headers such as `Content-Type` and `Cache-Control`.  Fedify does not
+ * verify the response body against the digest, so the complete
+ * representation must be the exact bytes that hash to the requested digest.
+ *
+ * @template TContextData The context data to pass to the {@link Context}.
+ * @param context The request context.
+ * @param media The requested hashlink and its digest.
+ * @returns The response to send, or `null` if the resource is not stored on
+ *          this server, which results in `404 Not Found`.  It may be returned
+ *          synchronously or wrapped in a `Promise`.
+ * @since 2.4.0
+ */
+export type HashlinkMediaDispatcher<TContextData> = (
+  context: RequestContext<TContextData>,
+  media: HashlinkMediaRequest,
+) => Response | null | Promise<Response | null>;
 
 /**
  * The reason why an incoming activity could not be verified.
@@ -437,6 +527,35 @@ export type CustomCollectionDispatcher<
   values: Record<TParam, string>,
   cursor: string | null,
 ) => PageItems<TItem> | null | Promise<PageItems<TItem> | null>;
+
+/**
+ * A callback that maps a custom collection to the identifier of the actor
+ * that owns it, so that the collection can be served as an [FEP-ef61]
+ * portable collection through the gateway endpoint, e.g.,
+ * `GET /.well-known/apgateway/did:key:z6Mk.../users/alice/bookmarks`.
+ *
+ * Fedify serves such a request only if the returned actor is a portable actor
+ * whose ID is under the requested DID.  The owner has to come from
+ * the application's data, not from the request, since the DID in the request
+ * path is not evidence that this server hosts collections for it.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
+ *
+ * @template TContextData The context data to pass to the {@link Context}.
+ * @template TParam The parameter names of the requested URL.
+ * @param context The context.
+ * @param values The parameters of the requested URL.
+ * @returns The internal identifier of the actor that owns the collection, or
+ *          `null` if the collection is not a portable collection.
+ * @since 2.4.0
+ */
+export type PortableCollectionOwnerMapper<
+  TContextData,
+  TParam extends string,
+> = (
+  context: Context<TContextData>,
+  values: Record<TParam, string>,
+) => string | null | Promise<string | null>;
 
 /**
  * A callback that counts the number of items in a custom collection.

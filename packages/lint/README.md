@@ -132,6 +132,12 @@ federation code:
  -  **`actor-upload-media-property-mismatch`**: Validates endpoints.uploadMedia
     URI from `getMediaUploaderUri`
 
+The mismatch rules for actor `id`, `inbox`, `outbox`, `followers`, `following`,
+`liked`, `featured`, and `featuredTags` also accept the corresponding
+`getPortable*Uri()` method.  They accept an inline
+`toCompatibleEf61Id(ctx.getPortable*Uri(identifier, did), gateway)` call for
+gateway-compatible IDs.
+
 ### Other rules
 
  -  **`collection-filtering-not-implemented`**: Warns about missing collection
@@ -140,6 +146,9 @@ federation code:
     callback does not derive its return value from `getObjectUri`
  -  **`media-uploader-authorization-required`**: Warns when `setMediaUploader`
     is registered without an `authorize` hook
+ -  **`outbox-listener-delivery-not-awaited`**: Warns when an outbox listener
+    calls `sendActivity` or `forwardActivity` and does not wait for the result
+    (ESLint and Oxlint only)
 
 
 Installation

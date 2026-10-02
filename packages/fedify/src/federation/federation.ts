@@ -1,3 +1,4 @@
+import type { InboxRequestFinishedHandler } from "./inbox-report.ts";
 import type {
   Activity,
   Actor,
@@ -25,6 +26,7 @@ import type {
   CustomCollectionCounter,
   CustomCollectionCursor,
   CustomCollectionDispatcher,
+  HashlinkMediaDispatcher,
   InboxErrorHandler,
   InboxListener,
   MediaUploaderCallback,
@@ -35,6 +37,8 @@ import type {
   OutboxListener,
   OutboxListenerErrorHandler,
   OutboxPermanentFailureHandler,
+  PortableActorIdMapper,
+  PortableCollectionOwnerMapper,
   SharedInboxKeyDispatcher,
   UnverifiedActivityHandler,
   WebFingerLinksDispatcher,
@@ -141,7 +145,9 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
    *             based on URI Template
    *             ([RFC 6570](https://tools.ietf.org/html/rfc6570)).  The path
    *             must have one or more variables.
-   * @param dispatcher An object dispatcher callback to register.
+   * @param dispatcher An object dispatcher callback to register.  It may
+   *                   return an object, a `Tombstone` if the object has been
+   *                   deleted, or `null` if the object is not found.
    */
   setObjectDispatcher<TObject extends Object, TParam extends string>(
     cls: ConstructorWithTypeId<TObject>,
@@ -161,7 +167,9 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
    *             based on URI Template
    *             ([RFC 6570](https://tools.ietf.org/html/rfc6570)).  The path
    *             must have one or more variables.
-   * @param dispatcher An object dispatcher callback to register.
+   * @param dispatcher An object dispatcher callback to register.  It may
+   *                   return an object, a `Tombstone` if the object has been
+   *                   deleted, or `null` if the object is not found.
    */
   setObjectDispatcher<TObject extends Object, TParam extends string>(
     cls: ConstructorWithTypeId<TObject>,
@@ -181,7 +189,9 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
    *             based on URI Template
    *             ([RFC 6570](https://tools.ietf.org/html/rfc6570)).  The path
    *             must have one or more variables.
-   * @param dispatcher An object dispatcher callback to register.
+   * @param dispatcher An object dispatcher callback to register.  It may
+   *                   return an object, a `Tombstone` if the object has been
+   *                   deleted, or `null` if the object is not found.
    */
   setObjectDispatcher<TObject extends Object, TParam extends string>(
     cls: ConstructorWithTypeId<TObject>,
@@ -201,7 +211,9 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
    *             based on URI Template
    *             ([RFC 6570](https://tools.ietf.org/html/rfc6570)).  The path
    *             must have one or more variables.
-   * @param dispatcher An object dispatcher callback to register.
+   * @param dispatcher An object dispatcher callback to register.  It may
+   *                   return an object, a `Tombstone` if the object has been
+   *                   deleted, or `null` if the object is not found.
    */
   setObjectDispatcher<TObject extends Object, TParam extends string>(
     cls: ConstructorWithTypeId<TObject>,
@@ -222,7 +234,9 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
    *             based on URI Template
    *             ([RFC 6570](https://tools.ietf.org/html/rfc6570)).  The path
    *             must have one or more variables.
-   * @param dispatcher An object dispatcher callback to register.
+   * @param dispatcher An object dispatcher callback to register.  It may
+   *                   return an object, a `Tombstone` if the object has been
+   *                   deleted, or `null` if the object is not found.
    */
   setObjectDispatcher<TObject extends Object, TParam extends string>(
     cls: ConstructorWithTypeId<TObject>,
@@ -243,7 +257,9 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
    *             based on URI Template
    *             ([RFC 6570](https://tools.ietf.org/html/rfc6570)).  The path
    *             must have one or more variables.
-   * @param dispatcher An object dispatcher callback to register.
+   * @param dispatcher An object dispatcher callback to register.  It may
+   *                   return an object, a `Tombstone` if the object has been
+   *                   deleted, or `null` if the object is not found.
    */
   setObjectDispatcher<TObject extends Object, TParam extends string>(
     cls: ConstructorWithTypeId<TObject>,
@@ -387,6 +403,56 @@ export interface Federatable<TContextData> extends TaskRegistry<TContextData> {
     path: `${string}${Rfc6570Expression<"identifier">}${string}`,
     callback: MediaUploaderCallback<TContextData>,
   ): MediaUploaderSetters<TContextData>;
+
+  /**
+   * Registers a dispatcher that serves resources addressed by hashlinks, such
+   * as media attached to portable objects, through the
+   * [FEP-ef61](https://w3id.org/fep/ef61) gateway endpoint, e.g.,
+   * `GET /.well-known/apgateway/hl:zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n`.
+   *
+   * Fedify responds with `400 Bad Request` without calling the dispatcher if
+   * the hashlink is malformed or its digest is not a SHA-256 multihash, and
+   * with `404 Not Found` if the dispatcher returns `null`.  Otherwise, the
+   * response returned by the dispatcher is sent as is.  Requests with methods
+   * other than `GET` and `HEAD` get `405 Method Not Allowed`.
+   *
+   * Fedify does not verify the served bytes against the digest, as that would
+   * require buffering the whole response body.  The dispatcher must serve only
+   * the resource whose complete representation hashes to the requested
+   * digest, e.g., by using the digest as the storage key.
+   *
+   * This is not the upload API of the ActivityPub Media Upload extension,
+   * which is registered through {@link Federatable.setMediaUploader}.
+   *
+   * @example
+   * ``` typescript
+   * federation.setHashlinkMediaDispatcher(async (ctx, media) => {
+   *   const file = await findPublicMedia(media.digest);
+   *   if (file == null) return null;
+   *   return new Response(
+   *     ctx.request.method === "HEAD" ? null : file.stream(),
+   *     {
+   *       headers: {
+   *         "Content-Type": file.mediaType,
+   *         "Content-Length": file.size.toString(),
+   *         "Cache-Control": "public, max-age=31536000, immutable",
+   *         "X-Content-Type-Options": "nosniff",
+   *       },
+   *     },
+   *   );
+   * });
+   * ```
+   *
+   * @param dispatcher A callback that returns the response serving the
+   *                   requested resource, or `null` if it is not stored on
+   *                   this server.
+   * @throws {RouterError} Thrown if a hashlink media dispatcher is already
+   *                       registered.
+   * @since 2.4.0
+   */
+  setHashlinkMediaDispatcher(
+    dispatcher: HashlinkMediaDispatcher<TContextData>,
+  ): void;
 
   /**
    * Registers a following collection dispatcher.
@@ -861,6 +927,50 @@ export interface FederationBuilder<TContextData>
 }
 
 /**
+ * Options for forwarding activities received in [FEP-ef61] portable inboxes to
+ * the other gateways of their actors.  See
+ * {@link FederationOptions.portableInboxForwarding}.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
+ * @since 2.4.0
+ */
+export interface PortableInboxForwardingOptions {
+  /**
+   * The maximum number of other gateways that a single delivery is forwarded
+   * to.  Gateways beyond it are skipped with a warning.  `0` turns off
+   * forwarding.
+   * @default `10`
+   */
+  maxTargets?: number;
+
+  /**
+   * How long Fedify remembers that it has forwarded an activity from
+   * a portable inbox to a gateway, under
+   * {@link FederationKvPrefixes.portableInboxForwarding}.  Within it, the same
+   * activity is never forwarded to the same gateway again; once it expires,
+   * a redelivery of the activity may be forwarded again.  It cannot have
+   * calendar units, i.e., weeks, months, or years.
+   * @default `{ days: 30 }`
+   */
+  ttl?: Temporal.DurationLike;
+
+  /**
+   * How long a delivery waits for forwarding requests made immediately, i.e.,
+   * when no outbox queue is configured, before Fedify responds to it.
+   * Requests still running afterwards continue in the background.  It also
+   * bounds verifying the HTTP Signature that identifies the gateway which
+   * forwarded the delivery, with or without an outbox queue; if the
+   * verification does not finish in time, the activity is forwarded to that
+   * gateway as well.  It cannot have calendar units,
+   * i.e., weeks, months, or years, and cannot be longer than
+   * 2,147,483,647 milliseconds (about 24.8 days), the longest delay timers
+   * support.
+   * @default `{ seconds: 10 }`
+   */
+  deadline?: Temporal.DurationLike;
+}
+
+/**
  * Policy for emitting `Accept-Signature` challenges on inbox `401`
  * responses, as defined in
  * [RFC 9421 §5](https://www.rfc-editor.org/rfc/rfc9421#section-5).
@@ -965,6 +1075,15 @@ export interface FederationOptions<TContextData> {
   httpMessageSignaturesSpecTtl?: Temporal.DurationLike;
 
   /**
+   * Options for forwarding activities received in [FEP-ef61] portable inboxes
+   * to the other gateways of their actors.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  portableInboxForwarding?: PortableInboxForwardingOptions;
+
+  /**
    * The message queue for sending and receiving activities.  If not provided,
    * activities will not be queued and will be processed immediately.
    *
@@ -1021,7 +1140,8 @@ export interface FederationOptions<TContextData> {
   authenticatedDocumentLoaderFactory?: AuthenticatedDocumentLoaderFactory;
 
   /**
-   * Whether to allow fetching private network addresses in the document loader.
+   * Whether to allow private network addresses in the document loader and
+   * outbound activity delivery, including redirects.
    *
    * If turned on, {@link FederationOptions.documentLoader},
    * {@link FederationOptions.contextLoader}, and
@@ -1061,6 +1181,36 @@ export interface FederationOptions<TContextData> {
   userAgent?: GetUserAgentOptions | string;
 
   /**
+   * The timeout for each call of the built-in document loader, context
+   * loader, and authenticated document loader, e.g., when Fedify fetches
+   * a key to verify a signature.  The timeout is shared by all the steps of
+   * a call, including every redirect it follows, retries, and reading the
+   * response body.  It does not cover the time spent reading from or
+   * writing to the cache.
+   *
+   * A timed-out call throws a `FetchError` without a response, whose
+   * `cause` is a `DOMException` named `"TimeoutError"`, so that, e.g.,
+   * a key fetch that times out is reported as a `keyFetchError` and cached
+   * like other failures to fetch a key.
+   *
+   * It does not affect loaders made by
+   * {@link FederationOptions.documentLoaderFactory},
+   * {@link FederationOptions.contextLoaderFactory}, or
+   * {@link FederationOptions.authenticatedDocumentLoaderFactory}.
+   * Note that if only {@link FederationOptions.documentLoaderFactory} is
+   * set, it also makes context loaders.
+   *
+   * Set it to `null` to turn off the timeout.
+   *
+   * 10 seconds by default.
+   * @throws {RangeError} If the duration is not positive, is longer than
+   *                      about 24.8 days, or is given in calendar units
+   *                      such as months.
+   * @since 2.4.0
+   */
+  documentLoaderTimeout?: Temporal.Duration | Temporal.DurationLike | null;
+
+  /**
    * A callback that handles errors during outbox processing.  Note that this
    * callback can be called multiple times for the same activity, because
    * the delivery is retried according to the backoff schedule until it
@@ -1090,6 +1240,30 @@ export interface FederationOptions<TContextData> {
    * By default, the window is an hour.
    */
   signatureTimeWindow?: Temporal.Duration | Temporal.DurationLike | false;
+
+  /**
+   * The maximum number of [RFC 9421] signatures of an incoming request to
+   * verify, e.g., in the inbox and in
+   * {@link RequestContext.getSignedKey}.  A request can carry several
+   * signatures, each of which may make Fedify fetch the key that it names,
+   * so only the first ones in the order of the `Signature-Input` header are
+   * verified, and the rest are ignored as if they were absent.  Every
+   * signature among the first ones counts, even if it fails before its key
+   * is fetched.  See also the `maxSignatures` option of `verifyRequest()`.
+   *
+   * It has to be a positive integer, or `Infinity` to verify every
+   * signature, which lets a single request make Fedify fetch any number of
+   * keys.  Draft-cavage HTTP Signatures carry a single signature, so this
+   * option does not affect them.
+   *
+   * Three by default.
+   *
+   * [RFC 9421]: https://www.rfc-editor.org/rfc/rfc9421
+   * @throws {RangeError} Thrown when the federation is created if the value
+   *         is not a positive integer or `Infinity`.
+   * @since 2.4.0
+   */
+  maxHttpSignatures?: number;
 
   /**
    * Whether to skip HTTP Signatures verification for incoming activities.
@@ -1290,6 +1464,33 @@ export interface ActorCallbackSetters<TContextData> {
    */
   mapAlias(
     mapper: ActorAliasMapper<TContextData>,
+  ): ActorCallbackSetters<TContextData>;
+
+  /**
+   * Sets the callback function that maps an actor's identifier to the ID of
+   * the [FEP-ef61] portable actor it dispatches.  If the callback returns
+   * a portable ID for an identifier, the key pairs of that actor are treated
+   * as this server's *gateway keys* for the portable actor:
+   * {@link Context.getActorKeyPairs} derives their key IDs from the actor's
+   * compatible identifier on this server, e.g.,
+   * `https://example.com/.well-known/apgateway/did:key:z6Mk.../actors/alice#main-key`,
+   * and makes the portable actor their owner, so that requests this server
+   * makes on behalf of the actor, such as activity deliveries and signed
+   * fetches, are signed with them.  Gateway keys are only used for HTTP
+   * Signatures; they never make Object Integrity Proofs or Linked Data
+   * Signatures.
+   *
+   * If it's omitted, or it returns `null`, the actor's keys are derived from
+   * {@link Context.getActorUri} as usual.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @param mapper A callback that maps an actor's identifier to its portable
+   *               ID, or `null` if the actor is not portable.
+   * @returns The setters object so that settings can be chained.
+   * @since 2.4.0
+   */
+  mapPortableActorId(
+    mapper: PortableActorIdMapper<TContextData>,
   ): ActorCallbackSetters<TContextData>;
 
   /**
@@ -1514,6 +1715,19 @@ export interface InboxListenerSetters<TContextData> {
   ): InboxListenerSetters<TContextData>;
 
   /**
+   * Observes each configured inbox delivery once, before fetch finishes.
+   * The callback is awaited and its errors do not alter delivery processing.
+   * Calling this again replaces the previous callback.  Built federations
+   * retain the callback registered at build time.
+   * @param handler The request completion observer.
+   * @returns This setter for chaining.
+   * @since 2.4.0
+   */
+  onRequestFinished(
+    handler: InboxRequestFinishedHandler<TContextData>,
+  ): InboxListenerSetters<TContextData>;
+
+  /**
    * Registers a callback for incoming activities whose HTTP signatures could
    * not be verified.
    *
@@ -1702,6 +1916,28 @@ export interface CustomCollectionCallbackSetters<
    */
   authorize(
     predicate: ObjectAuthorizePredicate<TContextData, string>,
+  ): CustomCollectionCallbackSetters<
+    TParam,
+    TContext,
+    TContextData
+  >;
+
+  /**
+   * Maps the custom collection to the actor that owns it, so that it is also
+   * served as an [FEP-ef61] portable collection through the gateway endpoint,
+   * e.g., `GET /.well-known/apgateway/did:key:z6Mk.../users/alice/bookmarks`,
+   * if the owner is a portable actor under the requested DID.  Without it,
+   * the custom collection is not served through the gateway endpoint.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @param mapper A callback that returns the identifier of the actor that
+   *               owns the collection, or `null` if the collection is not
+   *               portable.
+   * @returns The setters object so that settings can be chained.
+   * @since 2.4.0
+   */
+  mapPortableOwner(
+    mapper: PortableCollectionOwnerMapper<TContextData, TParam>,
   ): CustomCollectionCallbackSetters<
     TParam,
     TContext,

@@ -1,10 +1,12 @@
 {
   "name": "@fedify/vocab-runtime",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "license": "MIT",
   "exports": {
     ".": "./src/mod.ts",
     "./internal/jsonld-cache": "./src/internal/jsonld-cache.ts",
+    "./internal/portable-dereference": "./src/internal/portable-dereference.ts",
+    "./internal/signed-representation": "./src/internal/signed-representation.ts",
     "./jsonld": "./src/jsonld.ts",
     "./temporal": "./src/temporal.ts"
   },
@@ -34,6 +36,6 @@
   },
   "tasks": {
     "check": "deno fmt --check && deno lint && deno check src/*.ts",
-    "test": "deno test"
+    "test": "deno test --allow-net --allow-env=LOG"
   }
 }

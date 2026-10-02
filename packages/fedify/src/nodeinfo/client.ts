@@ -6,6 +6,7 @@ import {
 } from "@fedify/vocab-runtime";
 import type { ResourceDescriptor } from "@fedify/webfinger";
 import { getLogger } from "@logtape/logtape";
+import { MAX_BODY_SIZE, readBoundedText } from "../utils/body.ts";
 import type {
   InboundService,
   JsonValue,
@@ -30,8 +31,8 @@ const DEFAULT_MAX_REDIRECTION = 5;
  * bounce the request to an internal address.
  * @param url The URL to fetch.
  * @param headers The request headers.
- * @returns The final response, or `null` if the URL is disallowed or there
- *          are too many redirects.
+ * @returns The final response, or `null` if the URL is disallowed, its
+ *          hostname cannot be resolved, or there are too many redirects.
  */
 async function fetchPublicUrl(
   url: URL | string,
@@ -44,10 +45,17 @@ async function fetchPublicUrl(
       await validatePublicUrl(current.href);
     } catch (e) {
       if (e instanceof UrlError) {
-        logger.error(
-          "Refused to fetch a private or invalid URL {url}: {error}",
-          { url: current.href, error: e },
-        );
+        if (e.reason === "dns") {
+          logger.error("DNS lookup failed for {url}: {error}", {
+            url: current.href,
+            error: e,
+          });
+        } else {
+          logger.error(
+            "Refused to fetch a private or invalid URL {url}: {error}",
+            { url: current.href, error: e },
+          );
+        }
         return null;
       }
       throw e;
@@ -177,7 +185,9 @@ export async function getNodeInfo(
         });
         return undefined;
       }
-      const wellKnownRd = await wellKnownResponse.json() as ResourceDescriptor;
+      const wellKnownRd = JSON.parse(
+        await readBoundedText(wellKnownResponse, MAX_BODY_SIZE, wellKnownUrl),
+      ) as ResourceDescriptor;
       const link = wellKnownRd?.links?.find((link) =>
         link != null &&
         "rel" in link &&
@@ -213,7 +223,9 @@ export async function getNodeInfo(
       );
       return undefined;
     }
-    const data = await response.json();
+    const data = JSON.parse(
+      await readBoundedText(response, MAX_BODY_SIZE, nodeInfoUrl),
+    );
     if (options.parse === "none") return data as JsonValue;
     return parseNodeInfo(data, {
       tryBestEffort: options.parse === "best-effort",

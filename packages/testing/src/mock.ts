@@ -5,25 +5,46 @@ import type {
   Federation,
   FederationFetchOptions,
   FederationStartQueueOptions,
+  GetObjectOptions,
   Message,
+  ParseUriOptions,
   ParseUriResult,
+  PortableRequest,
   RequestContext,
   RouteActivityOptions,
 } from "@fedify/fedify/federation";
 import { hasProofLike, hasSignatureLike } from "@fedify/fedify/sig";
-import { Activity, CryptographicKey, Multikey } from "@fedify/vocab";
+import {
+  Activity,
+  CryptographicKey,
+  lookupObject as globalLookupObject,
+  Multikey,
+  Tombstone,
+} from "@fedify/vocab";
 import type {
   Collection,
   LookupObjectOptions,
   Object,
   TraverseCollectionOptions,
 } from "@fedify/vocab";
-import type { DocumentLoader } from "@fedify/vocab-runtime";
+import {
+  canonicalizePortableUri,
+  decodeMultibase,
+  type DocumentLoader,
+  formatIri,
+  fromCompatibleEf61Id,
+  getFe34Origin,
+  parseDigestMultibase,
+  parseHashlink,
+  parseIri,
+  type PortableObjectVerifier,
+} from "@fedify/vocab-runtime";
 import {
   createContext,
   createInboxContext,
   createOutboxContext,
   createRequestContext,
+  isSignedByAudience,
 } from "./context.ts";
 
 // Re-export for public API
@@ -120,6 +141,92 @@ function expandUriTemplate(
   });
 }
 
+/**
+ * Builds an FEP-ef61 portable ID from a DID authority and a path, validating
+ * the authority the same way as `@fedify/fedify` does.
+ */
+function buildPortableUri(authority: string, path: string): URL {
+  if (
+    typeof authority !== "string" ||
+    !/^did:[a-z0-9]+:[^/?#]+$/i.test(authority)
+  ) {
+    throw new TypeError(
+      "The authority of a portable ID must be a DID without a path, " +
+        "query, or fragment.",
+    );
+  }
+  const did = getFe34Origin(authority);
+  if (!isBase58BtcDidKey(did)) {
+    throw new TypeError(
+      "The did:key authority of a portable ID must be encoded in base58-btc, " +
+        "i.e., start with z.",
+    );
+  }
+  return parseIri(`ap+ef61://${did}${path}`);
+}
+
+/**
+ * Checks that a normalized DID, if it is a `did:key` DID, is encoded in
+ * base58-btc, as `@fedify/fedify` requires of portable IDs.
+ */
+function isBase58BtcDidKey(did: string): boolean {
+  return !did.startsWith("did:key:") ||
+    /^z[1-9A-HJ-NP-Za-km-z]+$/.test(did.slice("did:key:".length));
+}
+
+/**
+ * Recognizes an FEP-ef61 portable ID, i.e., an `ap:` or `ap+ef61:` URI, or
+ * a compatible identifier on any gateway, validating it the same way as
+ * `Context.parseUri()` of `@fedify/fedify` does.
+ * @returns The DID and the path of the portable ID, `null` if it is
+ *          malformed, or `undefined` if the URI is not a portable ID.
+ */
+function parseMockPortableId(
+  uri: URL,
+): { authority: string; path: string } | null | undefined {
+  const portable = uri.protocol === "ap:" || uri.protocol === "ap+ef61:";
+  if (
+    !portable &&
+    !((uri.protocol === "http:" || uri.protocol === "https:") &&
+      /^\/\.well-known\/apgateway\/did(?::|%3A)/i.test(uri.pathname))
+  ) {
+    return undefined;
+  }
+  if (uri.username !== "" || uri.password !== "") return null;
+  try {
+    // The query of a compatible identifier is ignored, as the gateway
+    // endpoint does:
+    const id = portable
+      ? parseIri(uri)
+      : fromCompatibleEf61Id(uri.origin + uri.pathname);
+    if (id == null) return null;
+    canonicalizePortableUri(formatIri(id));
+    const authority = getFe34Origin(id);
+    if (!isBase58BtcDidKey(authority)) return null;
+    return { authority, path: id.pathname };
+  } catch (error) {
+    if (error instanceof TypeError) return null;
+    throw error;
+  }
+}
+
+/**
+ * Parses a path in the way {@link MockContext.parseUri} does, i.e., only
+ * `/users/{identifier}` and its subpaths are recognized, as actors.
+ */
+function parseMockPath(path: string): ParseUriResult | null {
+  if (path.startsWith("/users/")) {
+    const parts = path.split("/");
+    if (parts.length >= 3) {
+      return {
+        type: "actor",
+        identifier: parts[2],
+      };
+    }
+  }
+  return null;
+}
+
 function validateOutboxListenerPath(
   path: string,
   dispatcherPath?: string,
@@ -181,10 +288,12 @@ interface TestContext<TContextData>
       RequestContext<TContextData>,
       | "request"
       | "url"
+      | "portableRequest"
       | "getActor"
       | "getObject"
       | "getSignedKey"
       | "getSignedKeyOwner"
+      | "isSignedByAudience"
       | "sendActivity"
       | "routeActivity"
     > {
@@ -220,8 +329,18 @@ interface TestFederation<TContextData>
 
   // Override createContext to return TestContext
   createContext(
+    baseUrl: URL,
+    contextData: TContextData,
+  ): TestContext<TContextData>;
+  createContext(
+    request: Request,
+    contextData: TContextData,
+    options?: { portableRequest?: PortableRequest },
+  ): TestContext<TContextData>;
+  createContext(
     baseUrlOrRequest: URL | Request,
     contextData: TContextData,
+    options?: { portableRequest?: PortableRequest },
   ): TestContext<TContextData>;
 }
 
@@ -294,6 +413,7 @@ class MockFederation<TContextData> implements Federation<TContextData> {
   private outboxListenerErrorHandler?: any;
   private mediaUploaderCallback?: any;
   private mediaUploaderAuthorizePredicate?: any;
+  private hashlinkMediaDispatcher?: any;
   private followingDispatcher?: any;
   private followersDispatcher?: any;
   private likedDispatcher?: any;
@@ -311,6 +431,9 @@ class MockFederation<TContextData> implements Federation<TContextData> {
       origin?: string;
       meterProvider?: any;
       tracerProvider?: any;
+      documentLoader?: DocumentLoader;
+      contextLoader?: DocumentLoader;
+      verifyPortableObject?: PortableObjectVerifier;
     } = {},
   ) {
     this.contextData = options.contextData;
@@ -346,34 +469,38 @@ class MockFederation<TContextData> implements Federation<TContextData> {
   setActorDispatcher(path: any, dispatcher: any): any {
     this.actorDispatchers.set(path, dispatcher);
     this.actorPath = path;
-    return {
+    const setters: any = {
       setKeyPairsDispatcher: (keyPairsDispatcher: any) => {
         this.actorKeyPairsDispatcher = keyPairsDispatcher;
-        return this as any;
+        return setters;
       },
-      mapHandle: () => this as any,
-      mapAlias: () => this as any,
-      authorize: () => this as any,
+      mapHandle: () => setters,
+      mapAlias: () => setters,
+      mapPortableActorId: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setObjectDispatcher(cls: any, path: string, dispatcher: any): any {
     this.objectDispatchers.set(path, dispatcher);
     this.objectPaths.set(cls.typeId.href, path);
-    return {
-      authorize: () => this as any,
+    const setters = {
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setInboxDispatcher(_path: any, dispatcher: any): any {
     this.inboxDispatcher = dispatcher;
     // Note: inboxPath is set in setInboxListeners
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setOutboxDispatcher(path: any, dispatcher: any): any {
@@ -383,70 +510,76 @@ class MockFederation<TContextData> implements Federation<TContextData> {
     );
     this.outboxDispatcher = dispatcher;
     this.outboxPath = path;
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
       authorize: (predicate: any) => {
         this.outboxDispatcherAuthorizePredicate = predicate;
-        return this as any;
+        return setters;
       },
     };
+    return setters;
   }
 
   setFollowingDispatcher(path: any, dispatcher: any): any {
     this.followingDispatcher = dispatcher;
     this.followingPath = path;
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setFollowersDispatcher(path: any, dispatcher: any): any {
     this.followersDispatcher = dispatcher;
     this.followersPath = path;
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setLikedDispatcher(path: any, dispatcher: any): any {
     this.likedDispatcher = dispatcher;
     this.likedPath = path;
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setFeaturedDispatcher(path: any, dispatcher: any): any {
     this.featuredDispatcher = dispatcher;
     this.featuredPath = path;
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setFeaturedTagsDispatcher(path: any, dispatcher: any): any {
     this.featuredTagsDispatcher = dispatcher;
     this.featuredTagsPath = path;
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
     };
+    return setters;
   }
 
   setInboxListeners(inboxPath: any, sharedInboxPath?: string): any {
@@ -467,6 +600,9 @@ class MockFederation<TContextData> implements Federation<TContextData> {
         return this;
       },
       onUnverifiedActivity(): any {
+        return this;
+      },
+      onRequestFinished(): any {
         return this;
       },
       setSharedKeyDispatcher(): any {
@@ -522,6 +658,13 @@ class MockFederation<TContextData> implements Federation<TContextData> {
     };
   }
 
+  setHashlinkMediaDispatcher(dispatcher: any): void {
+    if (this.hashlinkMediaDispatcher != null) {
+      throw new TypeError("Hashlink media dispatcher already set.");
+    }
+    this.hashlinkMediaDispatcher = dispatcher;
+  }
+
   setOutboxPermanentFailureHandler(_handler: any): void {
     // Mock implementation - no-op
   }
@@ -556,16 +699,33 @@ class MockFederation<TContextData> implements Federation<TContextData> {
   }
 
   createContext(
-    baseUrlOrRequest: any,
+    baseUrl: URL,
     contextData: TContextData,
-  ): any {
+  ): TestContext<TContextData>;
+  createContext(
+    request: Request,
+    contextData: TContextData,
+    options?: { portableRequest?: PortableRequest },
+  ): TestContext<TContextData>;
+  createContext(
+    baseUrlOrRequest: URL | Request,
+    contextData: TContextData,
+    options?: { portableRequest?: PortableRequest },
+  ): TestContext<TContextData>;
+  createContext(
+    baseUrlOrRequest: URL | Request,
+    contextData: TContextData,
+    options: { portableRequest?: PortableRequest } = {},
+  ): TestContext<TContextData> {
     // deno-lint-ignore no-this-alias
     const mockFederation = this;
 
     const request = baseUrlOrRequest instanceof Request
       ? baseUrlOrRequest
       : null;
-    const url = request == null ? baseUrlOrRequest : new URL(request.url);
+    const url = request == null
+      ? baseUrlOrRequest as URL
+      : new URL(request.url);
 
     return new MockContext({
       url,
@@ -574,15 +734,83 @@ class MockFederation<TContextData> implements Federation<TContextData> {
       federation: mockFederation as any,
       meterProvider: this.options.meterProvider,
       tracerProvider: this.options.tracerProvider,
+      documentLoader: this.options.documentLoader,
+      contextLoader: this.options.contextLoader,
+      verifyPortableObject: this.options.verifyPortableObject,
+      portableRequest: options.portableRequest,
     });
   }
 
-  // deno-lint-ignore require-await
   async fetch(
     request: Request,
     options: FederationFetchOptions<TContextData>,
   ): Promise<Response> {
-    // returning 404 by default
+    if (this.hashlinkMediaDispatcher != null) {
+      const url = new URL(request.url);
+      const prefix = "/.well-known/apgateway/";
+      if (
+        (url.protocol === "http:" || url.protocol === "https:") &&
+        url.pathname.startsWith(prefix)
+      ) {
+        const encoded = url.pathname.slice(prefix.length);
+        if (/^hl(?::|%3A)/i.test(encoded)) {
+          if (request.method !== "GET" && request.method !== "HEAD") {
+            return new Response("Method not allowed.", {
+              status: 405,
+              headers: {
+                Allow: "GET, HEAD",
+                "Content-Type": "text/plain; charset=utf-8",
+              },
+            });
+          }
+          let media;
+          try {
+            let hashlink: string;
+            try {
+              hashlink = decodeURIComponent(encoded);
+            } catch (error) {
+              throw new TypeError("Invalid percent-encoding in the hashlink.", {
+                cause: error,
+              });
+            }
+            const { digestMultibase } = parseHashlink(hashlink);
+            const { digest } = parseDigestMultibase(digestMultibase);
+            media = globalThis.Object.freeze({
+              hashlink: `hl:${digestMultibase}`,
+              digestMultibase,
+              algorithm: "sha2-256",
+              digest,
+              multihash: decodeMultibase(digestMultibase),
+            });
+          } catch (error) {
+            if (!(error instanceof TypeError)) throw error;
+            return new Response(
+              request.method === "HEAD" ? null : "Malformed hashlink.",
+              {
+                status: 400,
+                headers: { "Content-Type": "text/plain; charset=utf-8" },
+              },
+            );
+          }
+          const context = this.createContext(request, options.contextData);
+          const response = await this.hashlinkMediaDispatcher(context, media);
+          if (response == null) {
+            return options.onNotFound == null
+              ? new Response("Not Found", { status: 404 })
+              : await options.onNotFound(request);
+          }
+          if (request.method !== "HEAD" || response.body == null) {
+            return response;
+          }
+          response.body.cancel().catch(() => {});
+          return new Response(null, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        }
+      }
+    }
     if (options.onNotFound) {
       return options.onNotFound(request);
     }
@@ -778,12 +1006,14 @@ class MockFederation<TContextData> implements Federation<TContextData> {
     _dispatcher: any,
   ): any {
     // Mock implementation - just return a mock callback setters object
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
+      mapPortableOwner: () => setters,
     };
+    return setters;
   }
 
   setOrderedCollectionDispatcher<
@@ -796,12 +1026,14 @@ class MockFederation<TContextData> implements Federation<TContextData> {
     _dispatcher: any,
   ): any {
     // Mock implementation - just return a mock callback setters object
-    return {
-      setCounter: () => this as any,
-      setFirstCursor: () => this as any,
-      setLastCursor: () => this as any,
-      authorize: () => this as any,
+    const setters = {
+      setCounter: () => setters,
+      setFirstCursor: () => setters,
+      setLastCursor: () => setters,
+      authorize: () => setters,
+      mapPortableOwner: () => setters,
     };
+    return setters;
   }
 }
 
@@ -851,6 +1083,16 @@ export function createFederation<TContextData>(
      */
     meterProvider?: any;
     tracerProvider?: any;
+    /** The document loader used by mock context lookups. @since 2.4.0 */
+    documentLoader?: DocumentLoader;
+    /** The JSON-LD context loader used by mock context lookups. @since 2.4.0 */
+    contextLoader?: DocumentLoader;
+    /**
+     * The portable object verifier used by mock context lookups when a
+     * document loader is provided.  Mock collection traversal remains empty.
+     * @since 2.4.0
+     */
+    verifyPortableObject?: PortableObjectVerifier;
   } = {},
 ): TestFederation<TContextData> {
   return new MockFederation<TContextData>(options);
@@ -912,6 +1154,10 @@ class MockContext<TContextData> implements Context<TContextData> {
   readonly tracerProvider: any;
   readonly request: Request;
   readonly url: URL;
+  readonly portableRequest?: PortableRequest;
+  readonly verifyPortableObject?: PortableObjectVerifier;
+  private readonly hasDocumentLoader: boolean;
+  private readonly hasContextLoader: boolean;
 
   private sentActivities: Array<{
     sender: any;
@@ -928,6 +1174,10 @@ class MockContext<TContextData> implements Context<TContextData> {
       federation: Federation<TContextData>;
       documentLoader?: DocumentLoader;
       contextLoader?: DocumentLoader;
+      verifyPortableObject?: PortableObjectVerifier;
+      portableRequest?: PortableRequest;
+      hasDocumentLoader?: boolean;
+      hasContextLoader?: boolean;
       meterProvider?: any;
       tracerProvider?: any;
     },
@@ -939,6 +1189,12 @@ class MockContext<TContextData> implements Context<TContextData> {
     this.hostname = url.hostname;
     this.url = url;
     this.request = options.request ?? new Request(url);
+    this.portableRequest = options.portableRequest;
+    this.verifyPortableObject = options.verifyPortableObject;
+    this.hasDocumentLoader = options.hasDocumentLoader ??
+      options.documentLoader != null;
+    this.hasContextLoader = options.hasContextLoader ??
+      options.contextLoader != null;
     this.data = options.data;
     this.federation = options.federation;
     // deno-lint-ignore require-await
@@ -966,16 +1222,45 @@ class MockContext<TContextData> implements Context<TContextData> {
     return null;
   }
 
+  getObject<TObject extends Object>(
+    cls: (new (...args: any[]) => TObject) & { typeId: URL },
+    values: Record<string, string>,
+  ): Promise<TObject | null>;
+  getObject<TObject extends Object>(
+    cls: (new (...args: any[]) => TObject) & { typeId: URL },
+    values: Record<string, string>,
+    options: GetObjectOptions & { readonly tombstone: "passthrough" },
+  ): Promise<TObject | Tombstone | null>;
+  getObject<TObject extends Object>(
+    cls: (new (...args: any[]) => TObject) & { typeId: URL },
+    values: Record<string, string>,
+    options: GetObjectOptions & { readonly tombstone?: "suppress" | undefined },
+  ): Promise<TObject | null>;
+  getObject<TObject extends Object>(
+    cls: (new (...args: any[]) => TObject) & { typeId: URL },
+    values: Record<string, string>,
+    options: GetObjectOptions,
+  ): Promise<TObject | Tombstone | null>;
   async getObject<TObject extends Object>(
     cls: (new (...args: any[]) => TObject) & { typeId: URL },
     values: Record<string, string>,
-  ): Promise<TObject | null> {
+    options?: GetObjectOptions,
+  ): Promise<TObject | Tombstone | null> {
     if (this.federation instanceof MockFederation) {
       const path = this.federation.objectPaths.get(cls.typeId.href);
       if (path) {
         const dispatcher = this.federation.objectDispatchers.get(path);
         if (dispatcher) {
-          return await dispatcher(this, values);
+          const object = await dispatcher(this, values);
+          // Same as RequestContext.getObject(), a tombstone that is not
+          // an instance of the requested class is suppressed by default:
+          if (
+            object instanceof Tombstone && !(object instanceof cls) &&
+            options?.tombstone !== "passthrough"
+          ) {
+            return null;
+          }
+          return object;
         }
       }
     }
@@ -988,6 +1273,14 @@ class MockContext<TContextData> implements Context<TContextData> {
 
   getSignedKeyOwner(): Promise<any> {
     return Promise.resolve(null);
+  }
+
+  isSignedByAudience(object: any, options?: any): Promise<boolean> {
+    return isSignedByAudience(
+      () => this.getSignedKeyOwner(),
+      object,
+      options?.isMember,
+    );
   }
 
   #resolveTaskDefinition(task: any): any {
@@ -1044,10 +1337,15 @@ class MockContext<TContextData> implements Context<TContextData> {
   clone(data: TContextData): TestContext<TContextData> {
     return new MockContext({
       url: this.url,
+      request: this.request,
       data,
       federation: this.federation,
       documentLoader: this.documentLoader,
       contextLoader: this.contextLoader,
+      verifyPortableObject: this.verifyPortableObject,
+      portableRequest: this.portableRequest,
+      hasDocumentLoader: this.hasDocumentLoader,
+      hasContextLoader: this.hasContextLoader,
       meterProvider: this.meterProvider,
       tracerProvider: this.tracerProvider,
     });
@@ -1089,6 +1387,64 @@ class MockContext<TContextData> implements Context<TContextData> {
       .map(([key, value]) => `${key}/${value}`)
       .join("/");
     return new URL(`/objects/${cls.name.toLowerCase()}/${path}`, this.origin);
+  }
+
+  getPortableActorUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getActorUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableObjectUri<TObject extends Object>(
+    cls: (new (...args: any[]) => TObject) & { typeId: URL },
+    values: Record<string, string>,
+    authority: string,
+  ): URL {
+    const { pathname } = this.getObjectUri(cls, values);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableInboxUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getInboxUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableOutboxUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getOutboxUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableFollowingUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getFollowingUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableFollowersUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getFollowersUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableLikedUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getLikedUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableFeaturedUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getFeaturedUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableFeaturedTagsUri(identifier: string, authority: string): URL {
+    const { pathname } = this.getFeaturedTagsUri(identifier);
+    return buildPortableUri(authority, pathname);
+  }
+
+  getPortableCollectionUri<TParam extends Record<string, string>>(
+    name: string | symbol,
+    values: TParam,
+    authority: string,
+  ): URL {
+    const { pathname } = this.getCollectionUri(name, values);
+    return buildPortableUri(authority, pathname);
   }
 
   getOutboxUri(identifier: string): URL {
@@ -1209,17 +1565,18 @@ class MockContext<TContextData> implements Context<TContextData> {
     return new URL(`/collections/${String(_name)}/${path}`, this.origin);
   }
 
-  parseUri(uri: URL): ParseUriResult | null {
-    if (uri.pathname.startsWith("/users/")) {
-      const parts = uri.pathname.split("/");
-      if (parts.length >= 3) {
-        return {
-          type: "actor",
-          identifier: parts[2],
-        };
-      }
-    }
-    return null;
+  parseUri(
+    uri: URL | null,
+    options: ParseUriOptions = {},
+  ): ParseUriResult | null {
+    if (uri == null) return null;
+    const portable = parseMockPortableId(uri);
+    if (portable === undefined) return parseMockPath(uri.pathname);
+    if (portable === null || !options.portable) return null;
+    const result = parseMockPath(portable.path);
+    return result == null
+      ? null
+      : { ...result, authority: portable.authority } as ParseUriResult;
   }
 
   async getActorKeyPairs(identifier: string): Promise<ActorKeyPair[]> {
@@ -1259,10 +1616,38 @@ class MockContext<TContextData> implements Context<TContextData> {
   }
 
   lookupObject(
-    _uri: URL | string,
-    _options?: LookupObjectOptions,
+    uri: URL | string,
+    options: LookupObjectOptions = {},
   ): Promise<Object | null> {
-    return Promise.resolve(null);
+    if (
+      (!this.hasDocumentLoader && options.documentLoader == null) ||
+      (options.verifyPortableObject ?? this.verifyPortableObject) == null
+    ) {
+      return Promise.resolve(null);
+    }
+    // The mock only supports portable lookups.  The global helper falls back
+    // to live WebFinger for ordinary URLs and handles when a fixture misses.
+    const value = typeof uri === "string" ? uri : formatIri(uri);
+    if (!/^ap(?:\+ef61)?:\/\//i.test(value)) {
+      try {
+        if (fromCompatibleEf61Id(value) == null) {
+          return Promise.resolve(null);
+        }
+      } catch (error) {
+        if (error instanceof TypeError) return Promise.resolve(null);
+        throw error;
+      }
+    }
+    return globalLookupObject(uri, {
+      ...options,
+      documentLoader: options.documentLoader ?? this.documentLoader,
+      contextLoader: options.contextLoader ??
+        (this.hasContextLoader
+          ? this.contextLoader
+          : options.documentLoader ?? this.contextLoader),
+      verifyPortableObject: options.verifyPortableObject ??
+        this.verifyPortableObject,
+    });
   }
 
   traverseCollection<TItem, TContext extends Context<TContextData>>(

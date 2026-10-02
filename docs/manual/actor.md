@@ -757,3 +757,530 @@ for the actor's profile URL with the corresponding actor URI.
 > [!TIP]
 > The callback function of the `~ActorCallbackSetters.mapAlias()` method
 > can be an async function.
+
+
+Portable actors and WebFinger
+-----------------------------
+
+*This API is available since Fedify 2.4.0.*
+
+An [FEP-ef61] portable actor has an ID that is not tied to a server, such as
+`ap+ef61://did:key:z6Mk.../users/alice`, and a `gateways` property that lists
+the servers where the actor can be retrieved.  Since the ID has no host,
+FEP-ef61 takes the domain of the actor's WebFinger address from the *first*
+gateway instead: a portable actor with `preferredUsername` `alice` and
+`https://example.com` as its first gateway is `@alice@example.com`.
+
+FEP-ef61 requires a portable actor to have at least one gateway, and every
+gateway to be an HTTP(S) URI with an empty path, query, and fragment, such as
+`https://example.com`.  If the actor dispatcher returns a portable actor whose
+`gateways` is empty or has any other item, Fedify logs a warning.  Fedify does
+not serve such an actor through the gateway endpoint, and
+`verifyPortableObjectProof()` rejects it with the `invalidGateways` reason,
+so other servers running Fedify reject it too.
+
+Fedify's WebFinger endpoint supports portable actors through the same actor
+dispatcher, `~ActorCallbackSetters.mapHandle()`, and
+`~ActorCallbackSetters.mapAlias()` as ordinary actors.  If the actor dispatcher
+returns an actor whose ID is a portable ID, Fedify responds as follows:
+
+ -  The `self` link is the actor's *compatible identifier* made from its first
+    gateway, e.g.,
+    `https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice`,
+    so that software that does not support portable IDs can still fetch the
+    actor.  Software that supports them recovers the portable ID from it.
+    The portable ID itself is not put in the response, as it is not a valid
+    URI for most WebFinger clients.  If the actor's ID is a compatible
+    identifier already (see the [*Compatible identifiers as actor IDs*
+    section](#compatible-identifiers-as-actor-ids)), the `self` link is the
+    ID as is.
+ -  The `subject` is the `acct:` URI whose domain is the host of the first
+    gateway.  If this server is not the first gateway, the queried `acct:`
+    URI is listed in `aliases` instead.
+ -  If the actor has no `gateways`, or its first gateway is not an HTTP(S)
+    origin, Fedify logs an error and responds as if the actor were not found.
+
+The actor dispatcher also serves portable actors at their compatible
+identifiers, i.e., requests through the FEP-ef61 gateway endpoint like
+`GET /.well-known/apgateway/did:key:z6Mk.../users/alice`, with the path after
+the DID.  So use the portable ID that `~Context.getPortableActorUri()` builds
+from the same path as the actor's ID (see the [*Portable IDs*
+section](./context.md#portable-ids) for how to get a DID):
+
+~~~~ typescript twoslash
+import { signObject } from "@fedify/fedify";
+import { type Federation } from "@fedify/fedify";
+import { Person } from "@fedify/vocab";
+const federation = null as unknown as Federation<void>;
+interface User { username: string; did: string }
+async function findUser(_identifier: string): Promise<User | null> {
+  return null;
+}
+async function getPortableKey(
+  _did: string,
+): Promise<{ privateKey: CryptoKey; keyId: URL }> {
+  return null!;
+}
+// ---cut-before---
+federation
+  .setActorDispatcher("/users/{identifier}", async (ctx, identifier) => {
+    const user = await findUser(identifier);
+    if (user == null) return null;
+    // Serving GET /.well-known/apgateway/did:key:z6Mk.../users/alice; the DID
+    // comes from the request path, so make sure that it is the user's:
+    if (
+      ctx.portableRequest != null &&
+      ctx.portableRequest.authority !== user.did
+    ) {
+      return null;
+    }
+    const { privateKey, keyId } = await getPortableKey(user.did);
+    return await signObject(
+      new Person({
+        // ap+ef61://did:key:z6Mk.../users/alice
+        id: ctx.getPortableActorUri(identifier, user.did),
+        preferredUsername: user.username,
+        gateways: [new URL("https://example.com")],
+      }),
+      privateKey,
+      keyId,  // e.g., did:key:z6Mk...#z6Mk...
+    );
+  })
+  // Maps the WebFinger username (preferredUsername) back to the identifier:
+  .mapHandle((ctx, username) => username);
+~~~~
+
+Such a request is handled the same way as a portable object request that an
+object dispatcher serves (see the [*Serving portable objects*
+section](./object.md#serving-portable-objects)): the actor is served only if
+its ID canonically equals the requested portable ID and it has an Object
+Integrity Proof made with a key of the DID, and
+the `~ActorCallbackSetters.authorize()` predicate, if any, is applied.
+Otherwise, Fedify responds with `404 Not Found`, or with
+`500 Internal Server Error` if the proof is missing or invalid.  A `Tombstone`
+returned for a deleted portable actor is served with `410 Gone` if it has
+a proof made with a key of the DID, and with `404 Not Found` if it has no
+proof (see the [*Deleted portable objects*
+section](./object.md#deleted-portable-objects)).  Ordinary requests for the
+actor, WebFinger, and
+[portable inbox](./inbox.md#portable-inboxes) deliveries do not set
+`~RequestContext.portableRequest`, so the dispatcher returns the actor for
+them as usual.
+
+An object dispatcher can serve a portable actor as well, if you want its ID
+to have a path other than the actor dispatcher's; in that case, build the
+actor's ID with `~Context.getPortableObjectUri()` instead.
+
+> [!NOTE]
+> Fedify generates only one `self` link for a portable actor, but links
+> returned by the [WebFinger links dispatcher](#webfinger-links) are added
+> as they are.  Also note that WebFinger discovery alone does not make
+> a portable actor usable for software without FEP-ef61 support, which may
+> still refuse the actor document whose ID is a portable ID.
+
+On the other side, `Context.lookupObject()` resolves a handle of a portable
+actor, e.g., `@alice@example.com`, whether the `self` link of the WebFinger
+response is a portable ID or a compatible identifier.  It fetches the actor
+through gateways, asking the WebFinger server first, and returns it only if it
+has a valid Object Integrity Proof made by the DID in its ID; the WebFinger
+server is never treated as the actor's origin.  See the [*Looking up remote
+objects* section](./context.md#looking-up-remote-objects) for details.
+The `getActorHandle()` function, in turn, takes the domain of a portable
+actor's handle from its first gateway, and returns the handle only if the
+WebFinger response for it links back to the actor, since anyone can list any
+server in the `gateways` of their actor.
+
+[FEP-ef61]: https://w3id.org/fep/ef61
+
+
+Compatible identifiers as actor IDs
+-----------------------------------
+
+*This API is available since Fedify 2.4.0.*
+
+Software that does not support [FEP-ef61] cannot handle portable IDs like
+`ap+ef61://did:key:z6Mk.../users/alice`, and may refuse an actor document
+whose ID is one.  For such software, FEP-ef61 lets a portable actor, and its
+activities and objects, be identified by their *compatible identifiers*
+instead, e.g.,
+`https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice`.
+Some implementations, such as [tootik], identify all their portable actors
+this way.
+
+Prefer portable IDs unless your actors have to interoperate with software
+that cannot handle them.  A compatible identifier has a few drawbacks:
+
+ -  FEP-ef61 requires publishers to construct compatible identifiers with
+    the *first* gateway in the actor's `gateways`, so changing the first
+    gateway changes the IDs that software without FEP-ef61 support sees,
+    although the canonical portable IDs stay the same.
+ -  Software without FEP-ef61 support takes every object that a gateway
+    serves as having the same origin, as it does not know the DIDs in the
+    compatible identifiers.
+
+Fedify treats an actor whose ID is a compatible identifier as a portable actor
+in the same way as one whose ID is a portable ID, since software that supports
+FEP-ef61 turns the compatible identifier back into the portable ID it contains:
+
+ -  Its activities follow the same rules as those of other portable actors:
+    each has to have a portable ID or a compatible identifier of the actor's
+    DID, and is signed only by the DID's key.  See the [*Choosing the proof
+    key* section](./send.md#choosing-the-proof-key).
+ -  The [actor dispatcher](#portable-actors-and-webfinger) and the [object
+    dispatchers](./object.md#serving-portable-objects) that serve the actor
+    and its objects may return them with compatible identifiers as their IDs.
+ -  Its WebFinger `self` link is its ID as is, while the domain of its
+    address still comes from its first gateway.
+ -  Its inbox may be a compatible identifier as well, through which Fedify
+    accepts deliveries as for other [portable
+    inboxes](./inbox.md#portable-inboxes).
+ -  The `~ActorCallbackSetters.mapPortableActorId()` callback may return the
+    compatible identifier; see the [*Gateway keys of portable actors*
+    section](#gateway-keys-of-portable-actors).
+
+The `~Context.getPortableActorUri()`, `~Context.getPortableObjectUri()`, and
+`~Context.getPortableInboxUri()` methods build portable IDs only.  Turn them
+into compatible identifiers on the actor's first gateway with
+`toCompatibleEf61Id()`, before signing the documents that contain them; a
+signed document cannot be rewritten without invalidating its proof:
+
+~~~~ typescript twoslash
+import { type Context, signObject } from "@fedify/fedify";
+import { Person } from "@fedify/vocab";
+import { toCompatibleEf61Id } from "@fedify/vocab-runtime";
+interface User { username: string; did: string; identifier: string }
+async function getPortableKey(
+  _did: string,
+): Promise<{ privateKey: CryptoKey; keyId: URL }> {
+  return null!;
+}
+// ---cut-before---
+const gateways = [new URL("https://example.com"), new URL("https://other.example")];
+
+async function getPortableActor(
+  ctx: Context<void>,
+  user: User,
+): Promise<Person> {
+  const { privateKey, keyId } = await getPortableKey(user.did);
+  return await signObject(
+    new Person({
+      // https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice
+      id: toCompatibleEf61Id(
+        ctx.getPortableActorUri(user.identifier, user.did),
+        gateways[0],
+      ),
+      // https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice/inbox
+      inbox: toCompatibleEf61Id(
+        ctx.getPortableInboxUri(user.identifier, user.did),
+        gateways[0],
+      ),
+      preferredUsername: user.username,
+      gateways,
+    }),
+    privateKey,
+    keyId,  // e.g., did:key:z6Mk...#z6Mk...
+  );
+}
+~~~~
+
+If the actor dispatcher returns an actor whose ID is a compatible identifier
+that is malformed, e.g., has `@gateway` location hints, or is not on the
+actor's first gateway, Fedify logs a warning.  It also checks the
+compatible identifiers of objects returned by object dispatchers and of
+activities and their embedded objects sent by `Context.sendActivity()` against
+the owner's first gateway when the local actor document is available.  The
+warning does not reject or change the object.  An outgoing activity can also
+carry an embedded actor document with its gateways when the actor-dehydrating
+activity transformer is disabled; otherwise a send from a plain `Context`
+cannot check the first gateway without fetching that actor.
+Fedify still warns when an activity and its actor use compatible identifiers
+on different gateways.
+
+A WebFinger query for the compatible identifier itself does not match the
+actor dispatcher's path, so map it back to the actor's identifier through
+`~ActorCallbackSetters.mapAlias()`:
+
+~~~~ typescript twoslash
+import { type Federation } from "@fedify/fedify";
+import { fromCompatibleEf61Id, getFe34Origin } from "@fedify/vocab-runtime";
+const federation = null as unknown as Federation<void>;
+interface User { identifier: string; username: string }
+async function findUserByDid(_did: string): Promise<User | null> {
+  return null;
+}
+// ---cut-before---
+federation
+  .setActorDispatcher("/users/{identifier}", async (ctx, identifier) => {
+    // Omitted for brevity; see the example above.
+    return null;
+  })
+  .mapAlias(async (ctx, resource) => {
+    let portableId: URL | null;
+    try {
+      // e.g., ap+ef61://did:key:z6Mk.../users/alice:
+      portableId = fromCompatibleEf61Id(resource);
+    } catch {
+      return null;  // A malformed compatible identifier.
+    }
+    if (portableId == null) return null;  // Not a compatible identifier.
+    // did:key:z6Mk...
+    const user = await findUserByDid(getFe34Origin(portableId));
+    if (
+      user == null ||
+      portableId.pathname !== ctx.getActorUri(user.identifier).pathname
+    ) {
+      return null;
+    }
+    return { identifier: user.identifier };
+  });
+~~~~
+
+[tootik]: https://github.com/dimkr/tootik
+
+
+Gateway keys of portable actors
+-------------------------------
+
+*This API is available since Fedify 2.4.0.*
+
+When a server delivers activities or makes signed requests on behalf of an
+[FEP-ef61] portable actor, it acts as one of the actor's gateways, and signs
+the requests with HTTP Signatures as usual.  FEP-ef61 asks each gateway to
+sign with its own keys, and to list their public keys in the actor's
+`assertionMethods` as [FEP-521a] describes.  Fedify calls them
+*gateway keys*.
+
+Gateway keys only sign HTTP requests.  A portable actor's activities and
+objects are authenticated by the Object Integrity Proofs made by the actor's
+DID, not by the gateway that sends them.  So Fedify never makes Object
+Integrity Proofs or Linked Data Signatures with gateway keys, and never takes
+a gateway's HTTP Signature in place of a proof.
+
+To have the [key pairs dispatcher](#public-keys-of-an-actor) dispatch gateway
+keys for a portable actor, tell Fedify the actor's portable ID through
+the `~ActorCallbackSetters.mapPortableActorId()` method:
+
+~~~~ typescript twoslash
+import { type Federation } from "@fedify/fedify";
+const federation = null as unknown as Federation<void>;
+interface User { username: string; did: string }
+async function findUser(_identifier: string): Promise<User | null> {
+  return null;
+}
+async function getGatewayKeyPairs(
+  _identifier: string,
+): Promise<CryptoKeyPair[]> {
+  return [];
+}
+// ---cut-before---
+federation
+  .setActorDispatcher("/users/{identifier}", async (ctx, identifier) => {
+    // Omitted for brevity; see the example below.
+    return null;
+  })
+  .setKeyPairsDispatcher(async (ctx, identifier) => {
+    // This server's own key pairs for the actor, not the DID's key pair:
+    return await getGatewayKeyPairs(identifier);
+  })
+  .mapPortableActorId(async (ctx, identifier) => {
+    const user = await findUser(identifier);
+    if (user == null) return null;  // Not a portable actor.
+    // The same ID as the actor dispatcher returns for the actor, e.g.,
+    // ap+ef61://did:key:z6Mk.../users/alice:
+    return ctx.getPortableActorUri(identifier, user.did);
+  });
+~~~~
+
+For an actor the callback returns a portable ID for, the
+`~Context.getActorKeyPairs()` method derives the keys this way:
+
+ -  The key IDs are the actor's [compatible identifier] on this server,
+    i.e., the canonical origin of the federation, with `#main-key` for
+    the first key and `#key-2`, `#key-3`, and so on for the rest, e.g.,
+    `https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice#main-key`.
+    Such key IDs can be dereferenced to the actor document that this server
+    serves through the [actor dispatcher](#portable-actors-and-webfinger), and
+    tell which gateway made the signature.
+ -  The `cryptographicKey` and the `multikey` of each key pair have the key ID
+    as their IDs, so that verifiers find the key with the signature's key ID
+    in both `publicKey` and `assertionMethod`.  Their owner and controller is
+    the portable actor ID that the callback returns.
+
+The RSA key among them signs the HTTP requests made on behalf of the actor,
+such as the ones made by `Context.sendActivity()`,
+`InboxContext.forwardActivity()`, and the document loader that
+`Context.getDocumentLoader()` returns for the actor, as well as the activities
+that Fedify [forwards from the actor's portable
+inbox](./inbox.md#forwarding-to-other-gateways) to its other gateways.  If the
+callback is not registered, or it returns `null`, the keys are derived from
+`Context.getActorUri()` as usual.
+
+The actor document itself has to list the keys of all the actor's gateways,
+while the key pairs dispatcher knows only this server's keys.  Fedify does not
+store or exchange the keys of other gateways, so add their public keys to
+the actor's `assertionMethods` yourself, and sign the document with the DID's
+key as usual:
+
+~~~~ typescript twoslash
+import { type Context, signObject } from "@fedify/fedify";
+import { type Multikey, Person } from "@fedify/vocab";
+interface User { username: string; did: string; identifier: string }
+async function getPortableKey(
+  _did: string,
+): Promise<{ privateKey: CryptoKey; keyId: URL }> {
+  return null!;
+}
+async function getOtherGatewayKeys(_did: string): Promise<Multikey[]> {
+  return [];
+}
+// ---cut-before---
+async function getPortableActor(
+  ctx: Context<void>,
+  user: User,
+): Promise<Person> {
+  const { privateKey, keyId } = await getPortableKey(user.did);
+  // This server's gateway keys:
+  const keys = await ctx.getActorKeyPairs(user.identifier);
+  return await signObject(
+    new Person({
+      id: ctx.getPortableActorUri(user.identifier, user.did),
+      preferredUsername: user.username,
+      gateways: [new URL("https://example.com"), new URL("https://other.example")],
+      publicKeys: keys.map((key) => key.cryptographicKey),
+      assertionMethods: [
+        ...keys.map((key) => key.multikey),
+        // The public keys of the actor's other gateways:
+        ...await getOtherGatewayKeys(user.did),
+      ],
+    }),
+    privateKey,
+    keyId,  // e.g., did:key:z6Mk...#z6Mk...
+  );
+}
+~~~~
+
+> [!IMPORTANT]
+> This server has to be listed in the actor's `gateways`.  Receivers accept
+> a gateway key only from a gateway the actor lists.
+
+Since the DID's key pair is not dispatched by the key pairs dispatcher, sign
+a portable actor's activities with `signObject()` before sending them, or pass
+the DID's key to `Context.sendActivity()` as an explicit sender key.  An
+activity of a portable actor has to have a portable ID or a compatible
+identifier of the actor's DID, and
+`Context.sendActivity()` throws a `TypeError` if it does not, or if it has no
+proof and no key can make one.  See the [*Choosing the proof key*
+section](./send.md#choosing-the-proof-key) for details.
+
+On the receiving side, Fedify verifies an HTTP Signature made with a gateway
+key if the key ID is a compatible identifier that dereferences to a portable
+actor document, and:
+
+ -  the document is the actor that the key ID is a compatible identifier of,
+    whether the document's own ID is a portable ID or, as some
+    implementations such as [tootik] publish, a compatible identifier,
+ -  the document has a valid Object Integrity Proof made by the actor's DID,
+ -  the document embeds the key in its `assertionMethod`, with the actor as
+    its `controller` (a `publicKey` entry that embeds a key with the same ID,
+    if any, must have the same key material), or, if no `assertionMethod` entry
+    has the key ID, in its `publicKey`, with the actor as its `owner`,
+ -  no more than one entry of either property has the key ID, and
+ -  the gateway that the key ID belongs to is listed in the actor's
+    `gateways`.
+
+An entry has the key ID if its ID is the key ID itself or the `ap:` URI with
+the same canonical ID, e.g., `ap://did:key:z6Mk.../actors/alice#main-key` for
+the key ID
+`https://example.com/.well-known/apgateway/did:key:z6Mk.../actors/alice#main-key`.
+Some implementations, such as [Mitra], list the keys of portable actors under
+`ap:` URIs, but sign requests with compatible key IDs on their own gateways. An
+entry under a compatible identifier on another gateway is that gateway's key,
+not this one's, even if its fragment is the same.
+
+Otherwise the signature is not verified.  A verified gateway key belongs to
+the portable actor, so `RequestContext.getSignedKeyOwner()` returns the actor,
+e.g., to decide whether the actor may see a non-public portable object.
+Inboxes, however, still require a valid Object Integrity Proof on the
+activities of portable actors; see the [*Portable actors*
+section](./inbox.md#portable-actors) of the inbox guide.
+
+Accepting a key listed only in `publicKey` is a tolerance for publishers that
+list their RSA keys there, such as [tootik]; list your own gateway keys in
+`assertionMethods` as FEP-ef61 requires.
+
+A portable actor, whether its ID is a portable ID or a compatible identifier,
+is never authenticated by the web origin that serves it.  If the document at
+a compatible key ID is a portable actor that does not vouch for the key, e.g.,
+an unsigned one on someone else's gateway, the key is rejected rather than
+resolved as an ordinary actor's.  Likewise, a key at an ordinary URL that
+names a portable actor as its owner or controller is never that actor's key.
+
+Fedify also verifies an HTTP Signature whose key ID is an `ap:` or
+`ap+ef61:` URI, such as
+`ap://did:key:z6Mk.../actors/alice?@gateway=https%3A%2F%2Fexample.com#main-key`.
+Such a key ID names no gateway, so the key is taken as a key of the actor
+itself rather than of a gateway.  Fedify fetches the actor's document, i.e.,
+the key ID without its fragment, from the gateways in its `@gateway` location
+hints, up to three of them one after another, and accepts the key if one of the
+documents vouches for it by the rules above, except that:
+
+ -  the key is listed under the `ap:` URI with the same canonical ID as the key
+    ID, never under a compatible identifier, which would be a gateway's key,
+ -  the key ID has to have a fragment, and
+ -  instead of listing a particular gateway, the actor only has to have a valid
+    gateway in its `gateways`.
+
+Without location hints, Fedify asks the document loader for the `ap:` URI
+itself, which only a custom document loader can resolve.  The hints are chosen
+by whoever made the signature, but only a document with a valid proof by the
+key ID's DID vouches for the key, wherever it is fetched from.  Since the hints
+decide whom Fedify contacts, it follows fewer of them than the five it follows
+when it dereferences objects, and ignores the rest.
+
+All the gateways share a timeout of ten seconds, which covers fetching the
+actor's document and the remote contexts it needs, so several slow gateways
+cannot hold a request any longer than a single one.  The gateways left once
+the time is up are not asked.  The timeout bounds the waiting, not the number
+of HTTP requests: redirections and remote contexts are fetched as usual.
+
+If no gateway serves such a document, the signature is not verified.  If
+a gateway could not serve the document at all, or not in time, the reason that
+`~InboxListenerSetters.onUnverifiedActivity()` receives is a failure to fetch
+the key (`keyFetchError`), whose HTTP status is reported only if every gateway
+responded with the same status, e.g., `410 Gone`.
+
+Fedify itself never signs requests with such key IDs; its own keys for
+portable actors are gateway keys.
+
+> [!WARNING]
+> The actor's document that vouches for a key at an `ap:` key ID can come
+> from anywhere, so a key that the actor has removed from its document is
+> still accepted by anyone who is shown an older document that lists it,
+> as long as the older document's proof is valid and has not expired.  Set
+> `expires` on the proofs of portable actor documents to limit this.
+
+Whether a key at a compatible identifier is valid depends on what it is used
+for, so Fedify caches such keys apart for each purpose: a gateway key cached
+for verifying HTTP Signatures is never used for Object Integrity Proofs or
+Linked Data Signatures.  A key at an `ap:` or `ap+ef61:` key ID is only ever
+used for HTTP Signatures, and is cached the same way.  Since the key's validity
+depends on the actor's signed document rather than its origin, and the actor
+can drop the gateway from its document at any time, Fedify looks up a cached
+gateway key again after an hour at most, or once the proof on the actor's
+document expires, whichever comes first.  A failure to fetch a key at a
+compatible identifier, by contrast, fails every purpose alike, so it is cached
+like that of any other key.
+
+The key that HTTP Signature verification returns, e.g., from
+`RequestContext.getSignedKey()` or `verifyRequest()`, remembers the portable
+actor whose document vouched for it, and the cache keeps the verified document
+along with the key unless the document is larger than 32 KiB.  Given that very
+key object, `getKeyOwner()`, `doesActorOwnKey()`, and thus
+`RequestContext.getSignedKeyOwner()` take the actor from that document instead
+of fetching and verifying it again, for as long as the key would stay cached.
+Any other key object, even one with the same ID, owner, and key material, is
+checked from scratch, and so is a key whose document was not cached.
+
+[FEP-521a]: https://w3id.org/fep/521a
+[compatible identifier]: https://w3id.org/fep/ef61#compatible-ids
+[Mitra]: https://codeberg.org/silverpill/mitra

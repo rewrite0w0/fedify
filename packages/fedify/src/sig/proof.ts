@@ -1,4 +1,11 @@
 import {
+  observeAttempt,
+  observeCheck,
+  triedKey,
+  verificationObservation,
+  type VerificationObservationOptions,
+} from "./verification.ts";
+import {
   Activity,
   DataIntegrityProof,
   getTypeId,
@@ -7,13 +14,21 @@ import {
 } from "@fedify/vocab";
 import {
   type DocumentLoader,
+  encodeMultibase,
   formatIri,
+  fromCompatibleEf61Id,
   getDocumentLoader,
   getFe34Origin,
-  haveSameFe34Origin,
+  parseGatewayUrl,
   parseIri,
+  type PortableObjectVerifier,
   type RemoteDocument,
 } from "@fedify/vocab-runtime";
+import { getPortableActorGateways } from "@fedify/vocab-runtime/internal/jsonld-cache";
+import {
+  isPlainJsonTree,
+  retainSignedRepresentation,
+} from "@fedify/vocab-runtime/internal/signed-representation";
 import jsonld from "@fedify/vocab-runtime/jsonld";
 import { getLogger } from "@logtape/logtape";
 import {
@@ -35,12 +50,14 @@ import {
   type SignatureVerificationResult,
 } from "../federation/metrics.ts";
 import {
+  bypassKeyCacheReads,
   fetchKey,
   type FetchKeyResult,
   type KeyCache,
   validateCryptoKey,
 } from "./key.ts";
 import { getNormalizationContextLoader } from "./ld.ts";
+import { getPortableDid, isPortableId } from "./portable-key-id.ts";
 
 /**
  * Known Object Integrity Proof `cryptosuite` values, used to keep
@@ -152,21 +169,96 @@ export interface CreateProofOptions {
 }
 
 /**
- * Creates a proof for the given object.
- * @param object The object to create a proof for.
- * @param privateKey The private key to sign the proof with.
- * @param keyId The key ID to use in the proof. It will be used by the verifier.
- * @param options Additional options.  See also {@link CreateProofOptions}.
- * @returns The created proof.
- * @throws {TypeError} If the private key is invalid or unsupported.
- * @since 0.10.0
+ * The outcome of {@link createProofInternal}: the proof, and the secured JSON
+ * document that the proof covers when Fedify was able to capture one.
  */
-export async function createProof(
+interface CreatedProof {
+  readonly proof: DataIntegrityProof;
+  /**
+   * The complete secured JSON document, or `null` when it could not be
+   * captured with certainty.  It is the exact JSON value the signer hashed,
+   * plus the proof that was computed over it, so removing its direct `proof`
+   * member reproduces the signing input byte for byte.
+   */
+  readonly securedDocument: Record<string, unknown> | null;
+}
+
+function isJsonMap(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value != null && !Array.isArray(value);
+}
+
+/**
+ * Assembles the secured JSON document from the bytes that were just signed.
+ *
+ * The document is not re-derived from the vocabulary object: it is
+ * `compactMsg`, the value whose JCS form was hashed, with the serialized
+ * proof added.  Every part of it is then checked against the digests and the
+ * signature that {@link createProofInternal} produced, so a document that is
+ * returned verifies under the map-local compound-proof profile by
+ * construction.  Anything that does not check out yields `null`, and the
+ * caller simply does not retain a representation.
+ */
+async function captureSecuredDocument(
+  proof: DataIntegrityProof,
+  compactMsg: unknown,
+  msgCanon: string,
+  proofCanon: string,
+  proofValue: string,
+  contextLoader: DocumentLoader | undefined,
+): Promise<Record<string, unknown> | null> {
+  if (!isJsonMap(compactMsg)) return null;
+  const documentContext = compactMsg["@context"];
+  // A secured child has to carry its own context; without one it cannot be
+  // extracted from a parent document and verified on its own.
+  if (documentContext == null) return null;
+  if (globalThis.Object.hasOwn(compactMsg, "proof")) return null;
+  try {
+    const proofJson = await proof.toJsonLd({
+      format: "compact",
+      contextLoader,
+      context: documentContext as
+        | string
+        | Record<string, string>
+        | (string | Record<string, string>)[],
+    });
+    if (!isJsonMap(proofJson)) return null;
+    const { proofValue: serializedProofValue, ...proofConfiguration } =
+      proofJson;
+    if (serializedProofValue !== proofValue) return null;
+    if (serialize(proofConfiguration) !== proofCanon) return null;
+    const securedDocument: Record<string, unknown> = {
+      ...structuredClone(compactMsg),
+      proof: structuredClone(proofJson),
+    };
+    const { proof: _embeddedProof, ...unsecuredDocument } = securedDocument;
+    if (serialize(unsecuredDocument) !== msgCanon) return null;
+    // A document that is too large or too deep to validate cannot be
+    // retained.  Signing still succeeds; only the representation is dropped.
+    if (!isPlainJsonTree(securedDocument)) return null;
+    return securedDocument;
+  } catch (error) {
+    logger.debug(
+      "Failed to capture the secured JSON document for a created proof; " +
+        "the signed object will not preserve its representation when it is " +
+        "embedded in another object.\n{error}",
+      { error },
+    );
+    return null;
+  }
+}
+
+async function createProofInternal(
   object: Object,
   privateKey: CryptoKey,
   keyId: URL,
   { contextLoader, context, created }: CreateProofOptions = {},
-): Promise<DataIntegrityProof> {
+  /**
+   * Whether to assemble the secured JSON document.  Only `signObject()` needs
+   * it, and only when it can retain it, so `createProof()` skips the extra
+   * serialization.
+   */
+  capture = false,
+): Promise<CreatedProof> {
   validateCryptoKey(privateKey, "private");
   if (privateKey.algorithm.name !== "Ed25519") {
     throw new TypeError("Unsupported algorithm: " + privateKey.algorithm.name);
@@ -180,6 +272,10 @@ export async function createProof(
   compactMsg = await normalizeOutgoingActivityJsonLd(
     compactMsg,
     contextLoader,
+    // An embedded secured child is signed as it stands; rewriting anything
+    // inside it here would sign bytes that differ from the child's own
+    // signing input.
+    { preserveNestedSecuredDocuments: true },
   );
   const msgCanon = serialize(compactMsg);
   const encoder = new TextEncoder();
@@ -201,14 +297,52 @@ export async function createProof(
   const digest = new Uint8Array(proofDigest.byteLength + msgDigest.byteLength);
   digest.set(new Uint8Array(proofDigest), 0);
   digest.set(new Uint8Array(msgDigest), proofDigest.byteLength);
-  const sig = await crypto.subtle.sign("Ed25519", privateKey, digest);
-  return new DataIntegrityProof({
+  const sig = new Uint8Array(
+    await crypto.subtle.sign("Ed25519", privateKey, digest),
+  );
+  const proof = new DataIntegrityProof({
     cryptosuite: "eddsa-jcs-2022",
     verificationMethod: keyId,
     proofPurpose: "assertionMethod",
-    created: created ?? Temporal.Now.instant(),
-    proofValue: new Uint8Array(sig),
+    created,
+    proofValue: sig,
   });
+  const securedDocument = capture
+    ? await captureSecuredDocument(
+      proof,
+      compactMsg,
+      msgCanon,
+      proofCanon,
+      new TextDecoder().decode(encodeMultibase("base58btc", sig)),
+      contextLoader,
+    )
+    : null;
+  return { proof, securedDocument };
+}
+
+/**
+ * Creates a proof for the given object.
+ * @param object The object to create a proof for.
+ * @param privateKey The private key to sign the proof with.
+ * @param keyId The key ID to use in the proof. It will be used by the verifier.
+ * @param options Additional options.  See also {@link CreateProofOptions}.
+ * @returns The created proof.
+ * @throws {TypeError} If the private key is invalid or unsupported.
+ * @since 0.10.0
+ */
+export async function createProof(
+  object: Object,
+  privateKey: CryptoKey,
+  keyId: URL,
+  options: CreateProofOptions = {},
+): Promise<DataIntegrityProof> {
+  const { proof } = await createProofInternal(
+    object,
+    privateKey,
+    keyId,
+    options,
+  );
+  return proof;
 }
 
 /**
@@ -261,7 +395,16 @@ export async function signObject<T extends Object>(
         for await (const proof of object.getProofs(options)) {
           existingProofs.push(proof);
         }
-        const proof = await createProof(object, privateKey, keyId, options);
+        // The map-local compound-proof profile accepts exactly one direct
+        // proof per map, so an object that already carried one cannot be
+        // embedded as a secured child and needs no capture.
+        const { proof, securedDocument } = await createProofInternal(
+          object,
+          privateKey,
+          keyId,
+          options,
+          existingProofs.length < 1,
+        );
         if (span.isRecording()) {
           if (proof.cryptosuite != null) {
             span.setAttribute(
@@ -282,7 +425,24 @@ export async function signObject<T extends Object>(
             );
           }
         }
-        return object.clone({ proofs: [...existingProofs, proof] }) as T;
+        const signed = object.clone({
+          proofs: [...existingProofs, proof],
+        }) as T;
+        if (securedDocument != null) {
+          // Retain the secured JSON document so that embedding this object in
+          // another object's typed property emits the exact bytes its proof
+          // covers instead of reconstructing it under the parent's context.
+          retainSignedRepresentation(signed, securedDocument);
+        } else if (existingProofs.length > 0) {
+          logger.debug(
+            "The object {objectId} already had {proofCount} proof(s), so its " +
+              "signed representation is not retained for embedding; the " +
+              "map-local compound-proof profile accepts exactly one direct " +
+              "proof per map.",
+            { objectId: object.id?.href, proofCount: existingProofs.length },
+          );
+        }
+        return signed;
       } catch (error) {
         span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
         throw error;
@@ -297,7 +457,7 @@ export async function signObject<T extends Object>(
  * Options for {@link verifyProof}.
  * @since 0.10.0
  */
-export interface VerifyProofOptions {
+export interface VerifyProofOptions extends VerificationObservationOptions {
   /**
    * The security domain expected by the verifier.  When specified, it must
    * contain the same strings as the proof's `domain` option.
@@ -357,7 +517,10 @@ export interface VerifyPortableObjectProofOptions extends VerifyProofOptions {
  */
 export type VerifyPortableObjectProofFailureReason =
   | {
-    /** The document does not have a portable `ap:` or `ap+ef61:` ID. */
+    /**
+     * The document has neither a portable `ap:` or `ap+ef61:` ID nor an
+     * FEP-ef61 compatible identifier.
+     */
     readonly type: "notPortableObject";
   }
   | {
@@ -376,6 +539,15 @@ export type VerifyPortableObjectProofFailureReason =
   | {
     /** A portable actor, activity, or object has no proof. */
     readonly type: "missingProof";
+  }
+  | {
+    /**
+     * A portable actor's `gateways` is missing or empty, or has an item that
+     * is not an HTTP(S) URI with an empty path, query, and fragment.
+     * The document is rejected before its proofs are verified, so this
+     * reason does not mean that the proofs are valid.
+     */
+    readonly type: "invalidGateways";
   }
   | {
     /** The proof is malformed, unsupported, or cryptographically invalid. */
@@ -441,13 +613,141 @@ export async function verifyProof(
   return await verifyProofWithMessageDigestCache(jsonLd, proof, options);
 }
 
+/**
+ * Verifies the one direct literal proof on a map-local secured document.
+ *
+ * Unlike {@link verifyProof}, this removes only the literal `proof` member
+ * from the message digest.  JSON-LD aliases remain part of the signed input,
+ * and the document's received `@context` is not replaced by the proof
+ * configuration context.
+ *
+ * @internal
+ */
+export async function verifyMapLocalProof(
+  jsonLd: unknown,
+  options: VerifyProofOptions = {},
+): Promise<Multikey | null> {
+  if (
+    !isJsonLdNode(jsonLd) || !globalThis.Object.hasOwn(jsonLd, "proof") ||
+    !isJsonLdNode(jsonLd.proof)
+  ) {
+    return null;
+  }
+  const rawProof = jsonLd.proof;
+  const previousChecks = options[verificationObservation]?.attempt?.checks
+    .length;
+  const malformed = () =>
+    observeCheck<Multikey>(
+      options,
+      {
+        mechanism: "objectIntegrity",
+        proofId: typeof rawProof.id === "string"
+          ? rawProof.id
+          : typeof rawProof["@id"] === "string"
+          ? rawProof["@id"]
+          : null,
+        proofIndex: previousChecks ?? null,
+      },
+      getDeclaredProofKeyId(rawProof),
+      () => Promise.resolve(null),
+    );
+  const proofContextLoader = getNormalizationContextLoader(
+    preloadedOnlyDocumentLoader,
+  );
+  try {
+    const [candidate] = await parseRawProofCandidates(
+      jsonLd,
+      [jsonLd.proof],
+      options,
+      proofContextLoader,
+    );
+    if (candidate.proof == null) return await malformed();
+    return await verifyProofWithMessageDigestCache(
+      jsonLd,
+      candidate.proof,
+      options,
+      { proofContextLoader, proofPropertyMode: "literal" },
+      candidate,
+    );
+  } catch {
+    if (
+      previousChecks != null &&
+      options[verificationObservation]?.attempt?.checks.length ===
+        previousChecks
+    ) return await malformed();
+    return null;
+  }
+}
+
+function getDeclaredProofKeyId(
+  value: unknown,
+  propertyNames: Iterable<string> = [
+    "verificationMethod",
+    "https://w3id.org/security#verificationMethod",
+  ],
+): string | null {
+  if (!isJsonLdNode(value)) return null;
+  const method = Array.from(propertyNames, (name) => value[name]).find((v) =>
+    v != null
+  );
+  const candidate = Array.isArray(method) ? method[0] : method;
+  if (typeof candidate === "string") return candidate;
+  return isJsonLdNode(candidate) && typeof candidate["@id"] === "string"
+    ? candidate["@id"]
+    : null;
+}
+
 async function verifyProofWithMessageDigestCache(
   jsonLd: unknown,
   proof: DataIntegrityProof,
   options: VerifyProofOptions,
   messageDigestCache: ProofMessageDigestCache = {},
   rawProofCandidate?: RawProofCandidate,
+  // See the call in verifyPortableObjectProof() for why this exists.
+  keyIdBoundByCaller = false,
 ): Promise<Multikey | null> {
+  if (options[verificationObservation] == null) {
+    return await verifyProofWithMessageDigestCache(
+      jsonLd,
+      proof,
+      {
+        ...options,
+        [verificationObservation]: {
+          attempts: [],
+          attempt: { checks: [] },
+          captureRawKeyIds: false,
+        },
+      },
+      messageDigestCache,
+      rawProofCandidate,
+      keyIdBoundByCaller,
+    );
+  }
+  if (
+    options[verificationObservation]?.attempt != null &&
+    options[verificationObservation]?.check == null
+  ) {
+    return await observeCheck(
+      options,
+      {
+        mechanism: "objectIntegrity",
+        proofId: proof.id?.href ?? null,
+        proofIndex: options[verificationObservation]!.attempt!.checks.length,
+      },
+      rawProofCandidate?.declaredKeyId ??
+        getDeclaredProofKeyId(rawProofCandidate?.value) ??
+        proof.verificationMethodId?.href ?? null,
+      (observation) =>
+        verifyProofWithMessageDigestCache(
+          jsonLd,
+          proof,
+          { ...options, [verificationObservation]: observation },
+          messageDigestCache,
+          rawProofCandidate,
+          keyIdBoundByCaller,
+        ),
+    );
+  }
   const tracerProvider = options.tracerProvider ?? trace.getTracerProvider();
   const tracer = tracerProvider.getTracer(metadata.name, metadata.version);
   return await tracer.startActiveSpan(
@@ -488,9 +788,16 @@ async function verifyProofWithMessageDigestCache(
           options,
           messageDigestCache,
           rawProofCandidate,
+          keyIdBoundByCaller,
         );
-        if (key == null) span.setStatus({ code: SpanStatusCode.ERROR });
-        else verified = true;
+        if (key == null) {
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.setAttribute(
+            "activitypub.verification.failure_reason",
+            options[verificationObservation]?.check?.reason?.type ??
+              "invalidSignature",
+          );
+        } else verified = true;
         return key;
       } catch (error) {
         threw = true;
@@ -510,7 +817,13 @@ async function verifyProofWithMessageDigestCache(
             getDurationMs(start),
             "object_integrity",
             classified,
-            { cryptosuite },
+            {
+              cryptosuite,
+              verificationFailureReason: verified || threw
+                ? undefined
+                : options[verificationObservation]?.check?.reason?.type ??
+                  "invalidSignature",
+            },
           );
         span.end();
       }
@@ -526,6 +839,13 @@ interface ProofMessageDigests {
 interface ProofMessageDigestCache {
   values?: Map<string, Promise<ProofMessageDigests>>;
   proofContextLoader?: DocumentLoader;
+  proofPropertyMode?: "jsonLd" | "literal";
+  /**
+   * The earliest expiration among the proof configurations accepted while
+   * verifying one document, so that whatever the document vouches for is
+   * not trusted for longer than its proofs are.
+   */
+  expires?: Temporal.Instant;
 }
 
 function expandContextPropertyIri(
@@ -557,18 +877,29 @@ async function getJsonLdPropertyNames(
   documentLoader: DocumentLoader = preloadedOnlyDocumentLoader,
   inheritedContext?: unknown,
   rejectOnContextError = false,
+  contextState?: { initial?: unknown; scoped?: unknown; active?: unknown },
 ): Promise<Set<string> | null> {
   const names = new Set(defaults);
   const context = jsonLd["@context"] ?? inheritedContext;
-  if (context == null) return names;
+  if (context == null && contextState?.initial == null) return names;
   try {
     const options = { documentLoader };
-    let activeContext = await jsonld.processContext(null, null, options);
-    activeContext = await jsonld.processContext(
-      activeContext,
-      context,
-      options,
-    );
+    let activeContext = contextState?.initial ??
+      await jsonld.processContext(null, null, options);
+    if (contextState?.scoped != null) {
+      activeContext = await jsonld.processContext(
+        activeContext,
+        contextState.scoped,
+        options,
+      );
+    }
+    if (context != null) {
+      activeContext = await jsonld.processContext(
+        activeContext,
+        context,
+        options,
+      );
+    }
     const typeScopedContext = activeContext;
     for (const key of globalThis.Object.keys(jsonLd).sort()) {
       if (
@@ -595,6 +926,7 @@ async function getJsonLdPropertyNames(
         }
       }
     }
+    if (contextState != null) contextState.active = activeContext;
     for (const key of globalThis.Object.keys(jsonLd)) {
       if (expandContextPropertyIri(activeContext, key) === propertyIri) {
         names.add(key);
@@ -624,18 +956,25 @@ async function createProofMessageDigests(
   jsonLd: Record<string, unknown>,
   proofContextLoader?: DocumentLoader,
   context?: unknown,
+  proofPropertyMode: "jsonLd" | "literal" = "jsonLd",
 ): Promise<ProofMessageDigests> {
   const msg = { ...jsonLd };
-  // `verifyProof()` promises to ignore existing proofs on the input;
-  // strip every top-level property that the active JSON-LD context maps to
-  // the security proof predicate so its bytes are not folded into the JCS
-  // message digest.
-  for (
-    const property of await getProofPropertyNames(msg, proofContextLoader)
-  ) {
-    delete msg[property];
+  if (proofPropertyMode === "literal") {
+    delete msg.proof;
+  } else {
+    // `verifyProof()` promises to ignore existing proofs on the input;
+    // strip every top-level property that the active JSON-LD context maps to
+    // the security proof predicate so its bytes are not folded into the JCS
+    // message digest.
+    for (
+      const property of await getProofPropertyNames(msg, proofContextLoader)
+    ) {
+      delete msg[property];
+    }
   }
-  if (context != null) msg["@context"] = structuredClone(context);
+  if (proofPropertyMode === "jsonLd" && context != null) {
+    msg["@context"] = structuredClone(context);
+  }
   const encoder = new TextEncoder();
   const digest = async (value: unknown): Promise<ArrayBuffer> => {
     const bytes = encoder.encode(serialize(value));
@@ -738,6 +1077,72 @@ interface RawProofCandidate {
   readonly value: unknown;
   readonly proof: DataIntegrityProof | null;
   readonly reference?: string;
+  readonly declaredKeyId?: string | null;
+}
+
+// Replay contexts already read by the vocabulary parser when resolving raw
+// property aliases.  Diagnostic extraction never dereferences another context.
+function recordProofContexts(documentLoader: DocumentLoader): {
+  loader: DocumentLoader;
+  replay: DocumentLoader;
+} {
+  const documents = new Map<string, RemoteDocument>();
+  return {
+    loader: async (url, options) => {
+      const document = await documentLoader(url, options);
+      documents.set(url, document);
+      return document;
+    },
+    replay: (url, options) => {
+      const document = documents.get(url);
+      return document == null
+        ? preloadedOnlyDocumentLoader(url, options)
+        : Promise.resolve(document);
+    },
+  };
+}
+
+async function getAliasedDeclaredProofKeyId(
+  value: unknown,
+  inheritedContext: unknown,
+  contextLoader: DocumentLoader,
+): Promise<string | null> {
+  if (!isJsonLdNode(value)) return null;
+  const contextState: { active?: unknown } = {};
+  const names = await getJsonLdPropertyNames(
+    value,
+    "https://w3id.org/security#verificationMethod",
+    ["verificationMethod", "https://w3id.org/security#verificationMethod"],
+    contextLoader,
+    inheritedContext,
+    false,
+    contextState,
+  );
+  const methodName = Array.from(names ?? []).find((name) =>
+    value[name] != null
+  );
+  const method = methodName == null ? undefined : value[methodName];
+  const candidate = Array.isArray(method) ? method[0] : method;
+  if (typeof candidate === "string") return candidate;
+  if (!isJsonLdNode(candidate)) return null;
+  const idNames = await getJsonLdPropertyNames(
+    candidate,
+    "@id",
+    ["@id"],
+    contextLoader,
+    undefined,
+    false,
+    {
+      initial: contextState.active,
+      scoped: contextState.active == null || methodName == null
+        ? undefined
+        : jsonld.getContextValue(contextState.active, methodName, "@context"),
+    },
+  );
+  for (const name of idNames ?? []) {
+    if (typeof candidate[name] === "string") return candidate[name];
+  }
+  return null;
 }
 
 function normalizeDocumentUrl(url: string): string {
@@ -765,6 +1170,10 @@ async function parseRawProofCandidates(
   const candidates: RawProofCandidate[] = [];
   for (const value of values) {
     let parsed: DataIntegrityProof | null = null;
+    const contexts = options[verificationObservation] != null &&
+        options[verificationObservation]?.captureRawKeyIds !== false
+      ? recordProofContexts(documentLoader)
+      : undefined;
     if (isJsonLdNode(value)) {
       const proofJsonLd = value["@context"] == null &&
           jsonLd["@context"] != null
@@ -773,7 +1182,7 @@ async function parseRawProofCandidates(
       try {
         parsed = await DataIntegrityProof.fromJsonLd(
           proofJsonLd,
-          { ...options, contextLoader: documentLoader },
+          { ...options, contextLoader: contexts?.loader ?? documentLoader },
         );
       } catch {
         // Malformed sibling proofs cannot match a typed proof.
@@ -783,6 +1192,13 @@ async function parseRawProofCandidates(
       value,
       proof: parsed,
       reference: getRawProofReference(value) ?? parsed?.id?.href,
+      declaredKeyId: contexts == null
+        ? undefined
+        : await getAliasedDeclaredProofKeyId(
+          value,
+          jsonLd["@context"],
+          contexts.replay,
+        ),
     });
   }
   return candidates;
@@ -1061,28 +1477,37 @@ function equalStringSets(left: Set<string>, right: Set<string>): boolean {
     [...left].every((value) => right.has(value));
 }
 
+/**
+ * What {@link hasValidProofOptions} learned about a proof configuration it
+ * accepted.
+ */
+interface ValidProofOptions {
+  /** When the proof expires, if its configuration says so. */
+  readonly expires?: Temporal.Instant;
+}
+
 async function hasValidProofOptions(
   proofConfig: Record<string, unknown>,
   options: VerifyProofOptions,
   documentLoader: DocumentLoader,
-): Promise<boolean> {
+): Promise<ValidProofOptions | null> {
   const expires = await getProofOption(
     proofConfig,
     SECURITY_EXPIRATION,
     ["expires", SECURITY_EXPIRATION],
     documentLoader,
   );
-  if (expires == null) return false;
+  if (expires == null) return null;
+  let expiration: Temporal.Instant | undefined;
   if (expires.present) {
-    if (typeof expires.value !== "string") return false;
-    let expiration: Temporal.Instant;
+    if (typeof expires.value !== "string") return null;
     try {
       expiration = Temporal.Instant.from(expires.value);
     } catch {
-      return false;
+      return null;
     }
     if (Temporal.Instant.compare(Temporal.Now.instant(), expiration) >= 0) {
-      return false;
+      return null;
     }
   }
 
@@ -1092,16 +1517,16 @@ async function hasValidProofOptions(
     ["domain", SECURITY_DOMAIN],
     documentLoader,
   );
-  if (domain == null) return false;
+  if (domain == null) return null;
   const proofDomains = domain.present ? parseStringSet(domain.value) : null;
-  if (domain.present && proofDomains == null) return false;
+  if (domain.present && proofDomains == null) return null;
   if (options.domain != null) {
     const expectedDomains = parseStringSet(options.domain);
     if (
       expectedDomains == null || proofDomains == null ||
       !equalStringSets(proofDomains, expectedDomains)
     ) {
-      return false;
+      return null;
     }
   }
 
@@ -1117,7 +1542,7 @@ async function hasValidProofOptions(
     options.challenge != null &&
       (!challenge.present || challenge.value !== options.challenge)
   ) {
-    return false;
+    return null;
   }
 
   const nonce = await getProofOption(
@@ -1130,7 +1555,7 @@ async function hasValidProofOptions(
     nonce == null ||
     nonce.present && typeof nonce.value !== "string"
   ) {
-    return false;
+    return null;
   }
 
   const previousProof = await getProofOption(
@@ -1146,9 +1571,9 @@ async function hasValidProofOptions(
       (!Array.isArray(previousProof.value) ||
         previousProof.value.some((item) => typeof item !== "string"))
   ) {
-    return false;
+    return null;
   }
-  return true;
+  return { expires: expiration };
 }
 
 async function verifyProofInternal(
@@ -1157,6 +1582,8 @@ async function verifyProofInternal(
   options: VerifyProofOptions,
   messageDigestCache: ProofMessageDigestCache,
   rawProofCandidate?: RawProofCandidate,
+  // See the call in verifyPortableObjectProof() for why this exists.
+  keyIdBoundByCaller = false,
 ): Promise<Multikey | null> {
   if (
     !isJsonLdNode(jsonLd) ||
@@ -1175,15 +1602,20 @@ async function verifyProofInternal(
     proofContextLoader,
     rawProofCandidate,
   );
+  if (proofConfiguration == null) return null;
+  const validProofOptions = await hasValidProofOptions(
+    proofConfiguration.value,
+    options,
+    proofContextLoader,
+  );
+  if (validProofOptions == null) return null;
+  const { expires } = validProofOptions;
   if (
-    proofConfiguration == null ||
-    !await hasValidProofOptions(
-      proofConfiguration.value,
-      options,
-      proofContextLoader,
-    )
+    expires != null &&
+    (messageDigestCache.expires == null ||
+      Temporal.Instant.compare(expires, messageDigestCache.expires) < 0)
   ) {
-    return null;
+    messageDigestCache.expires = expires;
   }
   // Start the key fetch eagerly so it overlaps with the JCS
   // canonicalization and SHA-256 digest work below.  `measureSignatureKeyFetch`
@@ -1193,7 +1625,11 @@ async function verifyProofInternal(
   const publicKeyPromise = measureSignatureKeyFetch(
     options.meterProvider,
     "object_integrity",
-    () => fetchKey(proof.verificationMethodId!, Multikey, options),
+    () =>
+      fetchKey(proof.verificationMethodId!, Multikey, {
+        ...options,
+        keyIdBoundByCaller,
+      }),
   );
   const encoder = new TextEncoder();
   const proofBytes = encoder.encode(serialize(proofConfiguration.value));
@@ -1240,17 +1676,11 @@ async function verifyProofInternal(
         proof,
         {
           ...options,
-          keyCache: {
-            // Returning `undefined` signals "nothing cached" and forces
-            // `fetchKey()` to refetch from the network; returning `null`
-            // would instead be interpreted as a cached-unavailable result
-            // and short-circuit the retry.
-            get: () => Promise.resolve(undefined),
-            set: async (keyId, key) => await options.keyCache?.set(keyId, key),
-          },
+          keyCache: bypassKeyCacheReads(options.keyCache),
         },
         messageDigestCache,
         rawProofCandidate,
+        keyIdBoundByCaller,
       );
     }
     logger.debug(
@@ -1267,8 +1697,13 @@ async function verifyProofInternal(
   const digest = new Uint8Array(proofDigest.byteLength + SHA256_LENGTH);
   digest.set(new Uint8Array(proofDigest), 0);
   const proofValue = proof.proofValue;
+  let keyTried = false;
   const verifyCandidate = async (msgDigest: ArrayBuffer): Promise<boolean> => {
     digest.set(new Uint8Array(msgDigest), proofDigest.byteLength);
+    if (!keyTried) {
+      triedKey(options, publicKey);
+      keyTried = true;
+    }
     return await crypto.subtle.verify(
       "Ed25519",
       publicKey.publicKey,
@@ -1287,14 +1722,17 @@ async function verifyProofInternal(
       jsonLd,
       messageDigestCache.proofContextLoader,
       proofConfiguration.context,
+      messageDigestCache.proofPropertyMode,
     );
     messageDigestValues.set(messageDigestKey, messageDigestsPromise);
   }
   const messageDigests = await messageDigestsPromise;
   if (await verifyCandidate(messageDigests.onWire)) return publicKey;
-  const normalizedDigest = await messageDigests.normalized();
-  if (normalizedDigest != null && await verifyCandidate(normalizedDigest)) {
-    return publicKey;
+  if (messageDigestCache.proofPropertyMode !== "literal") {
+    const normalizedDigest = await messageDigests.normalized();
+    if (normalizedDigest != null && await verifyCandidate(normalizedDigest)) {
+      return publicKey;
+    }
   }
   if (fetchedKey.cached) {
     logger.debug(
@@ -1310,13 +1748,11 @@ async function verifyProofInternal(
       proof,
       {
         ...options,
-        keyCache: {
-          get: () => Promise.resolve(undefined),
-          set: async (keyId, key) => await options.keyCache?.set(keyId, key),
-        },
+        keyCache: bypassKeyCacheReads(options.keyCache),
       },
       messageDigestCache,
       rawProofCandidate,
+      keyIdBoundByCaller,
     );
   }
   logger.debug(
@@ -1326,7 +1762,7 @@ async function verifyProofInternal(
   return null;
 }
 
-type Fep2277CoreType =
+export type Fep2277CoreType =
   | "actor"
   | "activity"
   | "collection"
@@ -1389,7 +1825,48 @@ function hasValidPortableProofShape(proofValue: unknown): boolean {
     });
 }
 
-function classifyFep2277CoreType(
+/**
+ * Checks whether an expanded portable actor node has the `gateways` that
+ * FEP-ef61 requires: a non-empty list whose items are all HTTP(S) URIs with
+ * an empty path, query, and fragment.  Like the generated vocabulary decoder,
+ * this also tolerates a plain set of values instead of a `@list`, and gateway
+ * strings given as `@value`s instead of `@id`s.  JCS-authenticated actors may
+ * also supply an unmapped literal `gateways` list.
+ */
+function hasValidPortableActorGateways(
+  node: Record<string, unknown>,
+  allowUnmapped: boolean,
+): boolean {
+  const values = getPortableActorGateways(node, allowUnmapped);
+  if (!Array.isArray(values)) return false;
+  let items: unknown = values;
+  if (values.some((value) => isJsonLdNode(value) && "@list" in value)) {
+    if (values.length !== 1 || !isJsonLdNode(values[0])) return false;
+    items = values[0]["@list"];
+  }
+  if (!Array.isArray(items) || items.length < 1) return false;
+  return items.every((item) => {
+    if (!isJsonLdNode(item)) return false;
+    const gateway = typeof item["@id"] === "string"
+      ? item["@id"]
+      : item["@value"];
+    if (typeof gateway !== "string") return false;
+    try {
+      parseGatewayUrl(gateway);
+    } catch (error) {
+      if (error instanceof TypeError) return false;
+      throw error;
+    }
+    return true;
+  });
+}
+
+/**
+ * Classifies an expanded JSON-LD node into an FEP-2277 core type by the
+ * properties it has.
+ * @internal
+ */
+export function classifyFep2277CoreType(
   node: Record<string, unknown>,
 ): Fep2277CoreType {
   if (FEP_2277_ACTOR_PROPERTIES.every((property) => property in node)) {
@@ -1443,37 +1920,75 @@ async function expandPortableObjectRoot(
   };
 }
 
+interface PreparedPortableObjectProof {
+  readonly prepared: true;
+  readonly root: Record<string, unknown>;
+  readonly objectType: Fep2277CoreType;
+  readonly objectId: URL;
+  readonly proofs: readonly DataIntegrityProof[];
+  readonly rawProofValues: readonly unknown[];
+  readonly proofContextLoader: DocumentLoader;
+}
+
+type PreparePortableObjectProofResult =
+  | PreparedPortableObjectProof
+  | {
+    readonly prepared: false;
+    readonly result: Extract<VerifyPortableObjectProofResult, {
+      verified: false;
+    }>;
+    /** The expanded root node, if the document got as far as expansion. */
+    readonly root?: Record<string, unknown>;
+    /** The FEP-2277 core type of the root node, if it was classified. */
+    readonly objectType?: Fep2277CoreType;
+  };
+
 /**
- * Verifies the FEP-ef61 Object Integrity Proof policy for a portable object.
- *
- * This applies the FEP-2277 core-type classification to the top-level JSON-LD
- * node.  Portable actors, activities, and objects require proofs.  A portable
- * collection without a proof is reported separately so a caller can apply a
- * gateway trust policy.  Embedded portable objects are not traversed.
- *
- * Every proof must use a DID URL whose DID matches the portable object's
- * authority, and every proof must pass {@link verifyProof}.
- *
- * @param jsonLd The JSON-LD document to verify.
- * @param options Additional options.  See also
- *                {@link VerifyPortableObjectProofOptions}.
- * @returns The detailed portable proof-policy result.
- * @throws {TypeError} If the input is not a single JSON-LD object or has a
- *                     malformed portable ID.
- * @since 2.4.0
+ * Gets the DID of a portable object ID, which is either an `ap:` or
+ * `ap+ef61:` URI or an FEP-ef61 compatible identifier.
+ * @throws {TypeError} If the ID is malformed.
  */
-export async function verifyPortableObjectProof(
+function getObjectDid(id: string): string {
+  try {
+    parseIri(id);
+    if (PORTABLE_OBJECT_ID_PATTERN.test(id)) return getFe34Origin(id);
+    const portableId = fromCompatibleEf61Id(id);
+    if (portableId != null) return getFe34Origin(portableId);
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    throw new InvalidPortableObjectIdError(id, { cause: error });
+  }
+  throw new InvalidPortableObjectIdError(id);
+}
+
+/**
+ * The error thrown when a document's ID looks portable, i.e., it is an `ap:`
+ * or `ap+ef61:` URI or looks like an FEP-ef61 compatible identifier, but is
+ * malformed.
+ * @internal
+ */
+export class InvalidPortableObjectIdError extends TypeError {
+  constructor(id: string, options?: ErrorOptions) {
+    super(`Invalid portable object ID: ${id}`, options);
+    this.name = "InvalidPortableObjectIdError";
+  }
+}
+
+async function preparePortableObjectProof(
   jsonLd: unknown,
-  options: VerifyPortableObjectProofOptions = {},
-): Promise<VerifyPortableObjectProofResult> {
+  options: VerifyPortableObjectProofOptions,
+): Promise<PreparePortableObjectProofResult> {
   if (
     isJsonLdNode(jsonLd) &&
     typeof jsonLd["@id"] === "string" &&
-    !PORTABLE_OBJECT_ID_PATTERN.test(jsonLd["@id"])
+    !isPortableId(jsonLd["@id"])
   ) {
     return {
-      verified: false,
-      reason: { type: "notPortableObject" },
+      prepared: false,
+      result: {
+        verified: false,
+        reason: { type: "notPortableObject" },
+      },
     };
   }
   const { root, proofContextLoader } = await expandPortableObjectRoot(
@@ -1481,19 +1996,22 @@ export async function verifyPortableObjectProof(
     options.contextLoader,
   );
   const id = root["@id"];
-  if (
-    typeof id !== "string" ||
-    !PORTABLE_OBJECT_ID_PATTERN.test(id)
-  ) {
+  if (typeof id !== "string" || !isPortableId(id)) {
     return {
-      verified: false,
-      reason: { type: "notPortableObject" },
+      prepared: false,
+      result: {
+        verified: false,
+        reason: { type: "notPortableObject" },
+      },
     };
   }
+  // This guarantees that the ID's authority, or the DID in a compatible
+  // identifier, is a valid cryptographic origin before any key work begins.
+  // The document itself is never rewritten: a compatible identifier stays its
+  // ID, and only the DID of its canonical portable ID is compared with
+  // the proofs:
+  const objectDid = getObjectDid(id);
   const objectId = parseIri(id);
-  // parseIri() validates the portable ID; this additionally guarantees that
-  // its authority is a valid cryptographic origin before any key work begins.
-  getFe34Origin(objectId);
 
   const objectType = classifyFep2277CoreType(root);
   if (
@@ -1502,8 +2020,11 @@ export async function verifyPortableObjectProof(
     objectType === "link"
   ) {
     return {
-      verified: false,
-      reason: { type: "unsupportedObjectType", objectType },
+      prepared: false,
+      result: {
+        verified: false,
+        reason: { type: "unsupportedObjectType", objectType },
+      },
     };
   }
 
@@ -1511,20 +2032,28 @@ export async function verifyPortableObjectProof(
   if (
     proofValues == null || Array.isArray(proofValues) && proofValues.length < 1
   ) {
-    return objectType === "collection"
-      ? {
-        verified: false,
-        reason: { type: "unsecuredCollection" },
-      }
-      : {
-        verified: false,
-        reason: { type: "missingProof" },
-      };
+    return {
+      prepared: false,
+      root,
+      objectType,
+      result: objectType === "collection"
+        ? {
+          verified: false,
+          reason: { type: "unsecuredCollection" },
+        }
+        : {
+          verified: false,
+          reason: { type: "missingProof" },
+        },
+    };
   }
   if (!Array.isArray(proofValues)) {
     return {
-      verified: false,
-      reason: { type: "invalidProof", proofIndex: 0 },
+      prepared: false,
+      result: {
+        verified: false,
+        reason: { type: "invalidProof", proofIndex: 0 },
+      },
     };
   }
   const rawProofValues = isJsonLdNode(jsonLd)
@@ -1535,8 +2064,11 @@ export async function verifyPortableObjectProof(
     const proofValue = proofValues[proofIndex];
     if (!hasValidPortableProofShape(proofValue)) {
       return {
-        verified: false,
-        reason: { type: "invalidProof", proofIndex },
+        prepared: false,
+        result: {
+          verified: false,
+          reason: { type: "invalidProof", proofIndex },
+        },
       };
     }
     let proof: DataIntegrityProof;
@@ -1547,8 +2079,11 @@ export async function verifyPortableObjectProof(
       );
     } catch {
       return {
-        verified: false,
-        reason: { type: "invalidProof", proofIndex },
+        prepared: false,
+        result: {
+          verified: false,
+          reason: { type: "invalidProof", proofIndex },
+        },
       };
     }
     proofs.push(proof);
@@ -1561,17 +2096,23 @@ export async function verifyPortableObjectProof(
     const verificationMethod = proofs[proofIndex].verificationMethodId;
     if (verificationMethod == null) {
       return {
-        verified: false,
-        reason: { type: "invalidProof", proofIndex },
+        prepared: false,
+        result: {
+          verified: false,
+          reason: { type: "invalidProof", proofIndex },
+        },
       };
     }
     if (verificationMethod.protocol !== "did:") {
       return {
-        verified: false,
-        reason: {
-          type: "unsupportedVerificationMethod",
-          proofIndex,
-          verificationMethod,
+        prepared: false,
+        result: {
+          verified: false,
+          reason: {
+            type: "unsupportedVerificationMethod",
+            proofIndex,
+            verificationMethod,
+          },
         },
       };
     }
@@ -1580,26 +2121,226 @@ export async function verifyPortableObjectProof(
     } catch (error) {
       if (!(error instanceof TypeError)) throw error;
       return {
-        verified: false,
-        reason: {
-          type: "unsupportedVerificationMethod",
-          proofIndex,
-          verificationMethod,
+        prepared: false,
+        result: {
+          verified: false,
+          reason: {
+            type: "unsupportedVerificationMethod",
+            proofIndex,
+            verificationMethod,
+          },
         },
       };
     }
-    if (!haveSameFe34Origin(objectId, verificationMethod)) {
+    if (getFe34Origin(verificationMethod) !== objectDid) {
       return {
-        verified: false,
-        reason: {
-          type: "verificationMethodMismatch",
-          proofIndex,
-          objectId,
-          verificationMethod,
+        prepared: false,
+        result: {
+          verified: false,
+          reason: {
+            type: "verificationMethodMismatch",
+            proofIndex,
+            objectId,
+            verificationMethod,
+          },
         },
       };
     }
   }
+
+  // FEP-ef61 requires a portable actor to list where it can be retrieved.
+  // This is checked before any key is resolved, since the document is
+  // rejected whether or not its proofs are valid:
+  if (
+    objectType === "actor" &&
+    !hasValidPortableActorGateways(
+      root,
+      // JCS authenticates unmapped JSON properties, unlike RDF-based suites.
+      proofs.every((proof) => proof.cryptosuite === "eddsa-jcs-2022"),
+    )
+  ) {
+    return {
+      prepared: false,
+      root,
+      objectType,
+      result: {
+        verified: false,
+        reason: { type: "invalidGateways" },
+      },
+    };
+  }
+
+  return {
+    prepared: true,
+    root,
+    objectType,
+    objectId,
+    proofs,
+    rawProofValues,
+    proofContextLoader,
+  };
+}
+
+/**
+ * Applies portable-object proof policy to one map-local cryptographic result.
+ *
+ * @internal
+ */
+export async function verifyPortableObjectProofPolicy(
+  jsonLd: unknown,
+  key: Multikey | null,
+  options: VerifyPortableObjectProofOptions = {},
+): Promise<
+  | Extract<VerifyPortableObjectProofResult, { verified: false }>
+  | {
+    readonly verified: true;
+    readonly keys: readonly Multikey[];
+    readonly objectId: string;
+  }
+> {
+  const policyOptions = {
+    ...options,
+    contextLoader: preloadedOnlyDocumentLoader,
+  };
+  const prepared = await preparePortableObjectProof(jsonLd, policyOptions);
+  if (!prepared.prepared) return prepared.result;
+  const policyProof = prepared.proofs[0];
+  const literalProof = isJsonLdNode(jsonLd) && isJsonLdNode(jsonLd.proof)
+    ? (await parseRawProofCandidates(
+      jsonLd,
+      [jsonLd.proof],
+      policyOptions,
+      prepared.proofContextLoader,
+    ))[0]?.proof
+    : null;
+  const verificationMethod = policyProof?.verificationMethodId;
+  if (
+    prepared.proofs.length !== 1 || key == null ||
+    policyProof == null || literalProof == null ||
+    !sameProof(policyProof, literalProof) || verificationMethod == null ||
+    key.id?.href !== verificationMethod.href
+  ) {
+    return {
+      verified: false,
+      reason: {
+        type: "invalidProof",
+        proofIndex: prepared.proofs.length > 1 ? 1 : 0,
+      },
+    };
+  }
+  return {
+    verified: true,
+    keys: [key],
+    objectId: formatIri(prepared.objectId),
+  };
+}
+
+/**
+ * Verifies the FEP-ef61 Object Integrity Proof policy for a portable object.
+ *
+ * This applies the FEP-2277 core-type classification to the top-level JSON-LD
+ * node.  Portable actors, activities, and objects require proofs.  A portable
+ * collection without a proof is reported separately so a caller can apply a
+ * gateway trust policy.  Embedded portable objects are not traversed.
+ *
+ * A portable object is a document whose ID is an `ap:` or `ap+ef61:` URI, or
+ * an [FEP-ef61] compatible identifier such as
+ * `https://gw.example/.well-known/apgateway/did:key:z6Mk…/actor`, which
+ * stands for the portable ID `ap+ef61://did:key:z6Mk…/actor`.
+ *
+ * Every proof must use a DID URL whose DID matches the portable object's
+ * authority, i.e., the DID of its canonical portable ID, and every proof must
+ * pass {@link verifyProof}.  A portable actor must also have a non-empty
+ * `gateways` list whose items are all HTTP(S) URIs with an empty path, query,
+ * and fragment; otherwise, it is rejected with the `invalidGateways` reason
+ * before its proofs are verified.  The proofs are verified over the document as
+ * given; a compatible identifier is never rewritten into a portable ID.
+ * An unmapped literal `gateways` property is also accepted when every proof
+ * uses `eddsa-jcs-2022`, which authenticates the original JSON properties.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
+ *
+ * @param jsonLd The JSON-LD document to verify.
+ * @param options Additional options.  See also
+ *                {@link VerifyPortableObjectProofOptions}.
+ * @returns The detailed portable proof-policy result.
+ * @throws {TypeError} If the input is not a single JSON-LD object or has a
+ *                     malformed portable ID or compatible identifier.
+ * @since 2.4.0
+ */
+export async function verifyPortableObjectProof(
+  jsonLd: unknown,
+  options: VerifyPortableObjectProofOptions = {},
+): Promise<VerifyPortableObjectProofResult> {
+  return (await verifyPortableObjectProofWithRoot(jsonLd, options)).result;
+}
+
+/**
+ * The result of {@link verifyPortableObjectProofWithRoot}.
+ * @internal
+ */
+export interface PortableObjectProofVerification {
+  /** The same result as {@link verifyPortableObjectProof} returns. */
+  readonly result: VerifyPortableObjectProofResult;
+  /**
+   * The expanded root node that the proof policy examined, if the document
+   * was a portable object that got as far as expansion.
+   */
+  readonly root?: Record<string, unknown>;
+  /** The FEP-2277 core type of {@link root}. */
+  readonly objectType?: Fep2277CoreType;
+  /**
+   * The earliest expiration among the verified proofs, if any of them has
+   * one.  Present only when {@link result} is verified.
+   */
+  readonly expires?: Temporal.Instant;
+}
+
+/**
+ * Same as {@link verifyPortableObjectProof}, but also returns the expanded
+ * root node and its FEP-2277 core type, so that a caller can apply further
+ * policy, such as the gateway trust policy for unsecured collections, to the
+ * same interpretation of the document.
+ * @internal
+ */
+export async function verifyPortableObjectProofWithRoot(
+  jsonLd: unknown,
+  options: VerifyPortableObjectProofOptions = {},
+): Promise<PortableObjectProofVerification> {
+  const prepared = await preparePortableObjectProof(jsonLd, options);
+  if (!prepared.prepared) {
+    return {
+      result: prepared.result,
+      ...(prepared.root == null ? {} : { root: prepared.root }),
+      ...(prepared.objectType == null
+        ? {}
+        : { objectType: prepared.objectType }),
+    };
+  }
+  const { root, objectType, proofContextLoader } = prepared;
+  const messageDigestCache: ProofMessageDigestCache = { proofContextLoader };
+  const result = await verifyPreparedPortableObjectProof(
+    jsonLd,
+    prepared,
+    options,
+    messageDigestCache,
+  );
+  const { expires } = messageDigestCache;
+  return {
+    result,
+    root,
+    objectType,
+    ...(result.verified && expires != null ? { expires } : {}),
+  };
+}
+
+async function verifyPreparedPortableObjectProof(
+  jsonLd: unknown,
+  prepared: PreparedPortableObjectProof,
+  options: VerifyPortableObjectProofOptions,
+  messageDigestCache: ProofMessageDigestCache,
+): Promise<VerifyPortableObjectProofResult> {
+  const { proofs, rawProofValues, proofContextLoader } = prepared;
 
   const keys: Multikey[] = [];
   const rawProofCandidates = await parseRawProofCandidates(
@@ -1612,7 +2353,6 @@ export async function verifyPortableObjectProof(
     candidates: rawProofCandidates,
     used: new Set(),
   };
-  const messageDigestCache: ProofMessageDigestCache = { proofContextLoader };
   for (let proofIndex = 0; proofIndex < proofs.length; proofIndex++) {
     const rawProofCandidate = takeRawProofCandidate(
       rawProofCandidatePool,
@@ -1630,6 +2370,25 @@ export async function verifyPortableObjectProof(
       options,
       messageDigestCache,
       rawProofCandidate,
+      // Key resolution normally dereferences the `controller` a key claims
+      // and requires that actor's own document to list the key back, since
+      // the claim and the key come from one host (GHSA-q9f8-5hc7-898f).
+      // Portable objects are bound the other way round, and more tightly:
+      // the loop above already rejected every proof whose verification
+      // method does not share the object id's FEP-ef34 origin, so the signer
+      // is pinned by the identifier being verified, before any key is
+      // fetched.
+      //
+      // Running the ActivityPub check on top would also be impossible, not
+      // merely redundant: a portable verification method is a DID, and a DID
+      // dereferences to a DID document, which is not an actor with a
+      // `publicKey`/`assertionMethod` list.  Requiring it would leave every
+      // non-`did:key:` portable proof unverifiable.
+      //
+      // This does not take the key's word for its `controller`.  Key
+      // resolution still refuses a key naming anyone other than the DID its
+      // own id is a fragment of; see `FetchKeyOptions.keyIdBoundByCaller`.
+      true,
     );
     if (key == null) {
       return {
@@ -1647,6 +2406,16 @@ export async function verifyPortableObjectProof(
  * @since 0.10.0
  */
 export interface VerifyObjectOptions extends VerifyProofOptions {
+  /**
+   * The default [FEP-ef61] portable object verifier for the property
+   * accessors of the returned object and the objects obtained from it, e.g.,
+   * `Context.verifyPortableObject`.  It is not used to verify the given
+   * object itself.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  verifyPortableObject?: PortableObjectVerifier;
 }
 
 /**
@@ -1671,8 +2440,57 @@ export async function verifyObject<T extends Object>(
   jsonLd: unknown,
   options: VerifyObjectOptions = {},
 ): Promise<T | null> {
+  if (options[verificationObservation]?.attempt == null) {
+    const observedOptions = {
+      ...options,
+      [verificationObservation]: options[verificationObservation] ??
+        { attempts: [], captureRawKeyIds: false },
+    };
+    const tracer = (options.tracerProvider ?? trace.getTracerProvider())
+      .getTracer(metadata.name, metadata.version);
+    return await tracer.startActiveSpan(
+      "object_integrity_proofs.verify_object",
+      async (span) => {
+        try {
+          return await observeAttempt(
+            observedOptions,
+            "objectIntegrity",
+            async (observation) => {
+              const object = await verifyObject(cls, jsonLd, {
+                ...options,
+                [verificationObservation]: observation,
+              });
+              if (object == null) {
+                span.setStatus({ code: SpanStatusCode.ERROR });
+                span.setAttribute(
+                  "activitypub.verification.failure_reason",
+                  observation.attempt?.reason?.type ??
+                    "signatureVerificationFailed",
+                );
+              }
+              return object;
+            },
+            (value) => value != null,
+          );
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: String(error),
+          });
+          throw error;
+        } finally {
+          span.end();
+        }
+      },
+    );
+  }
+  const observation = options[verificationObservation];
   const logger = getLogger(["fedify", "sig", "proof"]);
   const object = await cls.fromJsonLd(jsonLd, options);
+  observation?.parsedObject?.(object);
+  if (observation?.subject != null) {
+    observation.subject.id = object.id == null ? null : new URL(object.id.href);
+  }
   const defaultDocumentLoader = getDocumentLoader();
   const proofContextLoader = options.contextLoader ?? defaultDocumentLoader;
   const attributions = new Set(object.attributionIds.map((uri) => uri.href));
@@ -1699,11 +2517,25 @@ export async function verifyObject<T extends Object>(
   };
   const baseDocumentLoader = options.documentLoader ?? defaultDocumentLoader;
   const hydratedCandidates = new Set<number>();
+  // Portable proof references are loaded through the gateway dereferencing
+  // path, which rejects a document whose @id does not match the reference
+  // before it reaches the verifier.  Counting both sides tells whether any
+  // loaded portable proof was rejected, so that it is not skipped silently:
+  let loadedPortableProofs = 0;
+  let acceptedPortableProofs = 0;
+  // A portable proof document carries no proof of its own; it is
+  // authenticated below, by verifying it against the object:
+  // deno-lint-ignore require-await
+  const acceptPortableProofDocument: PortableObjectVerifier = async () => {
+    acceptedPortableProofs++;
+    return { verified: true };
+  };
   const proofDocumentLoader: DocumentLoader = async (
     url,
     loaderOptions,
   ) => {
     const remoteDocument = await baseDocumentLoader(url, loaderOptions);
+    if (isPortableId(url)) loadedPortableProofs++;
     const reference = normalizeDocumentUrl(url);
     const candidateIndex = rawProofCandidates.findIndex(
       (candidate, index) =>
@@ -1714,12 +2546,16 @@ export async function verifyObject<T extends Object>(
     if (candidateIndex >= 0) {
       hydratedCandidates.add(candidateIndex);
       let parsed: DataIntegrityProof | null = null;
+      const contexts = options[verificationObservation] != null &&
+          options[verificationObservation]?.captureRawKeyIds !== false
+        ? recordProofContexts(proofContextLoader)
+        : undefined;
       try {
         parsed = await DataIntegrityProof.fromJsonLd(
           remoteDocument.document,
           {
             documentLoader: baseDocumentLoader,
-            contextLoader: proofContextLoader,
+            contextLoader: contexts?.loader ?? proofContextLoader,
             tracerProvider: options.tracerProvider,
             baseUrl: parseIri(remoteDocument.documentUrl),
           },
@@ -1731,6 +2567,13 @@ export async function verifyObject<T extends Object>(
         value: structuredClone(remoteDocument.document),
         proof: parsed,
         reference,
+        declaredKeyId: contexts == null
+          ? undefined
+          : await getAliasedDeclaredProofKeyId(
+            remoteDocument.document,
+            undefined,
+            contexts.replay,
+          ),
       };
     }
     return remoteDocument;
@@ -1739,6 +2582,14 @@ export async function verifyObject<T extends Object>(
     const proof of object.getProofs({
       ...options,
       documentLoader: proofDocumentLoader,
+      // Keep loading portable proof references through the document loader
+      // under their own IRIs, so that proofDocumentLoader can match them with
+      // their raw proof candidates:
+      gateways: [],
+      verifyPortableObject: acceptPortableProofDocument,
+      // The proofs are cached in the returned object, so they must not keep
+      // the verifier that accepts everything as their default:
+      inheritPortableObjectVerifier: false,
     })
   ) {
     const rawProofCandidate = takeRawProofCandidate(
@@ -1770,7 +2621,20 @@ export async function verifyObject<T extends Object>(
       proof.verificationMethodId,
     );
   }
+  if (acceptedPortableProofs < loadedPortableProofs) {
+    logger.debug("Some portable proof references could not be dereferenced.");
+    return null;
+  }
   if (attributions.size > 0) {
+    if (observation?.attempt != null) {
+      observation.attempt.reason = observation.attempt.checks.length === 0
+        ? { type: "noSignature" }
+        : {
+          type: "uncoveredAttribution",
+          attributionIds: [...attributions].map((id) => new URL(id)),
+        };
+    }
+
     logger.debug(
       "Some attributions are not authenticated by the proofs: {attributions}.",
       { attributions: [...attributions] },
@@ -1785,26 +2649,28 @@ function deleteAuthenticatedAttribution(
   controllerId: URL,
   verificationMethodId: URL,
 ): void {
-  const controllerHasCryptographicOrigin = hasCryptographicOrigin(
-    controllerId.href,
-  );
-  const verificationMethodMatchesController =
-    controllerHasCryptographicOrigin &&
-    hasCryptographicOrigin(verificationMethodId.href) &&
-    haveSameFe34Origin(controllerId, verificationMethodId);
+  // A compatible identifier stands for a portable object, so a controller
+  // at one is as cryptographic as an `ap:` URI:
   if (
-    !controllerHasCryptographicOrigin ||
-    verificationMethodMatchesController
+    !hasCryptographicOrigin(controllerId.href) && !isPortableId(controllerId)
   ) {
     attributions.delete(controllerId.href);
+    return;
   }
+  // Portable attributions, including compatible identifiers, are
+  // authenticated only by a proof whose verification method shares their
+  // DID; the web origin of a compatible identifier authenticates nothing:
+  const did = getPortableDid(controllerId);
   if (
-    !verificationMethodMatchesController
-  ) return;
+    did == null || !hasCryptographicOrigin(verificationMethodId.href) ||
+    getPortableDid(verificationMethodId) !== did
+  ) {
+    return;
+  }
   for (const attribution of [...attributions]) {
     if (
-      hasCryptographicOrigin(attribution) &&
-      haveSameFe34Origin(controllerId, attribution)
+      (hasCryptographicOrigin(attribution) || isPortableId(attribution)) &&
+      getPortableDid(attribution) === did
     ) {
       attributions.delete(attribution);
     }

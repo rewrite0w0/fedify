@@ -7,6 +7,8 @@ export default [
     entry: [
       "src/mod.ts",
       "src/internal/jsonld-cache.ts",
+      "src/internal/portable-dereference.ts",
+      "src/internal/signed-representation.ts",
       "src/jsonld.ts",
       "src/temporal.ts",
     ],

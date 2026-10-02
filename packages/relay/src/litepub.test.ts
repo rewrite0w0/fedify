@@ -39,9 +39,35 @@ const mockDocumentLoader = async (url: string): Promise<RemoteDocument> => {
         id: url,
         type: "Person",
         preferredUsername: "alice",
-        inbox: "https://remote.example.com/users/alice/inbox",
+        inbox: aliceInbox,
         publicKey: {
           id: "https://remote.example.com/users/alice#main-key",
+          owner: url.replace(/#main-key$/, ""),
+          publicKeyPem: await exportSpki(rsaKeyPair.publicKey),
+        },
+      },
+    };
+  } else if (
+    url === "https://remote.example.com/users/dave" ||
+    url === "https://remote.example.com/users/dave#main-key"
+  ) {
+    // Alice's inbox is shared by most of the tests in this file, so the
+    // subscription approval test gets an actor of its own whose inbox no
+    // other test delivers to.
+    return {
+      contextUrl: null,
+      documentUrl: url.replace(/#main-key$/, ""),
+      document: {
+        "@context": [
+          "https://www.w3.org/ns/activitystreams",
+          "https://w3id.org/security/v1",
+        ],
+        id: url,
+        type: "Person",
+        preferredUsername: "dave",
+        inbox: daveInbox,
+        publicKey: {
+          id: "https://remote.example.com/users/dave#main-key",
           owner: url.replace(/#main-key$/, ""),
           publicKeyPem: await exportSpki(rsaKeyPair.publicKey),
         },
@@ -80,6 +106,75 @@ const rsaPublicKey = {
   id: new URL("https://remote.example.com/users/alice#main-key"),
   ...rsaKeyPair.publicKey,
 };
+
+const davePublicKey = {
+  id: new URL("https://remote.example.com/users/dave#main-key"),
+  ...rsaKeyPair.publicKey,
+};
+
+// Recipients of the deliveries these tests assert on.  They live in the RFC
+// 3849 documentation prefix 2001:db8::/32, which validatePublicUrl() accepts
+// as public without a DNS lookup while never routing anywhere; an
+// *.example.com subdomain does not resolve, so a delivery to it is refused
+// before the request is made.  mastodon.test.ts uses a disjoint /48 so that
+// neither file's interceptor can swallow the other's deliveries.
+const INBOX_PREFIX = "https://[2001:db8:1::";
+const aliceInbox = `${INBOX_PREFIX}4]/users/alice/inbox`;
+const daveInbox = `${INBOX_PREFIX}1]/users/dave/inbox`;
+const pendingInbox = `${INBOX_PREFIX}2]/users/bob/inbox`;
+const acceptedInbox = `${INBOX_PREFIX}3]/users/carol/inbox`;
+
+interface DeliveredRequest {
+  readonly method: string;
+  readonly body: any;
+}
+
+const recorders = new Map<string, DeliveredRequest[]>();
+
+// Delivery goes through the global fetch(), and node:test runs the tests of a
+// describe() block concurrently, so a per-test interceptor would be clobbered
+// by whichever test installs or restores the next one.  Install a single
+// interceptor for the whole file instead, and let each test register the
+// inboxes whose deliveries it wants to see.
+function recordInbox(inbox: string): DeliveredRequest[] {
+  const recorded: DeliveredRequest[] = [];
+  recorders.set(inbox, recorded);
+  return recorded;
+}
+
+const aliceDeliveries = recordInbox(aliceInbox);
+
+function assertAcceptDelivered(
+  follow: Follow,
+  deliveries: readonly DeliveredRequest[] = aliceDeliveries,
+): void {
+  const accepts = deliveries.filter(({ body }) =>
+    body.type === "Accept" && body.object?.id === follow.id?.href
+  );
+  strictEqual(accepts.length, 1, "Expected exactly one Accept for this Follow");
+  strictEqual(accepts[0].method, "POST");
+  strictEqual(accepts[0].body.actor, "https://relay.example.com/users/relay");
+  strictEqual(accepts[0].body.object.type, "Follow");
+  strictEqual(
+    accepts[0].body.object.actor.id,
+    follow.actorId?.href,
+  );
+}
+
+const nextFetch = globalThis.fetch;
+globalThis.fetch = (async (input: URL | RequestInfo, init?: RequestInit) => {
+  const request = input instanceof Request ? input : new Request(input, init);
+  if (!request.url.startsWith(INBOX_PREFIX)) {
+    return await nextFetch(input, init);
+  }
+  // Answer every request within this file's prefix, registered or not, so that
+  // a stray delivery can never reach the network.
+  const recorded = recorders.get(request.url);
+  if (recorded != null) {
+    recorded.push({ method: request.method, body: await request.json() });
+  }
+  return new Response(null, { status: 202 });
+}) as typeof fetch;
 
 describe("LitePubRelay", () => {
   test("constructor with required options", () => {
@@ -279,13 +374,16 @@ describe("LitePubRelay", () => {
     });
 
     const follower = new Person({
-      id: new URL("https://remote.example.com/users/alice"),
-      preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      id: new URL("https://remote.example.com/users/dave"),
+      preferredUsername: "dave",
+      inbox: new URL(daveInbox),
     });
 
     const followActivity = new Follow({
-      id: new URL("https://remote.example.com/activities/follow/1"),
+      // Isolate delivery assertions from other tests and loop iterations.
+      id: new URL(
+        `https://remote.example.com/activities/follow/${crypto.randomUUID()}`,
+      ),
       actor: follower.id,
       object: new URL("https://relay.example.com/users/relay"),
     });
@@ -303,33 +401,13 @@ describe("LitePubRelay", () => {
     request = await signRequest(
       request,
       rsaKeyPair.privateKey,
-      rsaPublicKey.id,
+      davePublicKey.id,
     );
 
-    const originalFetch = globalThis.fetch;
-    const deliveredActivities: any[] = [];
-    globalThis.fetch = (async (
-      input: URL | RequestInfo,
-      init?: RequestInit,
-    ) => {
-      const outboundRequest = input instanceof Request
-        ? input
-        : new Request(input, init);
-      if (
-        outboundRequest.url ===
-          "https://remote.example.com/users/alice/inbox"
-      ) {
-        deliveredActivities.push(await outboundRequest.json());
-        return new Response(null, { status: 202 });
-      }
-      return originalFetch(input, init);
-    }) as typeof fetch;
-
-    try {
-      await relay.fetch(request);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    const deliveredActivities = recordInbox(daveInbox);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
+    assertAcceptDelivered(followActivity, deliveredActivities);
 
     // Verify handler was called
     strictEqual(handlerCalled, true);
@@ -338,13 +416,13 @@ describe("LitePubRelay", () => {
     // Verify follower was stored with "pending" state (awaiting reciprocal Accept)
     const followerData = await kv.get([
       "follower",
-      "https://remote.example.com/users/alice",
+      "https://remote.example.com/users/dave",
     ]);
     ok(isRelayFollowerData(followerData));
     strictEqual(followerData.state, "pending");
 
-    const reciprocalFollow = deliveredActivities.find((activity) =>
-      activity.type === "Follow"
+    const reciprocalFollow = deliveredActivities.map(({ body }) => body).find(
+      (activity) => activity.type === "Follow",
     );
     ok(reciprocalFollow, "Expected a reciprocal Follow activity");
     strictEqual(
@@ -353,11 +431,11 @@ describe("LitePubRelay", () => {
     );
     strictEqual(
       reciprocalFollow.object,
-      "https://remote.example.com/users/alice",
+      "https://remote.example.com/users/dave",
     );
     strictEqual(
       reciprocalFollow.to,
-      "https://remote.example.com/users/alice",
+      "https://remote.example.com/users/dave",
     );
   });
 
@@ -377,7 +455,7 @@ describe("LitePubRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     const followActivity = new Follow({
@@ -402,7 +480,8 @@ describe("LitePubRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
 
     // Verify follower was NOT stored
     const followerData = await kv.get([
@@ -426,12 +505,15 @@ describe("LitePubRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     // Public follow activity
     const followActivity = new Follow({
-      id: new URL("https://remote.example.com/activities/follow/1"),
+      // Isolate delivery assertions from other tests and loop iterations.
+      id: new URL(
+        `https://remote.example.com/activities/follow/${crypto.randomUUID()}`,
+      ),
       actor: follower.id,
       object: new URL("https://www.w3.org/ns/activitystreams#Public"),
     });
@@ -452,7 +534,9 @@ describe("LitePubRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
+    assertAcceptDelivered(followActivity);
 
     // Verify follower was stored with "pending" state
     const followerData = await kv.get([
@@ -496,7 +580,8 @@ describe("LitePubRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
 
     // Verify follower was NOT stored
     const followerData = await kv.get([
@@ -536,7 +621,10 @@ describe("LitePubRelay", () => {
       strictEqual(await relay.getFollower(followerId), null);
 
       const followActivity = new Follow({
-        id: new URL("https://remote.example.com/activities/follow/1"),
+        // Isolate delivery assertions from other tests and loop iterations.
+        id: new URL(
+          `https://remote.example.com/activities/follow/${crypto.randomUUID()}`,
+        ),
         actor: new URL(followerId),
         object: new URL("https://relay.example.com/users/relay"),
       });
@@ -553,7 +641,9 @@ describe("LitePubRelay", () => {
         rsaPublicKey.id,
       );
 
-      await relay.fetch(request);
+      const response = await relay.fetch(request);
+      strictEqual(response.status, 202);
+      assertAcceptDelivered(followActivity);
 
       strictEqual(handlerCallCount, 1);
       const follower = await relay.getFollower(followerId);
@@ -582,7 +672,7 @@ describe("LitePubRelay", () => {
       const follower = new Person({
         id: new URL("https://remote.example.com/users/alice"),
         preferredUsername: "alice",
-        inbox: new URL("https://remote.example.com/users/alice/inbox"),
+        inbox: new URL(aliceInbox),
       });
       await kv.set(
         ["follower", "https://remote.example.com/users/alice"],
@@ -610,7 +700,8 @@ describe("LitePubRelay", () => {
         rsaPublicKey.id,
       );
 
-      await relay.fetch(request);
+      const response = await relay.fetch(request);
+      strictEqual(response.status, 202);
 
       strictEqual(handlerCallCount, 0);
       const followerData = await kv.get([
@@ -628,7 +719,7 @@ describe("LitePubRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     // Pre-populate with pending follower
@@ -673,7 +764,8 @@ describe("LitePubRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
 
     // Verify follower state changed to "accepted"
     const followerData = await kv.get([
@@ -734,7 +826,8 @@ describe("LitePubRelay", () => {
         rsaPublicKey.id,
       );
 
-      await relay.fetch(request);
+      const response = await relay.fetch(request);
+      strictEqual(response.status, 202);
 
       deepStrictEqual(await kv.get(["follower", followerId]), invalidRow);
     }
@@ -748,7 +841,7 @@ describe("LitePubRelay", () => {
       const follower = new Person({
         id: new URL(followerId),
         preferredUsername: "alice",
-        inbox: new URL("https://remote.example.com/users/alice/inbox"),
+        inbox: new URL(aliceInbox),
       });
 
       await kv.set(
@@ -792,7 +885,8 @@ describe("LitePubRelay", () => {
         rsaPublicKey.id,
       );
 
-      await relay.fetch(request);
+      const response = await relay.fetch(request);
+      strictEqual(response.status, 202);
 
       const followerData = await kv.get(["follower", followerId]);
       strictEqual(followerData, undefined);
@@ -807,7 +901,7 @@ describe("LitePubRelay", () => {
     const follower = new Person({
       id: new URL(followerId),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     await kv.set(
@@ -861,12 +955,12 @@ describe("LitePubRelay", () => {
     const pendingFollower = new Person({
       id: new URL("https://pending.example.com/users/bob"),
       preferredUsername: "bob",
-      inbox: new URL("https://pending.example.com/users/bob/inbox"),
+      inbox: new URL(pendingInbox),
     });
     const acceptedFollower = new Person({
       id: new URL("https://accepted.example.com/users/carol"),
       preferredUsername: "carol",
-      inbox: new URL("https://accepted.example.com/users/carol/inbox"),
+      inbox: new URL(acceptedInbox),
     });
     await kv.set(
       ["follower", pendingFollower.id!.href],
@@ -906,32 +1000,20 @@ describe("LitePubRelay", () => {
       rsaPublicKey.id,
     );
 
-    const originalFetch = globalThis.fetch;
-    const deliveredInboxUrls: string[] = [];
-    globalThis.fetch = (async (
-      input: URL | RequestInfo,
-      init?: RequestInit,
-    ) => {
-      const outboundRequest = input instanceof Request
-        ? input
-        : new Request(input, init);
-      if (outboundRequest.url.endsWith("/inbox")) {
-        deliveredInboxUrls.push(outboundRequest.url);
-        return new Response(null, { status: 202 });
-      }
-      return await originalFetch(input, init);
-    }) as typeof fetch;
+    const deliveredToPending = recordInbox(pendingInbox);
+    const deliveredToAccepted = recordInbox(acceptedInbox);
 
-    try {
-      const response = await relay.fetch(request);
-      ok(response.status === 200 || response.status === 202);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    const response = await relay.fetch(request);
+    ok(
+      response.status === 200 || response.status === 202,
+      `Unexpected inbox response status: ${response.status}`,
+    );
 
-    deepStrictEqual(deliveredInboxUrls, [
-      "https://accepted.example.com/users/carol/inbox",
-    ]);
+    // The relay delivers to every recipient of a single sendActivity() call
+    // before the inbox handler returns, so the pending follower having no
+    // delivery by now means it was left out of the recipient list.
+    strictEqual(deliveredToAccepted.length, 1);
+    deepStrictEqual(deliveredToPending, []);
   });
 
   test("handles Update activity with Announce forwarding", async () => {
@@ -1269,7 +1351,7 @@ describe("LitePubRelay", () => {
       id: new URL(followerId),
       preferredUsername: "alice",
       name: "Alice Wonderland",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     await kv.set(

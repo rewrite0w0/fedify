@@ -1,6 +1,6 @@
 {
   "name": "@fedify/cli",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "type": "module",
   "files": [
     "README.md",
@@ -113,6 +113,7 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@fedify/fixture": "workspace:*",
     "@types/bun": "catalog:",
     "@types/node": "catalog:",
     "@types/pngjs": "^6.0.5",

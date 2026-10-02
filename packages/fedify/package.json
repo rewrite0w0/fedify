@@ -1,6 +1,6 @@
 {
   "name": "@fedify/fedify",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "An ActivityPub server framework",
   "keywords": [
     "ActivityPub",
@@ -161,7 +161,7 @@
     "@fedify/vocab-tools": "workspace:^",
     "@std/assert": "jsr:^0.226.0",
     "@std/path": "catalog:",
-    "@types/node": "^24.2.1",
+    "@types/node": "catalog:",
     "fetch-mock": "catalog:",
     "miniflare": "^4.20250523.0",
     "tsdown": "catalog:",
@@ -179,6 +179,6 @@
     "test": "cd dist/ && node --test",
     "pretest:bun": "pnpm build",
     "test:bun": "cd dist/ && bun test --timeout 60000",
-    "test:cfworkers": "deno task codegen && wrangler deploy --dry-run --outdir src/cfworkers && node --import=tsx src/cfworkers/client.ts"
+    "test:cfworkers": "deno task codegen && wrangler deploy --dry-run --outdir src/cfworkers && node --import=tsx scripts/check_cfworkers.ts && node --import=tsx src/cfworkers/client.ts"
   }
 }

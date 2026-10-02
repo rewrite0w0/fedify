@@ -1,3 +1,4 @@
+import { InboxObservation } from "./inbox-observation.ts";
 import { type Path, RouterError } from "@fedify/uri-template";
 import type {
   Actor,
@@ -23,8 +24,13 @@ import type {
   DocumentLoaderFactory,
   DocumentLoaderFactoryOptions,
   GetUserAgentOptions,
+  PortableObjectVerifier,
 } from "@fedify/vocab-runtime";
-import { FetchError, getDocumentLoader } from "@fedify/vocab-runtime";
+import {
+  FetchError,
+  getDocumentLoader,
+  resolveDocumentLoaderTimeout,
+} from "@fedify/vocab-runtime";
 import type {
   LookupWebFingerOptions,
   ResourceDescriptor,
@@ -59,8 +65,10 @@ import { getNodeInfo, type GetNodeInfoOptions } from "../nodeinfo/client.ts";
 import { handleNodeInfo, handleNodeInfoJrd } from "../nodeinfo/handler.ts";
 import type { JsonValue, NodeInfo } from "../nodeinfo/types.ts";
 import {
+  DEFAULT_MAX_RFC9421_SIGNATURES,
   type HttpMessageSignaturesSpec,
   type HttpMessageSignaturesSpecDeterminer,
+  validateMaxSignatures,
   verifyRequest,
 } from "../sig/http.ts";
 import { exportJwk, importJwk, validateCryptoKey } from "../sig/key.ts";
@@ -78,9 +86,19 @@ import {
   wrapContextLoaderForJsonLd,
 } from "../sig/ld.ts";
 import { getKeyOwner, type GetKeyOwnerOptions } from "../sig/owner.ts";
-import { hasProofLike, signObject, verifyObject } from "../sig/proof.ts";
+import {
+  getAuthenticationOrigin,
+  getCanonicalPortableId,
+  getGatewayKeyBase,
+  hasPortableActor,
+  isPortableKeyId,
+  isSameObjectId,
+} from "../sig/portable-key-id.ts";
+import { verifyPortableObject } from "../sig/portable-collection.ts";
+import { hasProofLike, verifyObject } from "../sig/proof.ts";
 import { getAuthenticatedDocumentLoader } from "../utils/docloader.ts";
 import { kvCache } from "../utils/kv-cache.ts";
+import { isInAudience } from "./audience.ts";
 import {
   type BenchmarkMetricReader,
   type BenchmarkTriggerOptions,
@@ -89,6 +107,7 @@ import {
   handleBenchmarkTrigger,
 } from "./bench.ts";
 import { ACTOR_ALIAS_PREFIX, FederationBuilderImpl } from "./builder.ts";
+import { warnCompatibleIdsInJson } from "./compatible-id-warning.ts";
 import type { OutboxErrorHandler } from "./callback.ts";
 import {
   CircuitBreaker,
@@ -102,10 +121,14 @@ import type {
   Context,
   ForwardActivityOptions,
   GetActorOptions,
+  GetObjectOptions,
   GetSignedKeyOptions,
   InboxContext,
+  IsSignedByAudienceOptions,
   OutboxContext,
+  ParseUriOptions,
   ParseUriResult,
+  PortableRequest,
   RequestContext,
   RouteActivityOptions,
   SendActivityOptionsForCollection,
@@ -120,6 +143,7 @@ import type {
   InboxChallengePolicy,
 } from "./federation.ts";
 import {
+  type CollectionCallbacks,
   handleActor,
   handleCollection,
   handleCustomCollection,
@@ -128,6 +152,8 @@ import {
   handleObject,
   handleOrderedCollection,
   handleOutbox,
+  handlePortableObject,
+  type PortableInboxDelivery,
   rawInboxContextFactorySymbol,
 } from "./handler.ts";
 import { routeActivity } from "./inbox.ts";
@@ -153,6 +179,31 @@ import {
 } from "./metrics.ts";
 import type { MessageQueue } from "./mq.ts";
 import { acceptsJsonLd } from "./negotiation.ts";
+import {
+  buildPortableUri,
+  HASHLINK_MEDIA_ROUTE_TEMPLATE,
+  type HashlinkGatewayRequest,
+  parseHashlinkGatewayRequest,
+  parsePortableGatewayRequest,
+  parsePortableId,
+  type PortableGatewayRequest,
+} from "./portable.ts";
+import {
+  buildPortableCollectionView,
+  resolvePortableCollectionOwner,
+} from "./portable-collection.ts";
+import {
+  forwardPortableInboxActivity,
+  type PortableInboxRecipient,
+  type ResolvedPortableInboxForwardingOptions,
+  resolvePortableInboxForwardingOptions,
+  resolvePortableInboxRecipient,
+} from "./portable-inbox.ts";
+import { getOrderingDestination } from "./portable-delivery.ts";
+import {
+  assertSupportedCompoundProofShape,
+  signOutgoingActivity,
+} from "./outgoing-proof.ts";
 import type {
   FanoutMessage,
   InboxMessage,
@@ -166,6 +217,8 @@ import {
   extractInboxes,
   sendActivity,
   SendActivityError,
+  type SendActivityParameters,
+  sendActivityThroughGateways,
   type SenderKeyPair,
 } from "./send.ts";
 import {
@@ -337,6 +390,49 @@ function maxDelay(
   return Temporal.Duration.compare(first, second) >= 0 ? first : second;
 }
 
+/**
+ * Gets the fields of a queued message that describe the FEP-ef61 portable
+ * inbox an inbox stands for, if any, omitting the absent ones.
+ */
+function getPortableMessageFields(
+  portableInbox: string | undefined,
+  gatewayInboxes: readonly string[] | undefined,
+): { portableInbox?: string; gatewayInboxes?: readonly string[] } {
+  return {
+    ...(portableInbox == null ? {} : { portableInbox }),
+    ...(gatewayInboxes == null ? {} : { gatewayInboxes: [...gatewayInboxes] }),
+  };
+}
+
+/**
+ * Sends an activity to an inbox, or, if the inbox is the compatible
+ * identifier of an FEP-ef61 portable inbox on more than one gateway, through
+ * the first gateway that accepts it.
+ */
+function sendActivityToInbox(
+  inbox: string,
+  gatewayInboxes: readonly string[] | undefined,
+  parameters: Omit<SendActivityParameters, "inbox">,
+): Promise<void> {
+  if (gatewayInboxes == null || gatewayInboxes.length < 2) {
+    return sendActivity({ ...parameters, inbox: new URL(inbox) });
+  }
+  return sendActivityThroughGateways(
+    parameters,
+    gatewayInboxes.map((i) => new URL(i)),
+  );
+}
+
+function parseInstant(value: string | undefined): Temporal.Instant | undefined {
+  if (value == null) return undefined;
+  try {
+    return Temporal.Instant.from(value);
+  } catch (error) {
+    if (error instanceof RangeError) return undefined;
+    throw error;
+  }
+}
+
 function isTransportDeliveryError(error: unknown): boolean {
   return error instanceof FetchError || isAbortError(error);
 }
@@ -422,7 +518,7 @@ function isPermanentInboxParseError(error: unknown): error is Error {
       (error.name === "jsonld.SyntaxError" &&
         !isRemoteContextLoadingFailure(error)))) ||
     (error instanceof TypeError &&
-      (/^(Invalid JSON-LD:|Invalid type:|Unexpected type:|Invalid @id:)/
+      (/^(Invalid JSON-LD:|Invalid type:|Unexpected type:|Invalid @id:|Invalid FEP-ef61 gateway:)/
         .test(error.message) ||
         isInvalidUrlTypeError(error)));
 }
@@ -562,6 +658,17 @@ export interface FederationKvPrefixes {
    * @since 2.4.0
    */
   readonly taskDeduplication: KvKey;
+
+  /**
+   * The key prefix used for remembering which activities received in
+   * [FEP-ef61] portable inboxes have been forwarded to which gateways, so that
+   * each activity is forwarded at most once.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @default `["_fedify", "portableInboxForwarding"]`
+   * @since 2.4.0
+   */
+  readonly portableInboxForwarding: KvKey;
 }
 
 /**
@@ -590,6 +697,8 @@ export interface FederationOrigin {
  * @returns A new {@link Federation} instance.
  * @throws {TypeError} If benchmark mode and `meterProvider` are both
  * specified.
+ * @throws {RangeError} If {@link FederationOptions.maxHttpSignatures} is not
+ * a positive integer or `Infinity`.
  * @since 0.10.0
  */
 export function createFederation<TContextData>(
@@ -605,6 +714,7 @@ export class FederationImpl<TContextData>
   kvPrefixes: FederationKvPrefixes;
   publicKeyTtl: Temporal.Duration;
   httpMessageSignaturesSpecTtl: Temporal.Duration;
+  portableInboxForwarding: ResolvedPortableInboxForwardingOptions;
   inboxQueue?: MessageQueue;
   outboxQueue?: MessageQueue;
   fanoutQueue?: MessageQueue;
@@ -620,6 +730,7 @@ export class FederationImpl<TContextData>
   onOutboxError?: OutboxErrorHandler;
   permanentFailureStatusCodes: readonly number[];
   signatureTimeWindow: Temporal.Duration | Temporal.DurationLike | false;
+  maxHttpSignatures: number;
   skipSignatureVerification: boolean;
   outboxRetryPolicy: RetryPolicy;
   inboxRetryPolicy: RetryPolicy;
@@ -637,6 +748,7 @@ export class FederationImpl<TContextData>
   benchmarkMetricReader?: BenchmarkMetricReader;
   benchmarkTriggerOptions: BenchmarkTriggerOptions;
   #mediaUploaderNoAuthWarned = false;
+  #portableInboxForwardingWarned = false;
   readonly #queueDepthGaugeSourceId = `fedify-${
     (++nextQueueDepthGaugeSourceId).toString(36)
   }`;
@@ -656,6 +768,9 @@ export class FederationImpl<TContextData>
       (benchmarkMode && !hasCustomLoaderFactory ? true : false);
     const signatureTimeWindow = options.signatureTimeWindow ??
       (benchmarkMode ? false : { hours: 1 });
+    if (options.maxHttpSignatures !== undefined) {
+      validateMaxSignatures(options.maxHttpSignatures, "maxHttpSignatures");
+    }
     if (benchmarkMode && options.meterProvider != null) {
       throw new TypeError(
         "benchmarkMode requires Fedify to own the meterProvider; " +
@@ -690,6 +805,7 @@ export class FederationImpl<TContextData>
         acceptSignatureNonce: ["_fedify", "acceptSignatureNonce"],
         circuitBreaker: ["_fedify", "circuit"],
         taskDeduplication: ["_fedify", "taskDeduplication"],
+        portableInboxForwarding: ["_fedify", "portableInboxForwarding"],
       } satisfies FederationKvPrefixes),
       ...(options.kvPrefixes ?? {}),
     };
@@ -698,6 +814,9 @@ export class FederationImpl<TContextData>
     );
     this.httpMessageSignaturesSpecTtl = Temporal.Duration.from(
       options.httpMessageSignaturesSpecTtl ?? { days: 90 },
+    );
+    this.portableInboxForwarding = resolvePortableInboxForwardingOptions(
+      options.portableInboxForwarding,
     );
     if (options.queue == null) {
       this.inboxQueue = undefined;
@@ -818,6 +937,13 @@ export class FederationImpl<TContextData>
     }
     const { userAgent } = options;
     this.allowPrivateAddress = allowPrivateAddress;
+    const documentLoaderTimeout = resolveDocumentLoaderTimeout(
+      options.documentLoaderTimeout == null
+        ? options.documentLoaderTimeout
+        : Temporal.Duration.from(options.documentLoaderTimeout).total(
+          "millisecond",
+        ),
+    );
     // The loader factory closures below read `this._meterProvider` at
     // call time, not when they are created.  Factories are only invoked
     // after the constructor has assigned `_meterProvider` (see below), so
@@ -831,6 +957,9 @@ export class FederationImpl<TContextData>
           allowPrivateAddress: opts?.allowPrivateAddress ??
             allowPrivateAddress,
           userAgent: opts?.userAgent ?? userAgent,
+          timeout: opts?.timeout !== undefined
+            ? opts.timeout
+            : documentLoaderTimeout,
         }),
         kv: options.kv,
         prefix: this.kvPrefixes.remoteDocument,
@@ -843,6 +972,9 @@ export class FederationImpl<TContextData>
           allowPrivateAddress: opts?.allowPrivateAddress ??
             allowPrivateAddress,
           userAgent: opts?.userAgent ?? userAgent,
+          timeout: opts?.timeout !== undefined
+            ? opts.timeout
+            : documentLoaderTimeout,
         }),
         kv: options.kv,
         prefix: this.kvPrefixes.remoteDocument,
@@ -897,6 +1029,9 @@ export class FederationImpl<TContextData>
             allowPrivateAddress: factoryOpts?.allowPrivateAddress ??
               allowPrivateAddress,
             userAgent: factoryOpts?.userAgent ?? userAgent,
+            timeout: factoryOpts?.timeout !== undefined
+              ? factoryOpts.timeout
+              : documentLoaderTimeout,
             specDeterminer: new KvSpecDeterminer(
               this.kv,
               this.kvPrefixes.httpMessageSignaturesSpec,
@@ -917,6 +1052,8 @@ export class FederationImpl<TContextData>
     this.permanentFailureStatusCodes = options.permanentFailureStatusCodes ??
       [404, 410];
     this.signatureTimeWindow = signatureTimeWindow;
+    this.maxHttpSignatures = options.maxHttpSignatures ??
+      DEFAULT_MAX_RFC9421_SIGNATURES;
     this.skipSignatureVerification = options.skipSignatureVerification ?? false;
     this.inboxChallengePolicy = options.inboxChallengePolicy;
     this.outboxRetryPolicy = options.outboxRetryPolicy ??
@@ -1249,6 +1386,7 @@ export class FederationImpl<TContextData>
       collectionSync: message.collectionSync,
       orderingKey: message.orderingKey,
       normalizeExistingProofs: message.normalizeExistingProofs,
+      activityJsonLd: message.activity,
       context,
     });
   }
@@ -1298,14 +1436,22 @@ export class FederationImpl<TContextData>
       });
       return parsedActorIds;
     };
-    const parseActivity = () =>
-      Activity.fromJsonLd(message.activity, {
-        contextLoader: this.contextLoaderFactory(loaderOptions),
-        documentLoader: rsaKeyPair == null
-          ? this.documentLoaderFactory(loaderOptions)
-          : this.authenticatedDocumentLoaderFactory(rsaKeyPair, loaderOptions),
+    const parseActivity = () => {
+      const contextLoader = this.contextLoaderFactory(loaderOptions);
+      const documentLoader = rsaKeyPair == null
+        ? this.documentLoaderFactory(loaderOptions)
+        : this.authenticatedDocumentLoaderFactory(rsaKeyPair, loaderOptions);
+      return Activity.fromJsonLd(message.activity, {
+        contextLoader,
+        documentLoader,
         tracerProvider: this.tracerProvider,
+        verifyPortableObject: createPortableObjectVerifier(
+          documentLoader,
+          contextLoader,
+          this,
+        ),
       });
+    };
     const enqueueHeldOutboxMessage = async (
       delay: Temporal.Duration,
       heldSince: Temporal.Instant,
@@ -1382,6 +1528,25 @@ export class FederationImpl<TContextData>
         message.activityType,
       );
     };
+    const { gatewayInboxes } = message;
+    if (gatewayInboxes != null && gatewayInboxes.length > 1) {
+      await this.#listenGatewayOutboxMessage(
+        _,
+        {
+          ...message,
+          gatewayInboxes,
+        },
+        span,
+        {
+          keys,
+          logData,
+          getActorIds,
+          parseActivity,
+          dropHeldOutboxMessage,
+        },
+      );
+      return;
+    }
     try {
       const inbox = new URL(message.inbox);
       const circuit = this.outboxQueue == null
@@ -1426,6 +1591,7 @@ export class FederationImpl<TContextData>
         }
       }
       await sendActivity({
+        allowPrivateAddress: this.allowPrivateAddress,
         keys,
         activity: message.activity,
         activityId: message.activityId,
@@ -1735,6 +1901,454 @@ export class FederationImpl<TContextData>
     );
   }
 
+  /**
+   * Delivers a queued activity to an FEP-ef61 portable inbox through the first
+   * of its gateways that accepts it, trying them one after another in a single
+   * round, so that the round counts as one attempt for the retry policy, keeps
+   * the message's place in its ordering key, and is replayed as a whole by
+   * queues that retry natively.
+   *
+   * A gateway that fails with a permanent failure status is not tried again.
+   * A gateway whose circuit is open, or which asked to be retried later with
+   * `Retry-After`, is skipped in this round.  If no gateway accepts the
+   * activity, the message is held while every remaining gateway is held, and
+   * otherwise retried according to the retry policy.
+   */
+  async #listenGatewayOutboxMessage(
+    contextData: TContextData,
+    message: OutboxMessage & { readonly gatewayInboxes: readonly string[] },
+    span: Span,
+    helpers: {
+      readonly keys: readonly SenderKeyPair[];
+      readonly logData: Record<string, unknown>;
+      readonly getActorIds: () => URL[];
+      readonly parseActivity: () => Promise<Activity>;
+      readonly dropHeldOutboxMessage: (
+        circuit: CircuitBreaker,
+        remoteHost: string,
+        inbox: URL,
+        heldSince: Temporal.Instant,
+        activity: Activity,
+      ) => Promise<void>;
+    },
+  ): Promise<void> {
+    const logger = getLogger(["fedify", "federation", "outbox"]);
+    const circuitLogger = getLogger(["fedify", "federation", "circuit"]);
+    const { keys, logData, getActorIds, parseActivity, dropHeldOutboxMessage } =
+      helpers;
+    const circuit = this.outboxQueue == null ? undefined : this.circuitBreaker;
+    const specDeterminer = new KvSpecDeterminer(
+      this.kv,
+      this.kvPrefixes.httpMessageSignaturesSpec,
+      this.firstKnock,
+      { specTtl: this.httpMessageSignaturesSpecTtl },
+    );
+    interface Survivor {
+      readonly inbox: string;
+      /** How long the gateway is held, or `undefined` if it just failed. */
+      readonly holdDelay?: Temporal.Duration;
+      /** Whether the gateway's circuit holds it, rather than `Retry-After`. */
+      readonly circuitHeld?: boolean;
+      /** Whether the gateway was held after it failed in this round. */
+      readonly postFailure?: boolean;
+      /** The time before which the gateway must not be tried again. */
+      readonly notBefore?: Temporal.Instant;
+      readonly retryAfter?: Temporal.Duration;
+    }
+    const survivors: Survivor[] = [];
+    let lastError: unknown;
+    let lastPermanent: { error: SendActivityError; inbox: URL } | undefined;
+    let activity: Activity | undefined;
+    const getActivity = async () => activity ??= await parseActivity();
+    const drop = async (
+      circuit: CircuitBreaker,
+      remoteHost: string,
+      inbox: URL,
+      heldSince: Temporal.Instant,
+    ) => {
+      await dropHeldOutboxMessage(
+        circuit,
+        remoteHost,
+        inbox,
+        heldSince,
+        await getActivity(),
+      );
+    };
+    // Checked up front, as gateways deferred by Retry-After are skipped
+    // without asking the circuit breaker, which would otherwise tell:
+    const heldSince = parseInstant(message.circuitHeldSince);
+    if (
+      circuit != null && heldSince != null &&
+      Temporal.Instant.compare(
+          heldSince.add(circuit.options.heldActivityTtl),
+          Temporal.Now.instant(),
+        ) <= 0
+    ) {
+      const inbox = new URL(message.gatewayInboxes[0]);
+      await drop(circuit, getRemoteHost(inbox), inbox, heldSince);
+      return;
+    }
+    for (const inboxHref of message.gatewayInboxes) {
+      const inbox = new URL(inboxHref);
+      const remoteHost = getRemoteHost(inbox);
+      const now = Temporal.Now.instant();
+      const notBefore = parseInstant(message.gatewayNotBefore?.[inboxHref]);
+      if (notBefore != null && Temporal.Instant.compare(notBefore, now) > 0) {
+        // Checked before the circuit, so that no recovery probe is taken:
+        survivors.push({
+          inbox: inboxHref,
+          holdDelay: now.until(notBefore),
+          notBefore,
+        });
+        continue;
+      }
+      let decision: CircuitBreakerBeforeSendDecision | undefined;
+      if (circuit != null) {
+        try {
+          decision = await circuit.beforeSend(remoteHost, message);
+        } catch (circuitError) {
+          circuitLogger.error(
+            "Failed to check circuit breaker state before sending; " +
+              "proceeding with delivery:\n{error}",
+            { ...logData, remoteHost, error: circuitError },
+          );
+        }
+      }
+      if (decision != null && circuit != null) {
+        if (decision.type === "drop") {
+          await drop(circuit, remoteHost, inbox, decision.heldSince);
+          return;
+        } else if (decision.type === "hold") {
+          recordCircuitBreakerHeldSpanEvent(span, remoteHost, decision.state);
+          survivors.push({
+            inbox: inboxHref,
+            holdDelay: decision.delay,
+            circuitHeld: true,
+          });
+          continue;
+        } else if (decision.stateChange != null) {
+          recordCircuitBreakerSpanEvent(
+            span,
+            remoteHost,
+            decision.stateChange,
+          );
+        }
+      }
+      try {
+        await sendActivity({
+          allowPrivateAddress: this.allowPrivateAddress,
+          keys,
+          activity: message.activity,
+          activityId: message.activityId,
+          activityType: message.activityType,
+          inbox,
+          sharedInbox: message.sharedInbox,
+          headers: new Headers(message.headers),
+          specDeterminer,
+          meterProvider: this.meterProvider,
+          tracerProvider: this.tracerProvider,
+        });
+      } catch (error) {
+        lastError = error;
+        const isPermanentFailure = error instanceof SendActivityError &&
+          this.permanentFailureStatusCodes.includes(error.statusCode);
+        let retryAfter = !isPermanentFailure &&
+            error instanceof SendActivityError &&
+            (error.statusCode === 429 || error.statusCode === 503)
+          ? parseRetryAfter(error.responseHeaders)
+          : undefined;
+        let retryAt: Temporal.Instant | undefined;
+        if (retryAfter != null) {
+          try {
+            retryAt = Temporal.Now.instant().add(retryAfter);
+          } catch (e) {
+            // A Retry-After too long to be an instant cannot be honored, and
+            // must not keep the round from trying the other gateways:
+            if (!(e instanceof RangeError)) throw e;
+            retryAfter = undefined;
+          }
+        }
+        let postDecision: CircuitBreakerBeforeSendDecision | undefined;
+        if (circuit != null) {
+          try {
+            if (error instanceof SendActivityError) {
+              const { statusCode } = error;
+              const stateChange = isPermanentFailure || statusCode === 429 ||
+                  (statusCode >= 400 && statusCode < 500)
+                ? await circuit.recordReachableFailure(remoteHost)
+                : statusCode >= 500
+                ? await circuit.recordFailure(remoteHost)
+                : undefined;
+              if (stateChange != null) {
+                recordCircuitBreakerSpanEvent(span, remoteHost, stateChange);
+              }
+            } else if (isTransportDeliveryError(error)) {
+              const stateChange = await circuit.recordFailure(remoteHost);
+              if (stateChange != null) {
+                recordCircuitBreakerSpanEvent(span, remoteHost, stateChange);
+              }
+            }
+            if (!isPermanentFailure) {
+              postDecision = await circuit.beforeSend(remoteHost, message);
+            }
+          } catch (circuitError) {
+            circuitLogger.error(
+              "Failed to update circuit breaker state after delivery " +
+                "failure; falling back to normal failure handling:\n{error}",
+              { ...logData, remoteHost, error: circuitError },
+            );
+          }
+        }
+        span.addEvent("activitypub.delivery.failed", {
+          "activitypub.remote.host": remoteHost,
+          "activitypub.delivery.attempt": message.attempt,
+          "activitypub.delivery.permanent_failure": isPermanentFailure,
+          ...(error instanceof SendActivityError
+            ? { "http.response.status_code": error.statusCode }
+            : {}),
+        });
+        try {
+          await this.onOutboxError?.(error as Error, await getActivity());
+        } catch (handlerError) {
+          logger.error(
+            "An unexpected error occurred in onError handler:\n{error}",
+            { ...logData, inbox: inboxHref, error: handlerError },
+          );
+        }
+        if (isPermanentFailure) {
+          logger.warn(
+            "Permanent delivery failure for activity {activityId} to " +
+              "{inbox} ({status}); not trying the gateway again.",
+            { ...logData, inbox: inboxHref, status: error.statusCode },
+          );
+          lastPermanent = { error, inbox };
+          continue;
+        }
+        if (postDecision?.type === "drop" && circuit != null) {
+          await drop(circuit, remoteHost, inbox, postDecision.heldSince);
+          return;
+        } else if (postDecision?.type === "hold") {
+          recordCircuitBreakerHeldSpanEvent(
+            span,
+            remoteHost,
+            postDecision.state,
+          );
+          survivors.push({
+            inbox: inboxHref,
+            holdDelay: retryAfter == null
+              ? postDecision.delay
+              : maxDelay(postDecision.delay, retryAfter),
+            circuitHeld: true,
+            postFailure: true,
+            notBefore: retryAt,
+            retryAfter,
+          });
+        } else {
+          survivors.push({ inbox: inboxHref, notBefore: retryAt, retryAfter });
+        }
+        logger.warn(
+          "Failed to send activity {activityId} to {inbox} (attempt " +
+            "#{attempt}); trying the next gateway if any:\n{error}",
+          { ...logData, inbox: inboxHref, error },
+        );
+        continue;
+      }
+      if (circuit != null) {
+        try {
+          const stateChange = await circuit.recordSuccess(remoteHost);
+          if (stateChange != null) {
+            recordCircuitBreakerSpanEvent(span, remoteHost, stateChange);
+          }
+        } catch (error) {
+          circuitLogger.error(
+            "Failed to record successful delivery in circuit breaker state; " +
+              "the activity was already delivered:\n{error}",
+            { ...logData, remoteHost, error },
+          );
+        }
+      }
+      logger.info(
+        "Successfully sent activity {activityId} to {inbox}.",
+        { ...logData, inbox: inboxHref },
+      );
+      return;
+    }
+    if (lastError != null) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: String(lastError),
+      });
+    }
+    if (survivors.length < 1) {
+      // Every gateway failed permanently:
+      const { error, inbox } = lastPermanent!;
+      this.metrics.recordPermanentFailure(error.inbox, error.statusCode);
+      logger.warn(
+        "Permanent delivery failure for activity {activityId} to every " +
+          "gateway of {portableInbox}; not retrying.",
+        { ...logData, portableInbox: message.portableInbox },
+      );
+      if (this.outboxPermanentFailureHandler != null) {
+        const ctx = this.#createContext(
+          new URL(message.baseUrl),
+          contextData,
+          {
+            documentLoader: this.documentLoaderFactory(
+              this.#getLoaderOptions(message.baseUrl),
+            ),
+          },
+        );
+        try {
+          await this.outboxPermanentFailureHandler(ctx, {
+            reason: "http",
+            inbox,
+            activity: await getActivity(),
+            error,
+            statusCode: error.statusCode,
+            actorIds: getActorIds(),
+          });
+        } catch (handlerError) {
+          logger.error(
+            "An unexpected error occurred in " +
+              "outboxPermanentFailureHandler:\n{error}",
+            { ...logData, error: handlerError },
+          );
+        }
+      }
+      recordOutboxActivity(
+        this.meterProvider,
+        "abandoned",
+        message.activityType,
+      );
+      return;
+    }
+    const now = Temporal.Now.instant();
+    const gatewayNotBefore: Record<string, string> = {};
+    for (const survivor of survivors) {
+      if (
+        survivor.notBefore != null &&
+        Temporal.Instant.compare(survivor.notBefore, now) > 0
+      ) {
+        gatewayNotBefore[survivor.inbox] = survivor.notBefore.toString();
+      }
+    }
+    const {
+      circuitHeld: _circuitHeld,
+      gatewayNotBefore: _gatewayNotBefore,
+      ...rest
+    } = message;
+    const nextMessage = {
+      ...rest,
+      inbox: survivors[0].inbox,
+      gatewayInboxes: survivors.map((s) => s.inbox),
+      ...(globalThis.Object.keys(gatewayNotBefore).length < 1
+        ? {}
+        : { gatewayNotBefore }),
+    } satisfies OutboxMessage;
+    const { outboxQueue } = this;
+    const policyDelay = this.outboxRetryPolicy({
+      elapsedTime: Temporal.Instant.from(message.started).until(now),
+      attempts: message.attempt,
+    });
+    if (
+      outboxQueue != null && survivors.every((s) => s.holdDelay != null) &&
+      (policyDelay != null || !survivors.some((s) => s.postFailure))
+    ) {
+      // Every remaining gateway is held, so the whole delivery waits for the
+      // first of them without counting as an attempt:
+      let delay = survivors
+        .map((s) => s.holdDelay!)
+        .reduce((a, b) => Temporal.Duration.compare(a, b) <= 0 ? a : b);
+      let heldMessage: OutboxMessage = nextMessage;
+      if (survivors.some((s) => s.circuitHeld)) {
+        const since = heldSince ?? now;
+        if (circuit != null) delay = circuit.capHeldDelay(since, delay);
+        heldMessage = {
+          ...nextMessage,
+          circuitHeld: true,
+          circuitHeldSince: since.toString(),
+        };
+      }
+      logger.warn(
+        "Failed to send activity {activityId} to {portableInbox}; holding it " +
+          "until one of its gateways can be tried again.",
+        { ...logData, portableInbox: message.portableInbox },
+      );
+      await outboxQueue.enqueue(heldMessage, {
+        delay: clampNegativeDelay(delay),
+        orderingKey: message.orderingKey,
+      });
+      this.metrics.recordQueueTaskEnqueued(
+        {
+          role: "outbox",
+          queue: outboxQueue,
+          activityType: heldMessage.activityType,
+        },
+        heldMessage.attempt,
+      );
+      return;
+    }
+    const hasRetryAfter = survivors.some((s) => s.retryAfter != null);
+    // A natively retrying queue replays the original message, so it is left
+    // to the queue only if no gateway has to be excluded from the retry:
+    if (
+      outboxQueue?.nativeRetrial && !hasRetryAfter &&
+      survivors.length === message.gatewayInboxes.length &&
+      globalThis.Object.keys(gatewayNotBefore).length < 1
+    ) {
+      logger.error(
+        "Failed to send activity {activityId} to every gateway of " +
+          "{portableInbox}; backend will handle retry:\n{error}",
+        { ...logData, portableInbox: message.portableInbox, error: lastError },
+      );
+      throw lastError;
+    }
+    if (policyDelay == null || outboxQueue == null) {
+      logger.error(
+        "Failed to send activity {activityId} to every gateway of " +
+          "{portableInbox} after {attempt} attempts; giving up:\n{error}",
+        { ...logData, portableInbox: message.portableInbox, error: lastError },
+      );
+      recordOutboxActivity(
+        this.meterProvider,
+        "abandoned",
+        message.activityType,
+      );
+      return;
+    }
+    // The next round is due as soon as any gateway can be tried again; the
+    // others are skipped then until their own time comes:
+    const delay = survivors
+      .map((s) => s.holdDelay ?? s.retryAfter ?? policyDelay)
+      .reduce((a, b) => Temporal.Duration.compare(a, b) <= 0 ? a : b);
+    const retryMessage = {
+      ...nextMessage,
+      attempt: message.attempt + 1,
+    } satisfies OutboxMessage;
+    logger.error(
+      "Failed to send activity {activityId} to every gateway of " +
+        "{portableInbox} (attempt #{attempt}); retry...:\n{error}",
+      { ...logData, portableInbox: message.portableInbox, error: lastError },
+    );
+    await outboxQueue.enqueue(retryMessage, {
+      delay: clampNegativeDelay(delay),
+      orderingKey: message.orderingKey,
+    });
+    this.metrics.recordQueueTaskEnqueued(
+      {
+        role: "outbox",
+        queue: outboxQueue,
+        activityType: retryMessage.activityType,
+      },
+      retryMessage.attempt,
+    );
+    recordOutboxActivity(
+      this.meterProvider,
+      "retried",
+      retryMessage.activityType,
+    );
+  }
+
   async #listenInboxMessage(
     ctxData: TContextData,
     message: InboxMessage,
@@ -1744,13 +2358,20 @@ export class FederationImpl<TContextData>
     const logger = getLogger(["fedify", "federation", "inbox"]);
     const baseUrl = new URL(message.baseUrl);
     let context = this.#createContext(baseUrl, ctxData);
-    if (message.identifier != null) {
+    // A portable actor does not necessarily have key pairs for authorized
+    // fetch, so fall back to the default document loader without them:
+    if (
+      message.identifier != null &&
+      this.actorCallbacks?.keyPairsDispatcher != null
+    ) {
       context = this.#createContext(baseUrl, ctxData, {
         documentLoader: await context.getDocumentLoader({
           identifier: message.identifier,
         }),
       });
-    } else if (this.sharedInboxKeyDispatcher != null) {
+    } else if (
+      message.identifier == null && this.sharedInboxKeyDispatcher != null
+    ) {
       const identity = await this.sharedInboxKeyDispatcher(context);
       if (identity != null) {
         context = this.#createContext(baseUrl, ctxData, {
@@ -2257,6 +2878,7 @@ export class FederationImpl<TContextData>
         cls: ConstructorWithTypeId<Object>;
         values: Record<string, string>;
       };
+      portableRequest?: PortableRequest;
     },
   ): RequestContextImpl<TContextData>;
 
@@ -2270,6 +2892,7 @@ export class FederationImpl<TContextData>
         cls: ConstructorWithTypeId<Object>;
         values: Record<string, string>;
       };
+      portableRequest?: PortableRequest;
     } = {},
   ): ContextImpl<TContextData> | RequestContextImpl<TContextData> {
     const request = urlOrRequest instanceof Request ? urlOrRequest : null;
@@ -2296,6 +2919,7 @@ export class FederationImpl<TContextData>
       request,
       invokedFromActorDispatcher: opts.invokedFromActorDispatcher,
       invokedFromObjectDispatcher: opts.invokedFromObjectDispatcher,
+      portableRequest: opts.portableRequest,
     });
   }
 
@@ -2316,7 +2940,12 @@ export class FederationImpl<TContextData>
     keys: SenderKeyPair[],
     inboxes: Record<
       string,
-      { actorIds: Iterable<string>; sharedInbox: boolean }
+      {
+        actorIds: Iterable<string>;
+        sharedInbox: boolean;
+        portableInbox?: string;
+        gatewayInboxes?: readonly string[];
+      }
     >,
     activity: Activity,
     options: SendActivityInternalOptions<TContextData>,
@@ -2337,45 +2966,60 @@ export class FederationImpl<TContextData>
       this.#getLoaderOptions(ctx.origin),
     );
     const activityId = activity.id.href;
-    let hasProof = false;
-    let proofCreated = false;
     let rsaKey: { keyId: URL; privateKey: CryptoKey } | null = null;
+    // A Linked Data Signature attests authorship, which neither a gateway key
+    // nor any key other than the DID's can do for a portable actor's
+    // activity; its Object Integrity Proof does that instead:
+    const ldSignable = !hasPortableActor(activity);
     for (const { keyId, privateKey } of keys) {
       validateCryptoKey(privateKey, "private");
-      if (rsaKey == null && privateKey.algorithm.name === "RSASSA-PKCS1-v1_5") {
+      if (
+        ldSignable && rsaKey == null &&
+        privateKey.algorithm.name === "RSASSA-PKCS1-v1_5" &&
+        !isPortableKeyId(keyId)
+      ) {
         rsaKey = { keyId, privateKey };
       }
     }
     // If Object Integrity Proofs were already created before fanout (e.g., in
     // sendActivityInternal()), skip signing to avoid duplicates.
-    for await (const _ of activity.getProofs({ contextLoader })) {
-      hasProof = true;
-      break;
-    }
-    if (!hasProof) {
-      for (const { keyId, privateKey } of keys) {
-        if (privateKey.algorithm.name === "Ed25519") {
-          activity = await signObject(activity, privateKey, keyId, {
-            contextLoader,
-            tracerProvider: this.tracerProvider,
-          });
-          hasProof = true;
-          proofCreated = true;
-        }
-      }
-    }
-    let jsonLd = await activity.toJsonLd({
-      format: "compact",
-      contextLoader,
-    });
+    const signed = await signOutgoingActivity(
+      activity,
+      keys.map(({ keyId, privateKey }) => ({
+        verificationMethod: keyId,
+        privateKey,
+      })),
+      {
+        contextLoader,
+        tracerProvider: this.tracerProvider,
+        appendToExistingProofs: false,
+      },
+    );
+    activity = signed.activity;
+    const { hasProof, proofCreated } = signed;
+    let jsonLd = !proofCreated && options.activityJsonLd != null
+      ? options.activityJsonLd
+      : await activity.toJsonLd({
+        format: "compact",
+        contextLoader,
+      });
     // Existing proofs are preserved by default because they may have been
     // created over the compact JSON-LD bytes exactly as supplied.  Fedify can
     // safely normalize unsigned activities, proofs it just created, or
     // locally pre-signed activities when callers opt in.
     if (proofCreated || !hasProof || options.normalizeExistingProofs) {
-      jsonLd = await normalizeOutgoingActivityJsonLd(jsonLd, contextLoader);
+      jsonLd = await normalizeOutgoingActivityJsonLd(jsonLd, contextLoader, {
+        preserveNestedSecuredDocuments: true,
+      });
     }
-    if (rsaKey == null) {
+    assertSupportedCompoundProofShape(jsonLd, activityId);
+    if (rsaKey == null && !ldSignable) {
+      logger.debug(
+        "The activity {activityId} is performed by a portable actor, so it " +
+          "is sent without a Linked Data signature.",
+        { activityId },
+      );
+    } else if (rsaKey == null) {
       logger.warn(
         "No supported key found to create a Linked Data signature for " +
           "the activity {activityId}.  The activity will be sent without " +
@@ -2435,12 +3079,12 @@ export class FederationImpl<TContextData>
       const promises: Promise<void>[] = [];
       for (const inbox in inboxes) {
         promises.push(
-          sendActivity({
+          sendActivityToInbox(inbox, inboxes[inbox].gatewayInboxes, {
+            allowPrivateAddress: this.allowPrivateAddress,
             keys,
             activity: jsonLd,
             activityId: activity.id?.href,
             activityType: getTypeId(activity).href,
-            inbox: new URL(inbox),
             sharedInbox: inboxes[inbox].sharedInbox,
             headers: collectionSync == null ? undefined : new Headers({
               "Collection-Synchronization":
@@ -2477,10 +3121,10 @@ export class FederationImpl<TContextData>
     propagation.inject(context.active(), carrier);
     const messages: { message: OutboxMessage; orderingKey?: string }[] = [];
     for (const inbox in inboxes) {
-      const inboxOrigin = new URL(inbox).origin;
+      const { portableInbox, gatewayInboxes } = inboxes[inbox];
       const messageOrderingKey = orderingKey == null
         ? undefined
-        : `${orderingKey}\n${inboxOrigin}`;
+        : `${orderingKey}\n${getOrderingDestination(inbox, portableInbox)}`;
       const message: OutboxMessage = {
         type: "outbox",
         id: crypto.randomUUID(),
@@ -2502,6 +3146,7 @@ export class FederationImpl<TContextData>
             ),
         },
         orderingKey: messageOrderingKey,
+        ...getPortableMessageFields(portableInbox, gatewayInboxes),
         traceContext: carrier,
       };
       messages.push({ message, orderingKey: messageOrderingKey });
@@ -2571,82 +3216,97 @@ export class FederationImpl<TContextData>
           const spanCtx = span.spanContext();
           return await withContext(
             { traceId: spanCtx.traceId, spanId: spanCtx.spanId },
-            async () => {
-              const logger = getLogger(["fedify", "federation", "http"]);
-              if (span.isRecording()) {
-                for (const [k, v] of request.headers) {
-                  span.setAttribute(ATTR_HTTP_REQUEST_HEADER(k), [v]);
+            () =>
+              this.#observeInboxFetch(metricState, async () => {
+                const logger = getLogger(["fedify", "federation", "http"]);
+                if (span.isRecording()) {
+                  for (const [k, v] of request.headers) {
+                    span.setAttribute(ATTR_HTTP_REQUEST_HEADER(k), [v]);
+                  }
                 }
-              }
-              let response: Response;
-              try {
-                response = await this.#fetch(request, {
-                  ...options,
-                  span,
-                  tracer,
-                  metricState,
-                });
-                if (acceptsJsonLd(request)) {
-                  response.headers.set("Vary", "Accept");
-                }
-              } catch (error) {
-                this.metrics
-                  .recordHttpServerRequest(
-                    request.method,
-                    metricState.endpoint ?? "error",
-                    getDurationMs(metricStart),
-                    { routeTemplate: metricState.routeTemplate },
+                let response: Response;
+                try {
+                  response = await this.#fetch(request, {
+                    ...options,
+                    span,
+                    tracer,
+                    metricState,
+                  });
+                  if (metricState.inboxCompletion != null) {
+                    metricState.inboxCompletion.observation.stage = "respond";
+                  }
+                  // Hashlink media responses are not negotiated, and they are
+                  // sent as the application returns them, whose headers may
+                  // even be immutable:
+                  if (
+                    metricState.endpoint !== "hashlink_media" &&
+                    acceptsJsonLd(request)
+                  ) {
+                    response.headers.set("Vary", "Accept");
+                  }
+                } catch (error) {
+                  metricState.inboxCompletion?.observation.project(span, {
+                    type: "exception",
+                    stage: metricState.inboxCompletion.observation.stage,
+                    error,
+                  });
+                  this.metrics
+                    .recordHttpServerRequest(
+                      request.method,
+                      metricState.endpoint ?? "error",
+                      getDurationMs(metricStart),
+                      { routeTemplate: metricState.routeTemplate },
+                    );
+                  span.setStatus({
+                    code: SpanStatusCode.ERROR,
+                    message: `${error}`,
+                  });
+                  span.end();
+                  logger.error(
+                    "An error occurred while serving request " +
+                      "{method} {url}: {error}",
+                    { method: request.method, url: request.url, error },
                   );
-                span.setStatus({
-                  code: SpanStatusCode.ERROR,
-                  message: `${error}`,
-                });
-                span.end();
-                logger.error(
-                  "An error occurred while serving request " +
-                    "{method} {url}: {error}",
-                  { method: request.method, url: request.url, error },
-                );
-                throw error;
-              }
-              this.metrics.recordHttpServerRequest(
-                request.method,
-                metricState.endpoint ?? "error",
-                getDurationMs(metricStart),
-                {
-                  statusCode: response.status,
-                  routeTemplate: metricState.routeTemplate,
-                },
-              );
-              if (span.isRecording()) {
-                span.setAttribute(
-                  ATTR_HTTP_RESPONSE_STATUS_CODE,
-                  response.status,
-                );
-                for (const [k, v] of response.headers) {
-                  span.setAttribute(ATTR_HTTP_RESPONSE_HEADER(k), [v]);
+                  throw error;
                 }
-                span.setStatus({
-                  code: response.status >= 500
-                    ? SpanStatusCode.ERROR
-                    : SpanStatusCode.UNSET,
-                  message: response.statusText,
-                });
-              }
-              span.end();
-              const url = new URL(request.url);
-              const logTpl = "{method} {path}: {status}";
-              const values = {
-                method: request.method,
-                path: `${url.pathname}${url.search}`,
-                url: request.url,
-                status: response.status,
-              };
-              if (response.status >= 500) logger.error(logTpl, values);
-              else if (response.status >= 400) logger.warn(logTpl, values);
-              else logger.info(logTpl, values);
-              return response;
-            },
+                this.metrics.recordHttpServerRequest(
+                  request.method,
+                  metricState.endpoint ?? "error",
+                  getDurationMs(metricStart),
+                  {
+                    statusCode: response.status,
+                    routeTemplate: metricState.routeTemplate,
+                  },
+                );
+                if (span.isRecording()) {
+                  span.setAttribute(
+                    ATTR_HTTP_RESPONSE_STATUS_CODE,
+                    response.status,
+                  );
+                  for (const [k, v] of response.headers) {
+                    span.setAttribute(ATTR_HTTP_RESPONSE_HEADER(k), [v]);
+                  }
+                  span.setStatus({
+                    code: response.status >= 500
+                      ? SpanStatusCode.ERROR
+                      : SpanStatusCode.UNSET,
+                    message: response.statusText,
+                  });
+                }
+                span.end();
+                const url = new URL(request.url);
+                const logTpl = "{method} {path}: {status}";
+                const values = {
+                  method: request.method,
+                  path: `${url.pathname}${url.search}`,
+                  url: request.url,
+                  status: response.status,
+                };
+                if (response.status >= 500) logger.error(logTpl, values);
+                else if (response.status >= 400) logger.warn(logTpl, values);
+                else logger.info(logTpl, values);
+                return response;
+              }),
           );
         },
       );
@@ -2675,14 +3335,72 @@ export class FederationImpl<TContextData>
     const url = new URL(request.url);
     const route = this.router.route(url.pathname as Path);
     if (route == null) {
+      // Routes registered by the application take precedence over the FEP-ef61
+      // gateway endpoint, so that existing routes keep working unchanged:
+      const media = this.hashlinkMediaDispatcher == null
+        ? null
+        : parseHashlinkGatewayRequest(url);
+      if (media != null) {
+        return await this.#fetchHashlinkMedia(request, media, {
+          onNotFound,
+          contextData,
+          span,
+          metricState,
+        });
+      }
+      if (request.method === "POST") {
+        const portable = parsePortableGatewayRequest(url);
+        if (portable != null) {
+          return await this.#fetchPortableInbox(request, portable, {
+            onNotFound,
+            contextData,
+            span,
+            metricState,
+          });
+        }
+      }
+      const portable = request.method === "GET" || request.method === "HEAD"
+        ? parsePortableGatewayRequest(url)
+        : null;
+      if (portable != null) {
+        const response = await this.#fetchPortableObject(request, portable, {
+          onNotFound,
+          onNotAcceptable,
+          onUnauthorized,
+          contextData,
+          span,
+          metricState,
+        });
+        // Also covers the responses of the application's callbacks:
+        return await discardBodyForHead(request, response);
+      }
       metricState.endpoint = "not_found";
       return await onNotFound(request);
     }
     metricState.routeTemplate = route.template;
     metricState.endpoint = getEndpointCategory(route.name);
     span.updateName(`${request.method} ${route.template}`);
-    let context = this.#createContext(request, contextData);
     const routeName = route.name.replace(/:.*$/, "");
+    let context: RequestContextImpl<TContextData>;
+    try {
+      context = this.#createContext(request, contextData);
+    } catch (error) {
+      if (
+        request.method !== "POST" ||
+        routeName !== "inbox" && routeName !== "sharedInbox"
+      ) throw error;
+      return await this.#reportInboxPreparationError(
+        request,
+        contextData,
+        {
+          kind: routeName === "inbox" ? "personal" : "shared",
+          recipient: route.values.identifier ?? null,
+        },
+        error,
+        span,
+        metricState,
+      );
+    }
 
     // Routes that aren't JSON-LD based:
     switch (routeName) {
@@ -2775,6 +3493,46 @@ export class FederationImpl<TContextData>
       }
       return response;
     }
+    if (
+      request.method === "POST" &&
+      (routeName === "inbox" || routeName === "sharedInbox")
+    ) {
+      const recipient = route.values.identifier ?? null;
+      const observation = new InboxObservation({
+        kind: routeName === "inbox" ? "personal" : "shared",
+        recipient,
+      });
+      this.#setInboxCompletion(metricState, observation, () => context);
+      return await observation.run(
+        async () => {
+          if (routeName === "inbox") {
+            context = this.#createContext(request, contextData, {
+              documentLoader: await context.getDocumentLoader({
+                identifier: recipient!,
+              }),
+            });
+          } else if (this.sharedInboxKeyDispatcher != null) {
+            const identity = await this.sharedInboxKeyDispatcher(context);
+            if (identity != null) {
+              context = this.#createContext(request, contextData, {
+                documentLoader:
+                  "identifier" in identity || "username" in identity
+                    ? await context.getDocumentLoader(identity)
+                    : context.getDocumentLoader(identity),
+              });
+            }
+          }
+          return await this.#handleInbox(request, {
+            recipient,
+            context,
+            contextData,
+            onNotFound,
+            observation,
+          });
+        },
+        span,
+      );
+    }
     switch (routeName) {
       case "actor":
       case "actorAlias": {
@@ -2858,14 +3616,11 @@ export class FederationImpl<TContextData>
             onNotFound,
           });
         }
-        context = this.#createContext(request, contextData, {
-          documentLoader: await context.getDocumentLoader({
-            identifier: route.values.identifier,
-          }),
-        });
-        // falls through
+        // POST deliveries are handled by the observed ingress above.
+        throw new Error("Unreachable inbox delivery.");
       case "sharedInbox": {
-        if (routeName !== "inbox" && this.sharedInboxKeyDispatcher != null) {
+        // Preserve the existing non-POST handling without reporting a delivery.
+        if (this.sharedInboxKeyDispatcher != null) {
           const identity = await this.sharedInboxKeyDispatcher(context);
           if (identity != null) {
             context = this.#createContext(request, contextData, {
@@ -2875,33 +3630,11 @@ export class FederationImpl<TContextData>
             });
           }
         }
-        if (!this.manuallyStartQueue) this._startQueueInternal(contextData);
-        const inboxContextFactory = context.toInboxContext.bind(context) as
-          & typeof context.toInboxContext
-          & {
-            [rawInboxContextFactorySymbol]?: typeof context.toInboxContext;
-          };
-        inboxContextFactory[rawInboxContextFactorySymbol] = context
-          .toInboxContext.bind(context);
-        return await handleInbox(request, {
+        return await this.#handleInbox(request, {
           recipient: route.values.identifier ?? null,
           context,
-          inboxContextFactory,
-          kv: this.kv,
-          kvPrefixes: this.kvPrefixes,
-          publicKeyTtl: this.publicKeyTtl,
-          queue: this.inboxQueue,
-          actorDispatcher: this.actorCallbacks?.dispatcher,
-          inboxListeners: this.inboxListeners,
-          inboxErrorHandler: this.inboxErrorHandler,
-          unverifiedActivityHandler: this.unverifiedActivityHandler,
+          contextData,
           onNotFound,
-          signatureTimeWindow: this.signatureTimeWindow,
-          skipSignatureVerification: this.skipSignatureVerification,
-          inboxChallengePolicy: this.inboxChallengePolicy,
-          meterProvider: this.meterProvider,
-          tracerProvider: this.tracerProvider,
-          idempotencyStrategy: this.idempotencyStrategy,
         });
       }
       case "following":
@@ -2917,15 +3650,7 @@ export class FederationImpl<TContextData>
           onNotFound,
         });
       case "followers": {
-        let baseUrl = url.searchParams.get("base-url");
-        if (baseUrl != null) {
-          try {
-            baseUrl = `${new URL(baseUrl).origin}/`;
-          } catch {
-            // If base-url is invalid, set to null to behave as if it wasn't provided
-            baseUrl = null;
-          }
-        }
+        const baseUrl = getFollowersBaseUrl(url);
         return await handleCollection(request, {
           name: "followers",
           identifier: route.values.identifier,
@@ -2939,10 +3664,7 @@ export class FederationImpl<TContextData>
           context,
           filter: baseUrl != null ? new URL(baseUrl) : undefined,
           filterPredicate: baseUrl != null
-            ? ((i) =>
-              (i instanceof URL ? i.href : i.id?.href ?? "").startsWith(
-                baseUrl!,
-              ))
+            ? getFollowersFilterPredicate(baseUrl)
             : undefined,
           collectionCallbacks: this.followersCallbacks,
           tracerProvider: this.tracerProvider,
@@ -2988,7 +3710,7 @@ export class FederationImpl<TContextData>
           onNotFound,
         });
       case "collection": {
-        const name = route.name.replace(/^collection:/, "");
+        const name = this.getCollectionName(route.name);
         const callbacks = this.collectionCallbacks[name];
         return await handleCustomCollection<
           URL | Object | Link | Recipient,
@@ -2996,7 +3718,7 @@ export class FederationImpl<TContextData>
           RequestContext<TContextData>,
           TContextData
         >(request, {
-          name,
+          name: String(name),
           context,
           values: route.values,
           collectionCallbacks: callbacks,
@@ -3007,7 +3729,7 @@ export class FederationImpl<TContextData>
         });
       }
       case "orderedCollection": {
-        const name = route.name.replace(/^orderedCollection:/, "");
+        const name = this.getCollectionName(route.name);
         const callbacks = this.collectionCallbacks[name];
         return await handleOrderedCollection<
           URL | Object | Link | Recipient,
@@ -3015,7 +3737,7 @@ export class FederationImpl<TContextData>
           RequestContext<TContextData>,
           TContextData
         >(request, {
-          name,
+          name: String(name),
           context,
           values: route.values,
           collectionCallbacks: callbacks,
@@ -3032,6 +3754,767 @@ export class FederationImpl<TContextData>
       }
     }
   }
+
+  async #fetchPortableObject(
+    request: Request,
+    portable: PortableGatewayRequest,
+    {
+      onNotFound,
+      onNotAcceptable,
+      onUnauthorized,
+      contextData,
+      span,
+      metricState,
+    }:
+      & Required<
+        Pick<
+          FederationFetchOptions<TContextData>,
+          "onNotFound" | "onNotAcceptable" | "onUnauthorized"
+        >
+      >
+      & {
+        contextData: TContextData;
+        span: Span;
+        metricState: HttpMetricState;
+      },
+  ): Promise<Response> {
+    if (portable.type === "malformed") {
+      metricState.endpoint = "not_found";
+      getLogger(["fedify", "federation", "object"]).debug(
+        "Malformed FEP-ef61 gateway request {url}: {error}",
+        { url: request.url, error: portable.error },
+      );
+      return new Response(
+        request.method === "HEAD" ? null : "Malformed portable object ID.",
+        {
+          status: 400,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        },
+      );
+    }
+    const route = this.router.route(portable.path);
+    const isActor = route != null &&
+      (route.name === "actor" || route.name.startsWith(ACTOR_ALIAS_PREFIX));
+    const collectionRoute = route == null
+      ? undefined
+      : getCollectionMetricRoute(route.name.replace(/:.*$/, ""));
+    if (
+      route == null ||
+      (!isActor && !route.name.startsWith("object:") &&
+        collectionRoute == null)
+    ) {
+      metricState.endpoint = "not_found";
+      return await onNotFound(request);
+    }
+    metricState.routeTemplate = PORTABLE_GATEWAY_ROUTE_PREFIX + route.template;
+    metricState.endpoint = getEndpointCategory(route.name);
+    span.updateName(`${request.method} ${metricState.routeTemplate}`);
+    if (!acceptsJsonLd(request)) {
+      metricState.endpoint = "not_acceptable";
+      const response = await onNotAcceptable(request);
+      if (collectionRoute != null) {
+        recordCollectionRequest(this._meterProvider, {
+          ...collectionRoute,
+          page: new URL(request.url).searchParams.get("cursor") != null,
+          result: "not_acceptable",
+          statusCode: response.status,
+        });
+      }
+      return response;
+    }
+    if (collectionRoute != null) {
+      return await this.#fetchPortableCollection(request, portable, route, {
+        onNotFound,
+        onUnauthorized,
+        contextData,
+      });
+    }
+    if (isActor) {
+      const identifier = route.name.startsWith(ACTOR_ALIAS_PREFIX)
+        ? route.name.substring(ACTOR_ALIAS_PREFIX.length)
+        : route.values.identifier;
+      const context = this.#createContext(request, contextData, {
+        invokedFromActorDispatcher: { identifier },
+        portableRequest: portable.portableRequest,
+      });
+      const actorDispatcher = this.actorCallbacks?.dispatcher;
+      const authorizePredicate = this.actorCallbacks?.authorizePredicate;
+      return await handlePortableObject(request, {
+        values: { identifier },
+        context,
+        objectDispatcher: actorDispatcher == null
+          ? undefined
+          : (ctx) => actorDispatcher(ctx, identifier),
+        authorizePredicate: authorizePredicate == null
+          ? undefined
+          : (ctx) => authorizePredicate(ctx, identifier),
+        canonicalId: portable.canonicalId,
+        kind: "actor",
+        onUnauthorized,
+        onNotFound,
+      });
+    }
+    const typeId = route.name.replace(/^object:/, "");
+    const callbacks = this.objectCallbacks[typeId];
+    const cls = this.objectTypeIds[typeId];
+    const context = this.#createContext(request, contextData, {
+      invokedFromObjectDispatcher: { cls, values: route.values },
+      portableRequest: portable.portableRequest,
+    });
+    return await handlePortableObject(request, {
+      values: route.values,
+      context,
+      objectDispatcher: callbacks?.dispatcher,
+      authorizePredicate: callbacks?.authorizePredicate,
+      canonicalId: portable.canonicalId,
+      kind: "object",
+      onUnauthorized,
+      onNotFound,
+    });
+  }
+
+  async #fetchPortableCollection(
+    request: Request,
+    portable: Extract<PortableGatewayRequest, { type: "object" }>,
+    route: { name: string; values: Record<string, string> },
+    {
+      onNotFound,
+      onUnauthorized,
+      contextData,
+    }:
+      & Required<
+        Pick<
+          FederationFetchOptions<TContextData>,
+          "onNotFound" | "onUnauthorized"
+        >
+      >
+      & { contextData: TContextData },
+  ): Promise<Response> {
+    const logger = getLogger(["fedify", "federation", "collection"]);
+    const url = new URL(request.url);
+    const { authority } = portable.portableRequest;
+    // The owner is looked up with a context without the portable request, so
+    // that its ID comes from the application's data rather than from
+    // the authority of the request, which the portable ID helpers would
+    // otherwise default to:
+    const ownerContext = this.#createContext(request, contextData);
+    const context = this.#createContext(request, contextData, {
+      portableRequest: portable.portableRequest,
+    });
+    const reject = async (reason: string, identifier?: string) => {
+      logger.debug(
+        "Not serving the portable collection {collection} of the actor " +
+          "{identifier}: {reason}.",
+        { collection: portable.canonicalId, identifier, reason },
+      );
+      return await onNotFound(request);
+    };
+    const routeName = route.name.replace(/:.*$/, "");
+    if (routeName === "collection" || routeName === "orderedCollection") {
+      const name = route.name.replace(/^(?:ordered)?[cC]ollection:/, "");
+      const callbacks = this.collectionCallbacks[name];
+      if (callbacks == null) return await onNotFound(request);
+      const mapper = callbacks.portableOwnerMapper;
+      if (mapper == null) return await reject("noPortableOwnerMapper");
+      const identifier = await mapper(ownerContext, route.values);
+      if (identifier == null) return await reject("notPortable");
+      const resolution = resolvePortableCollectionOwner(
+        await this.actorCallbacks?.dispatcher?.(ownerContext, identifier),
+        { authority, portableId: portable.portableRequest.id },
+      );
+      if (resolution.status === "rejected") {
+        return await reject(resolution.reason, identifier);
+      }
+      const view = buildPortableCollectionView(resolution.collectionId, url);
+      const handle = routeName === "collection"
+        ? handleCustomCollection
+        : handleOrderedCollection;
+      return await handle<
+        URL | Object | Link | Recipient,
+        string,
+        RequestContext<TContextData>,
+        TContextData
+      >(request, {
+        name,
+        context,
+        values: route.values,
+        collectionCallbacks: callbacks,
+        portable: { id: view, view, attribution: resolution.ownerId },
+        tracerProvider: this.tracerProvider,
+        meterProvider: this._meterProvider,
+        onUnauthorized,
+        onNotFound,
+      });
+    }
+    const identifier = route.values.identifier;
+    const serve = async <
+      TItem extends URL | Object | Link | Recipient,
+      TFilter,
+    >(
+      name: string,
+      callbacks:
+        | CollectionCallbacks<
+          TItem,
+          RequestContext<TContextData>,
+          TContextData,
+          TFilter
+        >
+        | undefined,
+      property: (actor: Actor) => URL | null,
+      filter?: {
+        value: TFilter;
+        predicate: (item: TItem) => boolean;
+        /** The query parameter that the collection's ID gets. */
+        parameter: readonly [string, string];
+      },
+    ): Promise<Response> => {
+      if (callbacks == null) return await onNotFound(request);
+      const resolution = resolvePortableCollectionOwner(
+        await this.actorCallbacks?.dispatcher?.(ownerContext, identifier),
+        { authority, canonicalId: portable.canonicalId, property },
+      );
+      if (resolution.status === "rejected") {
+        return await reject(resolution.reason, identifier);
+      }
+      const id = new URL(resolution.collectionId);
+      if (filter != null) id.searchParams.set(...filter.parameter);
+      const view = buildPortableCollectionView(resolution.collectionId, url);
+      if (routeName === "followers") {
+        // The pages have the same filter as the collection's ID, i.e.,
+        // the normalized base-url, or none if it is invalid:
+        view.searchParams.delete("base-url");
+        if (filter != null) view.searchParams.set(...filter.parameter);
+      }
+      return await handleCollection(request, {
+        name,
+        identifier,
+        uriGetter: () => id,
+        context,
+        filter: filter?.value,
+        filterPredicate: filter?.predicate,
+        collectionCallbacks: callbacks,
+        portable: {
+          id,
+          view,
+          attribution: resolution.ownerId,
+        },
+        tracerProvider: this.tracerProvider,
+        meterProvider: this._meterProvider,
+        onUnauthorized,
+        onNotFound,
+      });
+    };
+    switch (routeName) {
+      case "outbox":
+        return await serve("outbox", this.outboxCallbacks, (a) => a.outboxId);
+      case "inbox":
+        return await serve("inbox", this.inboxCallbacks, (a) => a.inboxId);
+      case "following":
+        return await serve(
+          "following",
+          this.followingCallbacks,
+          (a) => a.followingId,
+        );
+      case "followers": {
+        const baseUrl = getFollowersBaseUrl(url);
+        return await serve(
+          "followers",
+          this.followersCallbacks,
+          (a) => a.followersId,
+          baseUrl == null ? undefined : {
+            value: new URL(baseUrl),
+            predicate: getFollowersFilterPredicate(baseUrl),
+            parameter: ["base-url", baseUrl],
+          },
+        );
+      }
+      case "liked":
+        return await serve("liked", this.likedCallbacks, (a) => a.likedId);
+      case "featured":
+        return await serve(
+          "featured",
+          this.featuredCallbacks,
+          (a) => a.featuredId,
+        );
+      case "featuredTags":
+        return await serve(
+          "featured tags",
+          this.featuredTagsCallbacks,
+          (a) => a.featuredTagsId,
+        );
+    }
+    return await onNotFound(request);
+  }
+
+  #setInboxCompletion(
+    metricState: HttpMetricState,
+    observation: InboxObservation,
+    getContext: () => RequestContext<TContextData>,
+  ): void {
+    const handler = this.inboxRequestFinishedHandler;
+    metricState.inboxCompletion = {
+      observation,
+      finish: (outcome) => observation.finish(getContext(), handler, outcome),
+    };
+  }
+
+  async #observeInboxFetch(
+    metricState: HttpMetricState,
+    operation: () => Promise<Response>,
+  ): Promise<Response> {
+    let response: Response;
+    try {
+      response = await operation();
+    } catch (error) {
+      const completion = metricState.inboxCompletion;
+      if (completion != null) {
+        await completion.finish({
+          type: "exception",
+          stage: completion.observation.stage,
+          error,
+        });
+      }
+      throw error;
+    }
+    const completion = metricState.inboxCompletion;
+    if (completion != null) {
+      await completion.finish({
+        type: "response",
+        status: response.status,
+        ...completion.observation.result,
+      });
+    }
+    return response;
+  }
+
+  async #reportInboxPreparationError(
+    request: Request,
+    contextData: TContextData,
+    inbox: import("./inbox-report.ts").InboxRequestReport["inbox"],
+    error: unknown,
+    span: Span,
+    metricState: HttpMetricState,
+  ): Promise<Response> {
+    const unavailableLoader: DocumentLoader = () => Promise.reject(error);
+    const context = new RequestContextImpl({
+      url: new URL(request.url),
+      request,
+      federation: this,
+      data: contextData,
+      documentLoader: unavailableLoader,
+      contextLoader: unavailableLoader,
+    });
+    const observation = new InboxObservation(inbox);
+    this.#setInboxCompletion(metricState, observation, () => context);
+    return await observation.run(
+      () => Promise.reject(error),
+      span,
+    );
+  }
+
+  async #handleInbox(
+    request: Request,
+    {
+      recipient,
+      context,
+      contextData,
+      onNotFound,
+      portableInbox,
+      observation,
+    }: {
+      recipient: string | null;
+      context: RequestContextImpl<TContextData>;
+      contextData: TContextData;
+      onNotFound: (request: Request) => Response | Promise<Response>;
+      portableInbox?: PortableInboxDelivery;
+      observation?: InboxObservation;
+    },
+  ): Promise<Response> {
+    if (!this.manuallyStartQueue) this._startQueueInternal(contextData);
+    const inboxContextFactory = context.toInboxContext.bind(context) as
+      & typeof context.toInboxContext
+      & {
+        [rawInboxContextFactorySymbol]?: typeof context.toInboxContext;
+      };
+    inboxContextFactory[rawInboxContextFactorySymbol] = context
+      .toInboxContext.bind(context);
+    return await handleInbox(request, {
+      recipient,
+      context,
+      inboxContextFactory,
+      kv: this.kv,
+      kvPrefixes: this.kvPrefixes,
+      publicKeyTtl: this.publicKeyTtl,
+      queue: this.inboxQueue,
+      actorDispatcher: this.actorCallbacks?.dispatcher,
+      inboxListeners: this.inboxListeners,
+      inboxErrorHandler: this.inboxErrorHandler,
+      unverifiedActivityHandler: this.unverifiedActivityHandler,
+      onNotFound,
+      signatureTimeWindow: this.signatureTimeWindow,
+      maxHttpSignatures: this.maxHttpSignatures,
+      skipSignatureVerification: this.skipSignatureVerification,
+      inboxChallengePolicy: this.inboxChallengePolicy,
+      meterProvider: this.meterProvider,
+      tracerProvider: this.tracerProvider,
+      idempotencyStrategy: this.idempotencyStrategy,
+      portableInbox,
+      observation,
+    });
+  }
+
+  async #fetchPortableInbox(
+    request: Request,
+    portable: PortableGatewayRequest,
+    {
+      onNotFound,
+      contextData,
+      span,
+      metricState,
+    }:
+      & Required<Pick<FederationFetchOptions<TContextData>, "onNotFound">>
+      & {
+        contextData: TContextData;
+        span: Span;
+        metricState: HttpMetricState;
+      },
+  ): Promise<Response> {
+    const logger = getLogger(["fedify", "federation", "inbox"]);
+    if (portable.type === "malformed") {
+      metricState.endpoint = "not_found";
+      logger.debug(
+        "Malformed FEP-ef61 gateway inbox request {url}: {error}",
+        { url: request.url, error: portable.error },
+      );
+      return new Response("Malformed portable inbox ID.", {
+        status: 400,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+    // Only personal inboxes are reachable through the gateway endpoint:
+    const route = this.router.route(portable.path);
+    if (route == null || route.name !== "inbox") {
+      metricState.endpoint = "not_found";
+      return await onNotFound(request);
+    }
+    metricState.routeTemplate = PORTABLE_GATEWAY_ROUTE_PREFIX + route.template;
+    metricState.endpoint = "inbox";
+    span.updateName(`${request.method} ${metricState.routeTemplate}`);
+    const identifier = route.values.identifier;
+    let context: RequestContextImpl<TContextData>;
+    try {
+      context = this.#createContext(request, contextData);
+    } catch (error) {
+      return await this.#reportInboxPreparationError(
+        request,
+        contextData,
+        { kind: "portable", recipient: identifier },
+        error,
+        span,
+        metricState,
+      );
+    }
+    const observation = new InboxObservation({
+      kind: "portable",
+      recipient: identifier,
+    });
+    this.#setInboxCompletion(metricState, observation, () => context);
+    return await observation.run(
+      async () => {
+        // The actor is looked up only by its identifier, as for ordinary inbox
+        // deliveries, so that the identifier alone determines the recipient,
+        // also for inbox listeners and queued deliveries:
+        const actor = this.actorCallbacks?.dispatcher == null
+          ? null
+          : await this.actorCallbacks.dispatcher(context, identifier);
+        const localOrigin = context.canonicalOrigin;
+        const resolution = resolvePortableInboxRecipient(
+          actor == null || actor instanceof Tombstone ? null : actor,
+          {
+            authority: portable.portableRequest.authority,
+            canonicalInboxId: portable.canonicalId,
+            localOrigin,
+          },
+        );
+        if (resolution.status === "rejected") {
+          logger.debug(
+            "Not accepting a delivery to the portable inbox {inbox} on behalf " +
+              "of the actor {identifier}: {reason}.",
+            {
+              inbox: portable.canonicalId,
+              identifier,
+              reason: resolution.reason,
+            },
+          );
+          return await onNotFound(request);
+        }
+        const { recipient } = resolution;
+        // A portable actor does not necessarily have key pairs for authorized
+        // fetch, so fall back to the default document loader without them:
+        if (this.actorCallbacks?.keyPairsDispatcher != null) {
+          context = this.#createContext(request, contextData, {
+            documentLoader: await context.getDocumentLoader({ identifier }),
+          });
+        }
+        const excludedOrigins = [localOrigin, new URL(request.url).origin];
+        return await this.#handleInbox(request, {
+          recipient: identifier,
+          observation,
+          context,
+          contextData,
+          onNotFound,
+          portableInbox: {
+            recipient,
+            forward: async (activity, activityId, activityType, signatures) => {
+              if (this.portableInboxForwarding.maxTargets < 1) return;
+              if (this.kv.cas == null) {
+                if (!this.#portableInboxForwardingWarned) {
+                  this.#portableInboxForwardingWarned = true;
+                  logger.warn(
+                    "Activities delivered to FEP-ef61 portable inboxes are not " +
+                      "forwarded to the other gateways, as the key–value store " +
+                      "does not support compare-and-swap (KvStore.cas()), which " +
+                      "is needed to forward each activity at most once.",
+                  );
+                }
+                return;
+              }
+              await forwardPortableInboxActivity({
+                recipient,
+                activity,
+                activityId,
+                activityType,
+                excludedOrigins,
+                baseUrl: context.origin,
+                kv: this.kv,
+                kvPrefix: this.kvPrefixes.portableInboxForwarding,
+                outboxQueue: this.outboxQueue,
+                startQueue: this.manuallyStartQueue
+                  ? undefined
+                  : () => this._startQueueInternal(contextData),
+                allowPrivateAddress: this.allowPrivateAddress,
+                getKeys: () =>
+                  this.#getPortableGatewayKeyPairs(
+                    context,
+                    identifier,
+                    recipient,
+                  ),
+                specDeterminer: new KvSpecDeterminer(
+                  this.kv,
+                  this.kvPrefixes.httpMessageSignaturesSpec,
+                  this.firstKnock,
+                  { specTtl: this.httpMessageSignaturesSpecTtl },
+                ),
+                signatures,
+                options: this.portableInboxForwarding,
+                meterProvider: this.meterProvider,
+                tracerProvider: this.tracerProvider,
+              });
+            },
+          },
+        });
+      },
+      span,
+    );
+  }
+
+  /**
+   * Gets this server's gateway key pairs for the portable actor that owns
+   * a portable inbox, which sign the activities forwarded from the inbox.
+   * @param context The context.
+   * @param identifier The identifier of the portable actor.
+   * @param recipient The portable inbox.
+   * @returns The key pairs, or an empty array if the actor has no gateway
+   *          keys on this server.
+   */
+  async #getPortableGatewayKeyPairs(
+    context: Context<TContextData>,
+    identifier: string,
+    recipient: PortableInboxRecipient,
+  ): Promise<SenderKeyPair[]> {
+    const logger = getLogger(["fedify", "federation", "inbox"]);
+    if (
+      this.actorCallbacks?.keyPairsDispatcher == null ||
+      this.actorCallbacks.portableActorIdMapper == null
+    ) {
+      logger.debug(
+        "Forwarding activities from the portable inbox {inbox} without HTTP " +
+          "Signatures, as gateway keys need both a key pairs dispatcher " +
+          "and a portable actor ID mapper.",
+        { inbox: recipient.canonicalInboxId },
+      );
+      return [];
+    }
+    const actorId = getCanonicalPortableId(recipient.actorId);
+    if (actorId == null) return [];
+    const keyPairs = await context.getActorKeyPairs(identifier);
+    // Context.getActorKeyPairs() makes the portable actor that the mapper
+    // returns the owner of the key pairs; they are this server's gateway keys
+    // for the recipient only if the mapper returns the recipient:
+    for (const { cryptographicKey } of keyPairs) {
+      const owner = cryptographicKey.ownerId;
+      const canonicalOwner = owner == null
+        ? null
+        : getCanonicalPortableId(owner);
+      if (canonicalOwner === actorId) continue;
+      if (canonicalOwner == null) {
+        logger.debug(
+          "Forwarding activities from the portable inbox {inbox} without " +
+            "HTTP Signatures, as the key pairs of the actor {identifier} are " +
+            "not the gateway keys of a portable actor.",
+          { inbox: recipient.canonicalInboxId, identifier },
+        );
+      } else {
+        logger.warn(
+          "Forwarding activities from the portable inbox {inbox} without " +
+            "HTTP Signatures, as the key pairs of the actor {identifier} are " +
+            "the gateway keys of {owner}, not of the recipient {actorId}.",
+          {
+            inbox: recipient.canonicalInboxId,
+            identifier,
+            owner: canonicalOwner,
+            actorId,
+          },
+        );
+      }
+      return [];
+    }
+    return keyPairs.map(({ keyId, privateKey }) => ({ keyId, privateKey }));
+  }
+
+  async #fetchHashlinkMedia(
+    request: Request,
+    media: HashlinkGatewayRequest,
+    {
+      onNotFound,
+      contextData,
+      span,
+      metricState,
+    }:
+      & Required<Pick<FederationFetchOptions<TContextData>, "onNotFound">>
+      & {
+        contextData: TContextData;
+        span: Span;
+        metricState: HttpMetricState;
+      },
+  ): Promise<Response> {
+    metricState.endpoint = "hashlink_media";
+    metricState.routeTemplate = HASHLINK_MEDIA_ROUTE_TEMPLATE;
+    span.updateName(`${request.method} ${HASHLINK_MEDIA_ROUTE_TEMPLATE}`);
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return new Response("Method not allowed.", {
+        status: 405,
+        headers: {
+          Allow: "GET, HEAD",
+          "Content-Type": "text/plain; charset=utf-8",
+        },
+      });
+    }
+    if (media.type === "malformed") {
+      getLogger(["fedify", "federation", "hashlinkMedia"]).debug(
+        "Malformed FEP-ef61 hashlink media request {url}: {error}",
+        { url: request.url, error: media.error },
+      );
+      return new Response(
+        request.method === "HEAD" ? null : "Malformed hashlink.",
+        {
+          status: 400,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        },
+      );
+    }
+    const context = this.#createContext(request, contextData);
+    const response = await this.hashlinkMediaDispatcher!(context, media.media);
+    // The onNotFound response is returned as is, since integrations may
+    // recognize it by its identity:
+    if (response == null) return await onNotFound(request);
+    // The body may be, e.g., a clone of a cached response, whose cancellation
+    // does not settle until the other branch is consumed on Node.js, so this
+    // does not wait for it:
+    return await discardBodyForHead(request, response, false);
+  }
+}
+
+const PORTABLE_GATEWAY_ROUTE_PREFIX = "/.well-known/apgateway/{did}";
+
+/**
+ * Gets the origin that a followers collection request filters followers by,
+ * i.e., its normalized `base-url` query parameter (FEP-8fcf).
+ * @returns The origin with a trailing slash, or `null` if the parameter is
+ *          missing or invalid.
+ */
+function getFollowersBaseUrl(url: URL): string | null {
+  const baseUrl = url.searchParams.get("base-url");
+  if (baseUrl == null) return null;
+  try {
+    return `${new URL(baseUrl).origin}/`;
+  } catch {
+    // If base-url is invalid, behave as if it wasn't provided:
+    return null;
+  }
+}
+
+function getFollowersFilterPredicate(
+  baseUrl: string,
+): (item: Recipient) => boolean {
+  return (i) =>
+    (i instanceof URL ? i.href : i.id?.href ?? "").startsWith(baseUrl);
+}
+
+const ACTOR_COLLECTION_ROUTE_ERRORS = {
+  outbox: "No outbox dispatcher registered.",
+  following: "No following collection path registered.",
+  followers: "No followers collection path registered.",
+  liked: "No liked collection path registered.",
+  featured: "No featured collection path registered.",
+  featuredTags: "No featured tags collection path registered.",
+} as const;
+
+/**
+ * Checks that the authority of a portable ID to build is given, either
+ * explicitly or by the FEP-ef61 gateway request being handled.
+ * @throws {TypeError} If the authority is missing.
+ */
+function requirePortableAuthority(authority: string | undefined): string {
+  if (authority == null) {
+    throw new TypeError(
+      "The authority of a portable ID is required outside an FEP-ef61 " +
+        "gateway request.",
+    );
+  }
+  return authority;
+}
+
+/**
+ * Removes the body of a response to a `HEAD` request.
+ * @param request The request.
+ * @param response The response to the request.
+ * @param waitForCancel Whether to wait until the discarded body is cancelled.
+ * @returns The response without a body if the request is a `HEAD` request,
+ *          or the response itself otherwise.
+ */
+async function discardBodyForHead(
+  request: Request,
+  response: Response,
+  waitForCancel: boolean = true,
+): Promise<Response> {
+  if (request.method !== "HEAD" || response.body == null) return response;
+  // Release the discarded body, which may be a stream of, e.g., a file:
+  const cancelled = response.body.cancel();
+  if (waitForCancel) await cancelled;
+  else {
+    cancelled.catch((error) => {
+      getLogger(["fedify", "federation", "http"]).debug(
+        "Failed to cancel the body of a response to {method} {url}: {error}",
+        { method: request.method, url: request.url, error },
+      );
+    });
+  }
+  return new Response(null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 type FedifyEndpoint =
@@ -3042,6 +4525,7 @@ type FedifyEndpoint =
   | "shared_inbox"
   | "outbox"
   | "media_upload"
+  | "hashlink_media"
   | "object"
   | "following"
   | "followers"
@@ -3055,6 +4539,12 @@ type FedifyEndpoint =
   | "error";
 
 interface HttpMetricState {
+  inboxCompletion?: {
+    observation: InboxObservation;
+    finish(
+      outcome: import("./inbox-report.ts").InboxRequestOutcome,
+    ): Promise<void>;
+  };
   endpoint?: FedifyEndpoint;
   routeTemplate?: string;
 }
@@ -3137,12 +4627,47 @@ interface ContextOptions<TContextData> {
 
 const FANOUT_THRESHOLD = 5;
 
+/**
+ * A portable actor whose gateway keys this server holds, as resolved through
+ * the portable actor ID mapper.
+ */
+interface PortableActorKeyOwner {
+  /** The portable actor's ID, as the application publishes it. */
+  readonly id: URL;
+  /** The actor's compatible identifier on this server, the key ID base. */
+  readonly keyBase: URL;
+}
+
+/**
+ * Creates the FEP-ef61 portable object verifier that a context applies to
+ * portable objects it dereferences: `verifyPortableObject()` with the given
+ * loaders and the federation's tracer provider as defaults.  Other options,
+ * such as the document URL, gateways, and referrer, are passed through as
+ * they are.
+ */
+function createPortableObjectVerifier(
+  documentLoader: DocumentLoader,
+  contextLoader: DocumentLoader,
+  federation: { readonly tracerProvider: TracerProvider },
+): PortableObjectVerifier {
+  return (document, options = {}) =>
+    verifyPortableObject(document, {
+      ...options,
+      documentLoader: options.documentLoader ?? documentLoader,
+      contextLoader: options.contextLoader ?? contextLoader,
+      tracerProvider: options.tracerProvider ?? federation.tracerProvider,
+    });
+}
+
 export class ContextImpl<TContextData> implements Context<TContextData> {
   readonly url: URL;
   readonly federation: FederationImpl<TContextData>;
   readonly data: TContextData;
   readonly documentLoader: DocumentLoader;
   readonly contextLoader: DocumentLoader;
+  // An own property rather than a method, so that it survives spreading the
+  // context into options, e.g., { ...ctx, contextLoader }:
+  readonly verifyPortableObject: PortableObjectVerifier;
   readonly invokedFromActorKeyPairsDispatcher?: { identifier: string };
   #codec?: TaskCodec;
 
@@ -3161,6 +4686,11 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     this.data = data;
     this.documentLoader = documentLoader;
     this.contextLoader = contextLoader;
+    this.verifyPortableObject = createPortableObjectVerifier(
+      documentLoader,
+      contextLoader,
+      federation,
+    );
     this.invokedFromActorKeyPairsDispatcher =
       invokedFromActorKeyPairsDispatcher;
   }
@@ -3264,6 +4794,15 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
   }
 
   getActorUri(identifier: string): URL {
+    return new URL(this.#getActorPath(identifier), this.canonicalOrigin);
+  }
+
+  getPortableActorUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorPath(identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
+  }
+
+  #getActorPath(identifier: string): string {
     const path = this.federation.router.build(
       `${ACTOR_ALIAS_PREFIX}${identifier}`,
       {},
@@ -3274,13 +4813,29 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     if (path == null) {
       throw new RouterError("No actor dispatcher registered.");
     }
-    return new URL(path, this.canonicalOrigin);
+    return path;
   }
 
   getObjectUri<TObject extends Object>(
     cls: ConstructorWithTypeId<TObject>,
     values: Record<string, string>,
   ): URL {
+    return new URL(this.#getObjectPath(cls, values), this.canonicalOrigin);
+  }
+
+  getPortableObjectUri<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    authority?: string,
+  ): URL {
+    const path = this.#getObjectPath(cls, values);
+    return buildPortableUri(requirePortableAuthority(authority), path);
+  }
+
+  #getObjectPath<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+  ): string {
     const callbacks = this.federation.objectCallbacks[cls.typeId.href];
     if (callbacks == null) {
       throw new RouterError("No object dispatcher registered.");
@@ -3297,18 +4852,30 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     if (path == null) {
       throw new RouterError("No object dispatcher registered.");
     }
-    return new URL(path, this.canonicalOrigin);
+    return path;
+  }
+
+  #getActorCollectionPath(
+    route: keyof typeof ACTOR_COLLECTION_ROUTE_ERRORS,
+    identifier: string,
+  ): string {
+    const path = this.federation.router.build(route, { identifier });
+    if (path == null) {
+      throw new RouterError(ACTOR_COLLECTION_ROUTE_ERRORS[route]);
+    }
+    return path;
   }
 
   getOutboxUri(identifier: string): URL {
-    const path = this.federation.router.build(
-      "outbox",
-      { identifier },
+    return new URL(
+      this.#getActorCollectionPath("outbox", identifier),
+      this.canonicalOrigin,
     );
-    if (path == null) {
-      throw new RouterError("No outbox dispatcher registered.");
-    }
-    return new URL(path, this.canonicalOrigin);
+  }
+
+  getPortableOutboxUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorCollectionPath("outbox", identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
   }
 
   getMediaUploaderUri(identifier: string): URL {
@@ -3342,59 +4909,72 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     return new URL(path, this.canonicalOrigin);
   }
 
-  getFollowingUri(identifier: string): URL {
-    const path = this.federation.router.build(
-      "following",
-      { identifier },
-    );
+  getPortableInboxUri(identifier: string, authority?: string): URL {
+    const path = this.federation.router.build("inbox", { identifier });
     if (path == null) {
-      throw new RouterError("No following collection path registered.");
+      throw new RouterError("No inbox path registered.");
     }
-    return new URL(path, this.canonicalOrigin);
+    return buildPortableUri(requirePortableAuthority(authority), path);
+  }
+
+  getFollowingUri(identifier: string): URL {
+    return new URL(
+      this.#getActorCollectionPath("following", identifier),
+      this.canonicalOrigin,
+    );
+  }
+
+  getPortableFollowingUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorCollectionPath("following", identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
   }
 
   getFollowersUri(identifier: string): URL {
-    const path = this.federation.router.build(
-      "followers",
-      { identifier },
+    return new URL(
+      this.#getActorCollectionPath("followers", identifier),
+      this.canonicalOrigin,
     );
-    if (path == null) {
-      throw new RouterError("No followers collection path registered.");
-    }
-    return new URL(path, this.canonicalOrigin);
+  }
+
+  getPortableFollowersUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorCollectionPath("followers", identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
   }
 
   getLikedUri(identifier: string): URL {
-    const path = this.federation.router.build(
-      "liked",
-      { identifier },
+    return new URL(
+      this.#getActorCollectionPath("liked", identifier),
+      this.canonicalOrigin,
     );
-    if (path == null) {
-      throw new RouterError("No liked collection path registered.");
-    }
-    return new URL(path, this.canonicalOrigin);
+  }
+
+  getPortableLikedUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorCollectionPath("liked", identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
   }
 
   getFeaturedUri(identifier: string): URL {
-    const path = this.federation.router.build(
-      "featured",
-      { identifier },
+    return new URL(
+      this.#getActorCollectionPath("featured", identifier),
+      this.canonicalOrigin,
     );
-    if (path == null) {
-      throw new RouterError("No featured collection path registered.");
-    }
-    return new URL(path, this.canonicalOrigin);
+  }
+
+  getPortableFeaturedUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorCollectionPath("featured", identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
   }
 
   getFeaturedTagsUri(identifier: string): URL {
-    const path = this.federation.router.build(
-      "featuredTags",
-      { identifier },
+    return new URL(
+      this.#getActorCollectionPath("featuredTags", identifier),
+      this.canonicalOrigin,
     );
-    if (path == null) {
-      throw new RouterError("No featured tags collection path registered.");
-    }
-    return new URL(path, this.canonicalOrigin);
+  }
+
+  getPortableFeaturedTagsUri(identifier: string, authority?: string): URL {
+    const path = this.#getActorCollectionPath("featuredTags", identifier);
+    return buildPortableUri(requirePortableAuthority(authority), path);
   }
 
   getCollectionUri<TParam extends Record<string, string>>(
@@ -3414,14 +4994,47 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     return new URL(path, this.canonicalOrigin);
   }
 
-  parseUri(uri: URL | null): ParseUriResult | null {
-    if (uri == null) return null;
-    if (uri.origin !== this.origin && uri.origin !== this.canonicalOrigin) {
-      return null;
+  getPortableCollectionUri<TParam extends Record<string, string>>(
+    name: string | symbol,
+    values: TParam,
+    authority?: string,
+  ): URL {
+    const path = this.federation.getCollectionPath(name, values);
+    if (path === null) {
+      throw new RouterError(
+        `No collection dispatcher registered for "${String(name)}".`,
+      );
     }
-    const route = this.federation.router.route(uri.pathname as Path);
-    if (route == null) return null;
-    else if (route.name === "sharedInbox") {
+    return buildPortableUri(requirePortableAuthority(authority), path);
+  }
+
+  parseUri(
+    uri: URL | null,
+    options: ParseUriOptions = {},
+  ): ParseUriResult | null {
+    if (uri == null) return null;
+    if (uri.origin === this.origin || uri.origin === this.canonicalOrigin) {
+      const route = this.federation.router.route(uri.pathname as Path);
+      // Routes registered by the application take precedence over
+      // the FEP-ef61 gateway endpoint, as they do in Federation.fetch():
+      if (route != null) return this.#parseRoute(route);
+    }
+    if (!options.portable) return null;
+    const portable = parsePortableId(uri);
+    if (portable == null) return null;
+    const route = this.federation.router.route(portable.path);
+    // The gateway endpoint serves no shared inbox:
+    if (route == null || route.name === "sharedInbox") return null;
+    const result = this.#parseRoute(route);
+    return result == null
+      ? null
+      : { ...result, authority: portable.authority } as ParseUriResult;
+  }
+
+  #parseRoute(
+    route: { name: string; values: Record<string, string> },
+  ): ParseUriResult | null {
+    if (route.name === "sharedInbox") {
       return {
         type: "inbox",
         identifier: undefined,
@@ -3488,8 +5101,10 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
       string,
     ];
     if (match !== null) {
-      const [, type, name] = match;
+      const [, type] = match;
+      const name = this.federation.getCollectionName(route.name);
       const cls = this.federation.collectionTypeIds[name];
+      if (cls == null) return null;
       return {
         type,
         name,
@@ -3516,14 +5131,20 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
         },
       );
     }
+    // Resolved outside the try block below, so that errors from the portable
+    // actor ID mapper are not mistaken for a missing key pairs dispatcher:
+    const portableActor = await this.getPortableActorKeyOwner(identifier);
     let keyPairs: (CryptoKeyPair & { keyId: URL })[];
     try {
-      keyPairs = await this.getKeyPairsFromIdentifier(identifier);
+      keyPairs = await this.getKeyPairsFromIdentifier(
+        identifier,
+        portableActor,
+      );
     } catch (_) {
       logger.warn("No actor key pairs dispatcher registered.");
       return [];
     }
-    const owner = this.getActorUri(identifier);
+    const owner = portableActor?.id ?? this.getActorUri(identifier);
     const result = [];
     let i = 1;
     for (const keyPair of keyPairs) {
@@ -3535,7 +5156,12 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
           publicKey: keyPair.publicKey,
         }),
         multikey: new Multikey({
-          id: new URL(`#multikey-${i}`, owner),
+          // FEP-ef61 requires the keys that gateways sign HTTP requests with
+          // to be listed in the portable actor's assertionMethod, where
+          // verifiers look them up by the keyId of the signature:
+          id: portableActor == null
+            ? new URL(`#multikey-${i}`, owner)
+            : keyPair.keyId,
           controller: owner,
           publicKey: keyPair.publicKey,
         }),
@@ -3546,8 +5172,28 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     return result;
   }
 
+  /**
+   * Resolves the portable actor that the actor with the given identifier is,
+   * through the portable actor ID mapper, along with the base of its gateway
+   * key IDs on this server.
+   * @param identifier The actor's identifier.
+   * @returns The portable actor's ID and key ID base, or `null` if the actor
+   *          is not portable.
+   * @throws {TypeError} If the mapper returns an invalid portable actor ID.
+   */
+  protected async getPortableActorKeyOwner(
+    identifier: string,
+  ): Promise<PortableActorKeyOwner | null> {
+    const mapper = this.federation.actorCallbacks?.portableActorIdMapper;
+    if (mapper == null) return null;
+    const id = await mapper(this, identifier);
+    if (id == null) return null;
+    return { id, keyBase: getGatewayKeyBase(id, this.canonicalOrigin) };
+  }
+
   protected async getKeyPairsFromIdentifier(
     identifier: string,
+    portableActor?: PortableActorKeyOwner | null,
   ): Promise<(CryptoKeyPair & { keyId: URL })[]> {
     const logger = getLogger(["fedify", "federation", "actor"]);
     if (this.federation.actorCallbacks?.keyPairsDispatcher == null) {
@@ -3563,6 +5209,12 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
       }
       throw error;
     }
+    if (portableActor === undefined) {
+      portableActor = await this.getPortableActorKeyOwner(identifier);
+    }
+    // A portable actor's keys are this server's gateway keys for it, so they
+    // are identified under its compatible identifier on this server:
+    const keyBase = portableActor?.keyBase ?? actorUri;
     const keyPairs = await this.federation.actorCallbacks?.keyPairsDispatcher(
       new ContextImpl({
         ...this,
@@ -3581,7 +5233,7 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
         keyId: new URL(
           // For backwards compatibility, the first key is always the #main-key:
           i == 0 ? `#main-key` : `#key-${i + 1}`,
-          actorUri,
+          keyBase,
         ),
       });
       i++;
@@ -3665,6 +5317,8 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
       userAgent: options.userAgent ?? this.federation.userAgent,
       tracerProvider: options.tracerProvider ?? this.tracerProvider,
       meterProvider: options.meterProvider ?? this.meterProvider,
+      verifyPortableObject: options.verifyPortableObject ??
+        this.verifyPortableObject,
       // @ts-ignore: `allowPrivateAddress` is not in the type definition.
       allowPrivateAddress: this.federation.allowPrivateAddress,
     });
@@ -3678,6 +5332,8 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
       ...options,
       documentLoader: options.documentLoader ?? this.documentLoader,
       contextLoader: options.contextLoader ?? this.contextLoader,
+      verifyPortableObject: options.verifyPortableObject ??
+        this.verifyPortableObject,
     });
   }
 
@@ -3912,21 +5568,41 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     // Pre-sign with Object Integrity Proofs before fanout so that all
     // recipients receive the same signed activity.  Uses Multikey IDs so that
     // verifiers can look up the correct key type in the actor document.
-    let proofCreated = false;
-    if (actorKeyPairs != null) {
-      const contextLoader = this.contextLoader;
-      for (const kp of actorKeyPairs) {
-        if (
-          kp.privateKey.algorithm.name !== "Ed25519" ||
-          kp.multikey.id == null
-        ) continue;
-        activity = await signObject(activity, kp.privateKey, kp.multikey.id, {
-          contextLoader,
+    //
+    // Explicit sender keys carry no Multikey, so they sign with the key ID
+    // the caller supplied, which is exactly what the delivery worker would do
+    // after reparsing the activity.  Signing here instead keeps a signed
+    // child's retained representation intact: the reparsed activity no
+    // longer carries one, so a worker-side proof would cover a rebuilt child
+    // whose own proof no longer verifies.
+    //
+    // An activity the caller already signed keeps its own proof when sent
+    // with explicit keys: appending another would turn a single-proof
+    // document into a proof set, which the map-local compound-proof profile
+    // does not accept.  This mirrors the guard `FederationImpl.sendActivity()`
+    // applies before signing.  Actor key pairs keep appending outside that
+    // profile, as they always have.
+    const { activity: signedActivity, proofCreated } =
+      await signOutgoingActivity(
+        activity,
+        actorKeyPairs == null
+          ? keys.map(({ keyId, privateKey }) => ({
+            verificationMethod: keyId,
+            privateKey,
+          }))
+          : actorKeyPairs.flatMap((kp) =>
+            kp.multikey.id == null ? [] : [{
+              verificationMethod: kp.multikey.id,
+              privateKey: kp.privateKey,
+            }]
+          ),
+        {
+          contextLoader: this.contextLoader,
           tracerProvider: this.tracerProvider,
-        });
-        proofCreated = true;
-      }
-    }
+          appendToExistingProofs: actorKeyPairs != null,
+        },
+      );
+    activity = signedActivity;
     const inboxes = extractInboxes({
       recipients: expandedRecipients,
       preferSharedInbox: options.preferSharedInbox,
@@ -3944,6 +5620,23 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
       activityId: activity.id?.href,
       activity,
     });
+    const activityJsonLd = await activity.toJsonLd({
+      format: "compact",
+      contextLoader: this.contextLoader,
+    });
+    try {
+      await warnCompatibleIdsInJson(
+        activityJsonLd,
+        this instanceof RequestContextImpl && !this.isInActorDispatcher()
+          ? this
+          : undefined,
+      );
+    } catch (error) {
+      logger.debug(
+        "Could not check the first gateway of activity {activityId}: {error}",
+        { activityId: activity.id?.href, error },
+      );
+    }
     if (
       this.federation.fanoutQueue == null || options.immediate ||
       options.fanout === "skip" || (options.fanout ?? "auto") === "auto" &&
@@ -3951,11 +5644,15 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
     ) {
       await this.federation.sendActivity(keys, inboxes, activity, {
         ...opts,
+        activityJsonLd,
         normalizeExistingProofs: proofCreated ||
           options.normalizeExistingProofs,
       });
       return true;
     }
+    // Reject before anything is enqueued, so the caller learns about it
+    // instead of the fanout worker.
+    assertSupportedCompoundProofShape(activityJsonLd, activity.id?.href);
     const keyJwkPairs = await Promise.all(
       keys.map(async ({ keyId, privateKey }) => ({
         keyId: keyId.href,
@@ -3971,13 +5668,14 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
       keys: keyJwkPairs,
       inboxes: globalThis.Object.fromEntries(
         globalThis.Object.entries(inboxes).map((
-          [k, { actorIds, sharedInbox }],
-        ) => [k, { actorIds: [...actorIds], sharedInbox }]),
+          [k, { actorIds, sharedInbox, portableInbox, gatewayInboxes }],
+        ) => [k, {
+          actorIds: [...actorIds],
+          sharedInbox,
+          ...getPortableMessageFields(portableInbox, gatewayInboxes),
+        }]),
       ),
-      activity: await activity.toJsonLd({
-        format: "compact",
-        contextLoader: this.contextLoader,
-      }),
+      activity: activityJsonLd,
       activityId: activity.id?.href,
       activityType: getTypeId(activity).href,
       collectionSync: opts.collectionSync,
@@ -4130,7 +5828,7 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
   ): Promise<boolean> {
     const logger = getLogger(["fedify", "federation", "inbox"]);
     const contextLoader = options.contextLoader ?? this.contextLoader;
-    const json = await activity.toJsonLd({ contextLoader });
+    let json = await activity.toJsonLd({ contextLoader });
     const keyCache = new KvKeyCache(
       this.federation.kv,
       this.federation.kvPrefixes.publicKey,
@@ -4177,7 +5875,9 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
           { recipient, activity: await fetched.toJsonLd({ contextLoader }) },
         );
         return false;
-      } else if (fetched.id?.href !== activity.id.href) {
+      } else if (
+        fetched.id == null || !isSameObjectId(fetched.id, activity.id)
+      ) {
         logger.debug(
           "Fetched activity object has a different ID; failed to verify.",
           { recipient, activity: await fetched.toJsonLd({ contextLoader }) },
@@ -4190,9 +5890,15 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
         );
         return false;
       }
-      const activityId = fetched.id;
+      // A portable activity and its actors are compared by their DIDs, as
+      // FEP-ef61 requires; a compatible identifier's gateway does not count,
+      // since the activity's proof is made only by the DID of its own ID:
+      const activityOrigin = getAuthenticationOrigin(fetched.id);
       if (
-        !fetched.actorIds.every((actor) => actor.origin === activityId.origin)
+        activityOrigin == null ||
+        !fetched.actorIds.every((actor) =>
+          getAuthenticationOrigin(actor) === activityOrigin
+        )
       ) {
         logger.debug(
           "Fetched activity object has actors from different origins; " +
@@ -4206,6 +5912,7 @@ export class ContextImpl<TContextData> implements Context<TContextData> {
           "ignore the original activity and use the fetched one, which is trustworthy.",
       );
       activity = fetched;
+      json = await fetched.toJsonLd({ contextLoader });
     } else {
       logger.debug(
         "Object Integrity Proofs are verified.",
@@ -4247,6 +5954,7 @@ interface RequestContextOptions<TContextData>
     cls: ConstructorWithTypeId<Object>;
     values: Record<string, string>;
   };
+  portableRequest?: PortableRequest;
 }
 
 class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
@@ -4257,8 +5965,16 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
     values: Record<string, string>;
   };
   readonly request: Request;
+
+  /** Whether a diagnostic actor lookup would re-enter the actor dispatcher. */
+  isInActorDispatcher(): boolean {
+    return this.#invokedFromActorDispatcher != null;
+  }
   // deno-lint-ignore no-explicit-any
   override readonly url: URL = undefined as any;
+  // An own property, so that the contexts derived by spreading this one, e.g.,
+  // in getActor() and getObject(), keep it:
+  readonly portableRequest?: PortableRequest;
 
   constructor(options: RequestContextOptions<TContextData>) {
     super(options);
@@ -4266,6 +5982,7 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
     this.#invokedFromObjectDispatcher = options.invokedFromObjectDispatcher;
     this.request = options.request;
     this.url = options.url;
+    this.portableRequest = options.portableRequest;
   }
 
   override clone(data: TContextData): RequestContext<TContextData> {
@@ -4279,8 +5996,98 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
         this.invokedFromActorKeyPairsDispatcher,
       invokedFromActorDispatcher: this.#invokedFromActorDispatcher,
       invokedFromObjectDispatcher: this.#invokedFromObjectDispatcher,
+      portableRequest: this.portableRequest,
       request: this.request,
     });
+  }
+
+  override getPortableActorUri(identifier: string, authority?: string): URL {
+    return super.getPortableActorUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableObjectUri<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    authority?: string,
+  ): URL {
+    return super.getPortableObjectUri(
+      cls,
+      values,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableInboxUri(identifier: string, authority?: string): URL {
+    return super.getPortableInboxUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableOutboxUri(identifier: string, authority?: string): URL {
+    return super.getPortableOutboxUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableFollowingUri(
+    identifier: string,
+    authority?: string,
+  ): URL {
+    return super.getPortableFollowingUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableFollowersUri(
+    identifier: string,
+    authority?: string,
+  ): URL {
+    return super.getPortableFollowersUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableLikedUri(identifier: string, authority?: string): URL {
+    return super.getPortableLikedUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableFeaturedUri(identifier: string, authority?: string): URL {
+    return super.getPortableFeaturedUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableFeaturedTagsUri(
+    identifier: string,
+    authority?: string,
+  ): URL {
+    return super.getPortableFeaturedTagsUri(
+      identifier,
+      authority ?? this.portableRequest?.authority,
+    );
+  }
+
+  override getPortableCollectionUri<TParam extends Record<string, string>>(
+    name: string | symbol,
+    values: TParam,
+    authority?: string,
+  ): URL {
+    return super.getPortableCollectionUri(
+      name,
+      values,
+      authority ?? this.portableRequest?.authority,
+    );
   }
 
   getActor(
@@ -4333,10 +6140,30 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
     return actor;
   }
 
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+  ): Promise<TObject | null>;
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    options: GetObjectOptions & { readonly tombstone: "passthrough" },
+  ): Promise<TObject | Tombstone | null>;
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    options: GetObjectOptions & { readonly tombstone?: "suppress" | undefined },
+  ): Promise<TObject | null>;
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    options: GetObjectOptions,
+  ): Promise<TObject | Tombstone | null>;
   async getObject<TObject extends Object>(
     cls: ConstructorWithTypeId<TObject>,
     values: Record<string, string>,
-  ): Promise<TObject | null> {
+    options?: GetObjectOptions,
+  ): Promise<TObject | Tombstone | null> {
     const callbacks = this.federation.objectCallbacks[cls.typeId.href];
     if (callbacks == null) {
       throw new Error("No object dispatcher registered.");
@@ -4360,14 +6187,22 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
         },
       );
     }
-    return await callbacks.dispatcher(
+    const object = await callbacks.dispatcher(
       new RequestContextImpl({
         ...this,
         invokedFromObjectDispatcher: { cls, values },
       }),
       values,
-      // deno-lint-ignore no-explicit-any
-    ) as any;
+    );
+    // A tombstone that is an instance of the requested class, e.g., Object or
+    // Tombstone itself, is an object of that class, so it is not suppressed:
+    if (
+      object instanceof Tombstone && !(object instanceof cls) &&
+      options?.tombstone !== "passthrough"
+    ) {
+      return null;
+    }
+    return object as TObject | Tombstone | null;
   }
 
   #signedKey: CryptographicKey | null | undefined = undefined;
@@ -4381,6 +6216,7 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
       contextLoader: options.contextLoader ?? this.contextLoader,
       documentLoader: options.documentLoader ?? this.documentLoader,
       timeWindow: this.federation.signatureTimeWindow,
+      maxSignatures: this.federation.maxHttpSignatures,
       meterProvider: this.meterProvider,
       tracerProvider: options.tracerProvider ?? this.tracerProvider,
     });
@@ -4412,6 +6248,18 @@ class RequestContextImpl<TContextData> extends ContextImpl<TContextData>
       }
       throw error;
     }
+  }
+
+  async isSignedByAudience(
+    object: Object,
+    options: IsSignedByAudienceOptions = {},
+  ): Promise<boolean> {
+    return await isInAudience(object, null) ||
+      await isInAudience(
+        object,
+        await this.getSignedKeyOwner(options),
+        options,
+      );
   }
 }
 
@@ -4586,12 +6434,12 @@ async function forwardActivityInternal<TContextData>(
     const promises: Promise<void>[] = [];
     for (const inbox in inboxes) {
       promises.push(
-        sendActivity({
+        sendActivityToInbox(inbox, inboxes[inbox].gatewayInboxes, {
+          allowPrivateAddress: ctx.federation.allowPrivateAddress,
           keys,
           activity: ctx.activity,
           activityId: ctx.activityId,
           activityType: ctx.activityType,
-          inbox: new URL(inbox),
           sharedInbox: inboxes[inbox].sharedInbox,
           meterProvider: ctx.meterProvider,
           tracerProvider: ctx.tracerProvider,
@@ -4625,7 +6473,7 @@ async function forwardActivityInternal<TContextData>(
   const started = new Date().toISOString();
   const messages: { message: OutboxMessage; orderingKey?: string }[] = [];
   for (const inbox in inboxes) {
-    const inboxUrl = new URL(inbox);
+    const { portableInbox, gatewayInboxes } = inboxes[inbox];
     const message: OutboxMessage = {
       type: "outbox",
       id: crypto.randomUUID(),
@@ -4642,7 +6490,8 @@ async function forwardActivityInternal<TContextData>(
       headers: {},
       orderingKey: orderingKey == null
         ? undefined
-        : `${orderingKey}\n${inboxUrl.origin}`,
+        : `${orderingKey}\n${getOrderingDestination(inbox, portableInbox)}`,
+      ...getPortableMessageFields(portableInbox, gatewayInboxes),
       traceContext: carrier,
     };
     messages.push({
@@ -4913,6 +6762,14 @@ interface SendActivityInternalOptions<TContextData> {
   readonly collectionSync?: string;
   readonly orderingKey?: string;
   readonly normalizeExistingProofs?: boolean;
+  /**
+   * The compact JSON-LD document the activity was already serialized into,
+   * when the caller has one.  Reusing it keeps a document that embeds a
+   * secured child intact: reparsing an activity and serializing it again
+   * rebuilds the child under the parent's context and invalidates both its
+   * own proof and the outer proof that covered it.
+   */
+  readonly activityJsonLd?: unknown;
   readonly context: Context<TContextData>;
 }
 

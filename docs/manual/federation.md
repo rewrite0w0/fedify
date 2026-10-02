@@ -94,7 +94,17 @@ that the `Federation` object uses:
     ([double-knocking] technique).
     `["_fedify", "httpMessageSignaturesSpec"]` by default.
 
+`~FederationKvPrefixes.portableInboxForwarding`
+:   *This API is available since Fedify 2.4.0.*
+
+    The key prefix used for remembering which activities received in
+    [FEP-ef61] portable inboxes have been forwarded to which gateways, so that
+    each activity is forwarded at most once (see the [*Portable inboxes*
+    section](./inbox.md#portable-inboxes)).
+    `["_fedify", "portableInboxForwarding"]` by default.
+
 [double-knocking]: https://swicg.github.io/activitypub-http-signature/#how-to-upgrade-supported-versions
+[FEP-ef61]: https://w3id.org/fep/ef61
 
 ### `publicKeyTtl`
 
@@ -138,6 +148,55 @@ const federation = createFederation<void>({
 > Both TTLs trade storage against remote requests.  See
 > [*Bounding how long cache entries live*](./kv.md#bounding-how-long-cache-entries-live)
 > for what shortening or lengthening them costs.
+
+### `portableInboxForwarding`
+
+*This API is available since Fedify 2.4.0.*
+
+The `~FederationOptions.portableInboxForwarding` property configures how
+activities received in [FEP-ef61] portable inboxes are forwarded to the other
+gateways of their actors (see the [*Forwarding to other gateways*
+section](./inbox.md#forwarding-to-other-gateways)).  It is an object with
+the following properties, all optional:
+
+`~PortableInboxForwardingOptions.maxTargets`
+:   The maximum number of other gateways that a single delivery is forwarded
+    to.  Gateways beyond it are skipped with a warning, and `0` turns off
+    forwarding.  It is 10 by default.
+
+`~PortableInboxForwardingOptions.ttl`
+:   How long Fedify remembers that it has forwarded an activity from
+    a portable inbox to a gateway, under
+    `~FederationKvPrefixes.portableInboxForwarding`.  Once it expires,
+    a redelivery of the activity may be forwarded again.  It is 30 days by
+    default.
+
+`~PortableInboxForwardingOptions.deadline`
+:   How long a delivery waits for forwarding requests made immediately, i.e.,
+    when no outbox queue is configured, before Fedify responds to it.
+    Requests still running afterwards continue in the background.  It also
+    bounds identifying the gateway that forwarded the delivery, with or
+    without an outbox queue, and the activity is forwarded back to that
+    gateway if it is not identified in time.  It is 10 seconds by default.
+
+~~~~ typescript twoslash
+import { createFederation, MemoryKvStore } from "@fedify/fedify";
+
+const federation = createFederation<void>({
+  kv: new MemoryKvStore(),
+  portableInboxForwarding: {  // [!code highlight]
+    maxTargets: 5,  // [!code highlight]
+    ttl: { days: 7 },  // [!code highlight]
+    deadline: { seconds: 5 },  // [!code highlight]
+  },  // [!code highlight]
+});
+~~~~
+
+The durations cannot have calendar units, i.e., weeks, months, or years, as
+their length depends on the date; use days instead, e.g., `{ days: 7 }`.  A
+negative or non-integer `maxTargets`, a `ttl` that is not positive, or a
+`deadline` that is negative or longer than 2,147,483,647 milliseconds (about
+24.8 days, the longest delay timers support) throws a `RangeError`.
 
 ### `queue`
 
@@ -302,6 +361,40 @@ the same as the `documentLoaderFactory`, but their purposes are different
 (see also [*Document loader vs. context loader*
 section](./context.md#document-loader-vs-context-loader)).
 
+### `documentLoaderTimeout`
+
+*This API is available since Fedify 2.4.0.*
+
+The time limit for each call of the built-in document loader, context loader,
+and authenticated document loader, e.g., when Fedify fetches the key of
+an HTTP Signature.  It takes a `Temporal.Duration` or a `Temporal.DurationLike`
+object.  The limit covers the whole call, including every redirect it follows,
+retries, and reading the response body, but not reading from or writing to
+the cache.
+
+10 seconds by default.  Set it to `null` to turn off the timeout:
+
+~~~~ typescript twoslash
+import { createFederation, MemoryKvStore } from "@fedify/fedify";
+// ---cut-before---
+const federation = createFederation<void>({
+  kv: new MemoryKvStore(),
+  documentLoaderTimeout: { seconds: 5 },
+});
+~~~~
+
+It does not affect the loaders that the [`documentLoaderFactory`],
+[`contextLoaderFactory`], and [`authenticatedDocumentLoaderFactory`] options
+make.  Note that if you set only `documentLoaderFactory`, it also makes
+the context loaders.
+
+See the [*Timeouts* section](./context.md#timeouts) for how a timeout is
+reported.
+
+[`documentLoaderFactory`]: #documentloaderfactory
+[`contextLoaderFactory`]: #contextloaderfactory
+[`authenticatedDocumentLoaderFactory`]: #authenticateddocumentloaderfactory
+
 ### `allowPrivateAddress`
 
 *This API is available since Fedify 0.15.0.*
@@ -310,7 +403,8 @@ section](./context.md#document-loader-vs-context-loader)).
 > Do not turn on this option in production environments.  Disallowing fetching
 > private network addresses is a security feature to prevent [SSRF] attacks.
 
-Whether to allow fetching private network addresses in the document loader.
+Whether to allow private network addresses in the document loader and outbound
+activity delivery, including redirects.
 
 Mostly useful for testing purposes.
 
@@ -408,6 +502,20 @@ Defaults to `"rfc9421"`.
 
 [HTTP Signatures]: https://datatracker.ietf.org/doc/html/draft-cavage-http-signatures-12
 [RFC 9421]: https://www.rfc-editor.org/rfc/rfc9421
+
+### `maxHttpSignatures`
+
+*This API is available since Fedify 2.4.0.*
+
+The maximum number of [RFC 9421] signatures of an incoming request to verify,
+in the inbox and in `~RequestContext.getSignedKey()`.  Each signature may make
+Fedify fetch the key that it names, so only the first ones in the order of
+the `Signature-Input` header are verified, and the rest are ignored.  It has
+to be a positive integer, or `Infinity` to verify every signature, which lets
+a single request make Fedify fetch any number of keys.
+
+Defaults to `3`.  See also the [*Requests with several RFC 9421 signatures*
+section](./inbox.md#requests-with-several-rfc-9421-signatures).
 
 ### `permanentFailureStatusCodes`
 

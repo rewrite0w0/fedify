@@ -38,7 +38,7 @@ const mockDocumentLoader = async (url: string): Promise<RemoteDocument> => {
         id: url,
         type: "Person",
         preferredUsername: "alice",
-        inbox: "https://remote.example.com/users/alice/inbox",
+        inbox: aliceInbox,
         publicKey: {
           id: "https://remote.example.com/users/alice#main-key",
           owner: url.replace(/#main-key$/, ""),
@@ -79,6 +79,68 @@ const rsaPublicKey = {
   id: new URL("https://remote.example.com/users/alice#main-key"),
   ...rsaKeyPair.publicKey,
 };
+
+// Recipients of the deliveries these tests assert on.  They live in the RFC
+// 3849 documentation prefix 2001:db8::/32, which validatePublicUrl() accepts
+// as public without a DNS lookup while never routing anywhere; an
+// *.example.com subdomain does not resolve, so a delivery to it is refused
+// before the request is made.  litepub.test.ts uses a disjoint /48 so that
+// neither file's interceptor can swallow the other's deliveries.
+const INBOX_PREFIX = "https://[2001:db8:2::";
+const aliceInbox = `${INBOX_PREFIX}2]/users/alice/inbox`;
+const followerInbox = `${INBOX_PREFIX}1]/users/bob/inbox`;
+
+interface DeliveredRequest {
+  readonly method: string;
+  readonly body: any;
+}
+
+const recorders = new Map<string, DeliveredRequest[]>();
+
+// Delivery goes through the global fetch(), and node:test runs the tests of a
+// describe() block concurrently, so a per-test interceptor would be clobbered
+// by whichever test installs or restores the next one.  Install a single
+// interceptor for the whole file instead, and let each test register the
+// inboxes whose deliveries it wants to see.
+function recordInbox(inbox: string): DeliveredRequest[] {
+  const recorded: DeliveredRequest[] = [];
+  recorders.set(inbox, recorded);
+  return recorded;
+}
+
+const aliceDeliveries = recordInbox(aliceInbox);
+
+function assertAcceptDelivered(
+  follow: Follow,
+  deliveries: readonly DeliveredRequest[] = aliceDeliveries,
+): void {
+  const accepts = deliveries.filter(({ body }) =>
+    body.type === "Accept" && body.object?.id === follow.id?.href
+  );
+  strictEqual(accepts.length, 1, "Expected exactly one Accept for this Follow");
+  strictEqual(accepts[0].method, "POST");
+  strictEqual(accepts[0].body.actor, "https://relay.example.com/users/relay");
+  strictEqual(accepts[0].body.object.type, "Follow");
+  strictEqual(
+    accepts[0].body.object.actor.id,
+    follow.actorId?.href,
+  );
+}
+
+const nextFetch = globalThis.fetch;
+globalThis.fetch = (async (input: URL | RequestInfo, init?: RequestInit) => {
+  const request = input instanceof Request ? input : new Request(input, init);
+  if (!request.url.startsWith(INBOX_PREFIX)) {
+    return await nextFetch(input, init);
+  }
+  // Answer every request within this file's prefix, registered or not, so that
+  // a stray delivery can never reach the network.
+  const recorded = recorders.get(request.url);
+  if (recorded != null) {
+    recorded.push({ method: request.method, body: await request.json() });
+  }
+  return new Response(null, { status: 202 });
+}) as typeof fetch;
 
 describe("MastodonRelay", () => {
   test("constructor with required options", () => {
@@ -238,7 +300,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL(followerId),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     // Simulate the relay's internal logic
@@ -260,7 +322,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL(followerId),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     await kv.set(
@@ -359,11 +421,14 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     const followActivity = new Follow({
-      id: new URL("https://remote.example.com/activities/follow/1"),
+      // Isolate delivery assertions from other tests and loop iterations.
+      id: new URL(
+        `https://remote.example.com/activities/follow/${crypto.randomUUID()}`,
+      ),
       actor: follower.id,
       object: new URL("https://relay.example.com/users/relay"),
     });
@@ -384,7 +449,9 @@ describe("MastodonRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
+    assertAcceptDelivered(followActivity);
 
     // Verify handler was called
     strictEqual(handlerCalled, true);
@@ -415,7 +482,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     const followActivity = new Follow({
@@ -440,7 +507,8 @@ describe("MastodonRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
 
     // Verify follower was NOT stored
     const followerData = await kv.get([
@@ -458,7 +526,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL(followerId),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     const followActivityId = "https://remote.example.com/activities/follow/1";
@@ -503,7 +571,8 @@ describe("MastodonRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
 
     // Verify follower was removed
     const followerData = await kv.get(["follower", followerId]);
@@ -518,7 +587,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL(followerId),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     await kv.set(
@@ -695,7 +764,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL("https://follower.example.com/users/bob"),
       preferredUsername: "bob",
-      inbox: new URL("https://follower.example.com/users/bob/inbox"),
+      inbox: new URL(followerInbox),
     });
     await kv.set(
       ["follower", follower.id!.href],
@@ -736,40 +805,17 @@ describe("MastodonRelay", () => {
       rsaPublicKey.id,
     );
 
-    const originalFetch = globalThis.fetch;
-    let deliveryMethod: string | undefined;
-    let deliveredActivity: unknown;
-    globalThis.fetch = (async (
-      input: URL | RequestInfo,
-      init?: RequestInit,
-    ) => {
-      const outboundRequest = input instanceof Request
-        ? input
-        : new Request(input, init);
-      if (
-        outboundRequest.url ===
-          "https://follower.example.com/users/bob/inbox"
-      ) {
-        deliveryMethod = outboundRequest.method;
-        deliveredActivity = await outboundRequest.json();
-        return new Response(null, { status: 202 });
-      }
-      return originalFetch(input, init);
-    }) as typeof fetch;
+    const delivered = recordInbox(followerInbox);
 
-    try {
-      const response = await relay.fetch(request);
-      ok(
-        response.status === 200 || response.status === 202,
-        `Unexpected inbox response status: ${response.status}`,
-      );
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    const response = await relay.fetch(request);
+    ok(
+      response.status === 200 || response.status === 202,
+      `Unexpected inbox response status: ${response.status}`,
+    );
 
-    ok(deliveredActivity, "Expected Announce delivery to the follower inbox");
-    strictEqual(deliveryMethod, "POST");
-    deepStrictEqual(deliveredActivity, signedAnnounce);
+    strictEqual(delivered.length, 1, "Expected exactly one delivery");
+    strictEqual(delivered[0].method, "POST");
+    deepStrictEqual(delivered[0].body, signedAnnounce);
   });
 
   test("ignores Follow activity without required fields", async () => {
@@ -805,7 +851,8 @@ describe("MastodonRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
 
     // Verify follower was NOT stored
     const followerData = await kv.get([
@@ -829,12 +876,15 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     // Public follow activity
     const followActivity = new Follow({
-      id: new URL("https://remote.example.com/activities/follow/1"),
+      // Isolate delivery assertions from other tests and loop iterations.
+      id: new URL(
+        `https://remote.example.com/activities/follow/${crypto.randomUUID()}`,
+      ),
       actor: follower.id,
       object: new URL("https://www.w3.org/ns/activitystreams#Public"),
     });
@@ -855,7 +905,9 @@ describe("MastodonRelay", () => {
       rsaPublicKey.id,
     );
 
-    await relay.fetch(request);
+    const response = await relay.fetch(request);
+    strictEqual(response.status, 202);
+    assertAcceptDelivered(followActivity);
 
     // Verify follower was stored
     const followerData = await kv.get([
@@ -957,7 +1009,7 @@ describe("MastodonRelay", () => {
       id: new URL(followerId),
       preferredUsername: "alice",
       name: "Alice Wonderland",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     await kv.set(
@@ -990,12 +1042,12 @@ describe("MastodonRelay", () => {
     const follower1 = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
     const follower2 = new Person({
       id: new URL("https://remote.example.com/users/bob"),
       preferredUsername: "bob",
-      inbox: new URL("https://remote.example.com/users/bob/inbox"),
+      inbox: new URL(`${INBOX_PREFIX}3]/users/bob/inbox`),
     });
 
     await kv.set(
@@ -1056,7 +1108,7 @@ describe("MastodonRelay", () => {
     const follower = new Person({
       id: new URL("https://remote.example.com/users/alice"),
       preferredUsername: "alice",
-      inbox: new URL("https://remote.example.com/users/alice/inbox"),
+      inbox: new URL(aliceInbox),
     });
 
     await kv.set(
@@ -1075,7 +1127,7 @@ describe("MastodonRelay", () => {
     strictEqual(result.actor.preferredUsername, "alice");
     strictEqual(
       result.actor.inboxId?.href,
-      "https://remote.example.com/users/alice/inbox",
+      aliceInbox,
     );
 
     // Test non-existent follower

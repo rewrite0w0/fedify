@@ -9,6 +9,51 @@ import { Buffer } from "node:buffer";
 import { type Codec, JsonCodec } from "./codec.ts";
 
 /**
+ * Turns a TTL into the whole number of seconds Redis `SETEX` requires.
+ *
+ * The one-second granularity is `SETEX`'s, not Redis's: Redis can express a
+ * millisecond expiry through `SET` with `PX`, and `SETEX` is simply the
+ * command this adapter uses.  Within that command a duration which is not a
+ * whole number of seconds has to be approximated.
+ *
+ * It is rounded up rather than to the nearest second, because every other
+ * {@link KvStore} implementation keeps a value for at least as long as it was
+ * asked to, and expiring early is the direction that can change behaviour
+ * rather than just cost a refetch — a TTL used to suppress duplicate work
+ * would start letting duplicates through.
+ *
+ * The result is clamped to 1, the smallest expiry `SETEX` accepts.  A
+ * sub-second duration therefore stores the value for one second instead of
+ * being rejected, and so do **zero and negative durations**, which `SETEX`
+ * rejects outright.  That last part is a policy choice rather than a
+ * consequence of the rounding: the other {@link KvStore} implementations read
+ * a non-positive TTL as already expired, whereas this one keeps the value for
+ * the shortest lifetime the command can express.  Storing it briefly is closer
+ * to the caller's request than failing the write, which is what happened
+ * before.
+ */
+function expirySeconds(ttl: Temporal.Duration): number {
+  return Math.max(1, Math.ceil(ttl.total("second")));
+}
+
+const casScript = `
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == '1' then
+  if current then return 0 end
+elseif not current or current ~= ARGV[2] then
+  return 0
+end
+if ARGV[3] == '1' then
+  redis.call('DEL', KEYS[1])
+elseif ARGV[5] ~= '0' then
+  redis.call('SETEX', KEYS[1], ARGV[5], ARGV[4])
+else
+  redis.call('SET', KEYS[1], ARGV[4])
+end
+return 1
+`;
+
+/**
  * Options for {@link RedisKvStore} class.
  */
 export interface RedisKvStoreOptions {
@@ -21,6 +66,7 @@ export interface RedisKvStoreOptions {
   /**
    * The codec to use for encoding and decoding values in the key–value store.
    * Defaults to {@link JsonCodec}.
+   * For {@link RedisKvStore.cas}, equal values must encode to identical bytes.
    */
   readonly codec?: Codec;
 }
@@ -91,6 +137,15 @@ export class RedisKvStore implements KvStore {
     return this.#codec.decode(encodedValue) as T;
   }
 
+  /**
+   * {@inheritDoc KvStore.set}
+   *
+   * The `ttl` option is stored through Redis `SETEX`, which takes a whole
+   * number of seconds, so a duration with a finer resolution is rounded up to
+   * the next second.  A zero or negative duration stores the value for one
+   * second, the shortest expiry the command can express, rather than failing
+   * the write or deleting the key.
+   */
   async set(
     key: KvKey,
     value: unknown,
@@ -101,7 +156,7 @@ export class RedisKvStore implements KvStore {
     if (options?.ttl != null) {
       await this.#redis.setex(
         serializedKey,
-        options.ttl.total("second"),
+        expirySeconds(options.ttl),
         encodedValue,
       );
     } else {
@@ -112,6 +167,36 @@ export class RedisKvStore implements KvStore {
   async delete(key: KvKey): Promise<void> {
     const serializedKey = this.#serializeKey(key);
     await this.#redis.del(serializedKey);
+  }
+
+  /**
+   * {@inheritDoc KvStore.cas}
+   *
+   * Values are compared as encoded bytes.  A custom {@link Codec} must encode
+   * equal values identically; with {@link JsonCodec}, object property order
+   * affects the comparison.  The `ttl` option follows {@link set}: a
+   * fractional second is rounded up and a non-positive duration uses one
+   * second.
+   * @since 2.4.0
+   */
+  async cas(
+    key: KvKey,
+    expectedValue: unknown,
+    newValue: unknown,
+    options?: KvStoreSetOptions,
+  ): Promise<boolean> {
+    const absent = Buffer.alloc(0);
+    const result = await this.#redis.eval(
+      casScript,
+      1,
+      this.#serializeKey(key),
+      expectedValue === undefined ? "1" : "0",
+      expectedValue === undefined ? absent : this.#codec.encode(expectedValue),
+      newValue === undefined ? "1" : "0",
+      newValue === undefined ? absent : this.#codec.encode(newValue),
+      options?.ttl == null ? 0 : expirySeconds(options.ttl),
+    );
+    return result === 1;
   }
 
   #deserializeKey(redisKey: string): KvKey {

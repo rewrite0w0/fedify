@@ -79,6 +79,98 @@ sequenceDiagram
 [content negotiation]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Content_negotiation
 
 
+AdonisJS
+--------
+
+*This API is available since Fedify 2.4.0.*
+
+[AdonisJS] is a batteries-included TypeScript framework for Node.js, with its
+own IoC container, service providers and CLI.  The *@fedify/adonisjs* package
+integrates Fedify with AdonisJS.  It requires `@adonisjs/core` 7.4.0 or later,
+whose `request.authority()` honors `X-Forwarded-Host`, and Node.js 24 or later.
+It is published to npm only, and is not tested on Deno or Bun.
+
+::: code-group
+
+~~~~ sh [npm]
+node ace add @fedify/adonisjs
+~~~~
+
+~~~~ sh [pnpm]
+node ace add --package-manager=pnpm @fedify/adonisjs
+~~~~
+
+~~~~ sh [Yarn]
+node ace add --package-manager=yarn @fedify/adonisjs
+~~~~
+
+:::
+
+Unlike the other integrations, there is nothing to wire up by hand.  The
+`configure` hook that `node ace add` runs registers the service provider and the
+server middleware, and writes *config/fedify.ts*, *start/federation.ts* and
+*app/federation/main.ts*.
+
+Set the canonical origin in *config/fedify.ts*—Fedify mints actor URIs from it,
+so it has to be the address remote servers can reach:
+
+~~~~ typescript twoslash
+// config/fedify.ts
+import { defineConfig } from "@fedify/adonisjs";
+
+export default defineConfig({
+  origin: "https://example.com",  // [!code highlight]
+});
+~~~~
+
+Then register dispatchers on the builder that
+*@fedify/adonisjs/services/builder* exports.  The generated
+*start/federation.ts* preload file imports this module, which AdonisJS loads
+after every service provider has booted—so dispatchers may use Lucid models and
+anything else the container provides:
+
+~~~~ typescript twoslash
+// app/federation/main.ts
+import federation from "@fedify/adonisjs/services/builder";
+import { Person } from "@fedify/vocab";
+
+federation.setActorDispatcher(
+  "/actors/{identifier}",
+  (ctx, identifier) => {  // [!code highlight]
+    return new Person({  // [!code highlight]
+      id: ctx.getActorUri(identifier),  // [!code highlight]
+      preferredUsername: identifier,  // [!code highlight]
+    });  // [!code highlight]
+  },
+);
+~~~~
+
+Every request then carries a Fedify `RequestContext` as `ctx.federation`, so an
+ordinary controller can mint URIs, look remote objects up, or send activities:
+
+~~~~ typescript twoslash
+import "@fedify/adonisjs/types";
+import type { HttpContext } from "@adonisjs/core/http";
+// ---cut-before---
+export default class ActorsController {
+  async show({ params, federation }: HttpContext) {
+    return { actor: federation.getActorUri(params.identifier).href };
+  }
+}
+~~~~
+
+The middleware is registered at the front of the *server* middleware stack
+rather than in the router stack, because Fedify serves paths the AdonisJS
+router knows nothing about—*/.well-known/webfinger* among them—and because
+HTTP Signature verification needs the request body before the body parser
+consumes it.  Being first also keeps content negotiation honest: middleware
+that rewrites `Accept`, such as the API starter kit's
+`force_json_response_middleware`, would otherwise make Fedify answer a browser
+with the ActivityPub document.
+
+[AdonisJS]: https://adonisjs.com/
+
+
 Express
 -------
 
@@ -827,8 +919,12 @@ export default fedifyWith(federation)(
 */
 )
 
-// This config needs because middleware process only requests with the
-// "Accept" header matching the federation accept regex.
+// This config makes the middleware run only for requests that may be
+// federation requests: requests whose "Accept" or "Content-Type" header
+// has a federation media type, NodeInfo requests, and FEP-ef61 gateway
+// requests such as hashlink media, which clients fetch with, e.g.,
+// "Accept: image/*".  fedifyWith() then decides which of them Fedify
+// handles.
 // More details: https://nextjs.org/docs/app/api-reference/file-conventions/middleware#config-object-optional
 export const config = {
   runtime: "nodejs",
@@ -855,6 +951,7 @@ export const config = {
     },
     { source: "/.well-known/nodeinfo" },
     { source: "/.well-known/x-nodeinfo2" },
+    { source: "/.well-known/apgateway/:path*" },
   ],
 };
 ~~~~
@@ -862,14 +959,41 @@ export const config = {
 As you can see in the comment, you can handle other requests besides
 federation requests in the middleware.  If you handle only federation requests
 in the middleware, you can omit the function argument of `fedifyWith()`.
-The `config` object is necessary to let Next.js know that the middleware
-should process requests with the [`Accept`] header matching the federation
-accept regex.  This is because Next.js middleware processes only requests
-with the [`Accept`] header matching the regex by default.  More details can be
-found in the Next.js official documentation [`config` in *middleware.js*].
+Requests go through two stages.  First, the `matcher` in the `config` object
+decides whether Next.js runs the middleware at all.  Then, `fedifyWith()`
+decides whether Fedify handles the request, or the function you passed to it
+does (by default, the request goes on to your Next.js app).  Fedify handles
+a request if its [`Accept`] or [`Content-Type`] header has an ActivityPub,
+JSON-LD, JRD, or XRD media type, if it is a NodeInfo request, or if it is
+an [FEP-ef61] hashlink media request, e.g.,
+`GET /.well-known/apgateway/hl:zQm…`.  NodeInfo and hashlink media requests
+are matched by their paths alone, since clients send them without
+the federation media types, e.g., with `Accept: image/*` for media.
+More details about `matcher` can be found in the Next.js official
+documentation [`config` in *middleware.js*].
+
+The `/.well-known/apgateway/:path*` matcher makes the middleware run for every
+FEP-ef61 gateway request, but only hashlink media requests are handled by
+Fedify regardless of their headers; other gateway requests without
+the federation media types, e.g., browsers visiting a compatible identifier,
+still go to the function you passed to `fedifyWith()`.  Hashlink media
+requests are handled by Fedify even if no hashlink media dispatcher is
+registered, in which case they get the `onNotFound` response (`404 Not Found`
+by default), so serve such media with
+a [hashlink media dispatcher](./object.md#serving-hashlink-media) rather than
+a Next.js route handler.
+
+> [!NOTE]
+> If you set up the middleware with the `matcher` shown in the documentation
+> before Fedify 2.4.0, add `{ source: "/.well-known/apgateway/:path*" }` to
+> your `matcher` as well as upgrading *@fedify/next*; otherwise, hashlink
+> media requests without the federation media types in their headers never
+> reach Fedify.
 
 [Fedify repository]: https://github.com/fedify-dev/fedify
 [Next.js]: https://nextjs.org/
+[`Content-Type`]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Type
+[FEP-ef61]: https://w3id.org/fep/ef61
 [`config` in *middleware.js*]: https://nextjs.org/docs/app/api-reference/file-conventions/middleware#config-object-optional
 
 

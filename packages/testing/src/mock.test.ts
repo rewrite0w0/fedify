@@ -8,14 +8,119 @@ import {
   Create,
   IntransitiveActivity,
   Note,
+  Object as ASObject,
   Person,
+  PUBLIC_COLLECTION,
+  Tombstone,
 } from "@fedify/vocab";
-import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import {
+  computeDigestMultibase,
+  exportDidKey,
+  formatIri,
+  parseIri,
+  toCompatibleEf61Id,
+} from "@fedify/vocab-runtime";
+import {
+  assertEquals,
+  assertInstanceOf,
+  assertRejects,
+  assertStrictEquals,
+  assertThrows,
+} from "@std/assert";
+import {
+  ed25519PublicKey,
   rsaPrivateKey3,
   rsaPublicKey3,
 } from "../../fedify/src/testing/keys.ts";
-import { createFederation, createOutboxContext } from "./mock.ts";
+import {
+  createFederation,
+  createOutboxContext,
+  createRequestContext,
+} from "./mock.ts";
+
+test("MockFederation actor setters support chaining in any order", () => {
+  const federation = createFederation<void>();
+  const setters = federation.setActorDispatcher(
+    "/users/{identifier}",
+    () => null,
+  );
+  const configure = [
+    () => setters.setKeyPairsDispatcher(() => []),
+    () => setters.mapHandle((_ctx, handle) => handle),
+    () => setters.mapAlias(() => null),
+    () => setters.authorize(() => true),
+  ];
+  for (const first of configure) {
+    assertStrictEquals(first(), setters);
+    for (const second of configure) {
+      assertStrictEquals(second(), setters);
+    }
+  }
+  assertStrictEquals(
+    setters.setKeyPairsDispatcher(() => [])
+      .mapHandle((_ctx, handle) => handle)
+      .mapAlias(() => null)
+      .authorize(() => true)
+      .setKeyPairsDispatcher(() => []),
+    setters,
+  );
+});
+
+test("MockFederation object setters support chaining authorize", () => {
+  const federation = createFederation<void>();
+  const setters = federation.setObjectDispatcher(
+    Note,
+    "/notes/{id}",
+    () => null,
+  );
+  assertStrictEquals(setters.authorize(() => true), setters);
+  assertStrictEquals(
+    setters.authorize(() => true).authorize(() => false),
+    setters,
+  );
+});
+
+for (
+  const method of [
+    "setInboxDispatcher",
+    "setOutboxDispatcher",
+    "setFollowingDispatcher",
+    "setFollowersDispatcher",
+    "setLikedDispatcher",
+    "setFeaturedDispatcher",
+    "setFeaturedTagsDispatcher",
+    "setCollectionDispatcher",
+    "setOrderedCollectionDispatcher",
+  ] as const
+) {
+  test(`MockFederation.${method} setters support chaining in any order`, () => {
+    const federation = createFederation<void>();
+    const setters = method === "setCollectionDispatcher" ||
+        method === "setOrderedCollectionDispatcher"
+      ? federation[method]("notes", Note, "/notes/{identifier}", () => null)
+      : federation[method]("/users/{identifier}/collection", () => null);
+    assertStrictEquals(setters.setCounter(() => 0), setters);
+    assertStrictEquals(setters.setFirstCursor(() => null), setters);
+    assertStrictEquals(setters.setLastCursor(() => null), setters);
+    assertStrictEquals(setters.authorize(() => true), setters);
+    assertStrictEquals(
+      setters.authorize(() => true)
+        .setCounter(() => 0)
+        .setFirstCursor(() => null)
+        .setLastCursor(() => null)
+        .authorize(() => false),
+      setters,
+    );
+    assertStrictEquals(
+      setters.setLastCursor(() => null)
+        .setFirstCursor(() => null)
+        .setCounter(() => 0)
+        .authorize(() => true)
+        .setLastCursor(() => null),
+      setters,
+    );
+  });
+}
 
 test("getSentActivities returns sent activities", async () => {
   const mockFederation = createFederation<void>();
@@ -76,6 +181,13 @@ test("reset clears sent activities", async () => {
 
   // Verify they were cleared
   assertEquals(mockFederation.sentActivities.length, 0);
+});
+
+test("MockFederation accepts inbox request observation registration", () => {
+  const federation = createFederation<void>();
+  const setters = federation.setInboxListeners("/users/{identifier}/inbox");
+  assertStrictEquals(setters.onRequestFinished(() => {}), setters);
+  assertStrictEquals(setters.on(Create, () => {}), setters);
 });
 
 test("receiveActivity triggers inbox listeners", async () => {
@@ -1573,6 +1685,8 @@ test("MockContext.getActor() calls registered actor dispatcher", async () => {
         name: `Test User ${identifier}`,
       });
     },
+  ).mapHandle((_ctx, handle) => handle).mapAlias(() => null).authorize(() =>
+    true
   );
 
   const context = mockFederation.createContext(
@@ -1601,7 +1715,7 @@ test("MockContext.getObject() calls registered object dispatcher", async () => {
         content: `Post ${values.postId} by ${values.identifier}`,
       });
     },
-  );
+  ).authorize(() => true).authorize(() => true);
 
   const context = mockFederation.createContext(
     new URL("https://example.com"),
@@ -1674,7 +1788,10 @@ test("MockContext.getActorKeyPairs() calls registered key pairs dispatcher", asy
           publicKey: keyPair.publicKey,
         },
       ];
-    });
+    })
+    .mapHandle((_ctx, handle) => handle)
+    .mapAlias(() => null)
+    .authorize(() => true);
 
   const context = mockFederation.createContext(
     new URL("https://example.com"),
@@ -1699,6 +1816,20 @@ test("MockContext.getActorKeyPairs() calls registered key pairs dispatcher", asy
   assertEquals(
     keyPairs[0].multikey.controllerId?.href,
     "https://example.com/users/alice",
+  );
+});
+
+test("MockFederation actor setters chain from mapPortableActorId()", () => {
+  const mockFederation = createFederation<void>();
+  const keyPairsDispatcher = () => [];
+  mockFederation
+    .setActorDispatcher("/users/{identifier}", () => null)
+    .mapPortableActorId(() => null)
+    .setKeyPairsDispatcher(keyPairsDispatcher);
+  assertEquals(
+    (mockFederation as unknown as { actorKeyPairsDispatcher: unknown })
+      .actorKeyPairsDispatcher,
+    keyPairsDispatcher,
   );
 });
 
@@ -1827,4 +1958,566 @@ test("MockContext.enqueueTask rejects a handle from another federation", async (
     "is not defined on this federation",
   );
   assertEquals(called, 0);
+});
+
+test("MockFederation.setHashlinkMediaDispatcher()", () => {
+  const federation = createFederation<void>();
+  federation.setHashlinkMediaDispatcher(() => null);
+  assertThrows(
+    () => federation.setHashlinkMediaDispatcher(() => null),
+    TypeError,
+    "Hashlink media dispatcher already set.",
+  );
+});
+
+test("MockContext uses the injected portable verifier for lookup", async () => {
+  const did = await exportDidKey(ed25519PublicKey.publicKey);
+  const portableId = parseIri(`ap+ef61://${did}/notes/1`);
+  const compatibleId = toCompatibleEf61Id(portableId, "https://example.com");
+  const document = {
+    "@context": "https://www.w3.org/ns/activitystreams",
+    id: formatIri(portableId),
+    type: "Note",
+    content: "A portable note",
+  };
+  const loaded: string[] = [];
+  const verified: unknown[] = [];
+  const federation = createFederation<void>({
+    documentLoader: (url) => {
+      loaded.push(url);
+      return Promise.resolve({ contextUrl: null, document, documentUrl: url });
+    },
+    contextLoader: mockDocumentLoader,
+    verifyPortableObject: (value) => {
+      verified.push(value);
+      return Promise.resolve({ verified: true });
+    },
+  });
+  const context = federation.createContext(
+    new URL("https://example.com"),
+    undefined,
+  );
+  assertInstanceOf(await context.lookupObject(compatibleId), Note);
+  assertEquals(loaded, [compatibleId.href]);
+  assertEquals(verified, [document]);
+  assertInstanceOf(
+    await context.clone(undefined).lookupObject(compatibleId),
+    Note,
+  );
+  assertEquals(verified.length, 2);
+  let overrides = 0;
+  await context.lookupObject(compatibleId, {
+    verifyPortableObject: () => {
+      overrides++;
+      return Promise.resolve({ verified: true });
+    },
+  });
+  assertEquals(overrides, 1);
+  assertEquals(verified.length, 2);
+  assertEquals(
+    await context.lookupObject(compatibleId, {
+      verifyPortableObject: () => Promise.resolve({ verified: false }),
+    }),
+    null,
+  );
+  assertEquals(
+    await createFederation<void>().createContext(
+      new URL("https://example.com"),
+      undefined,
+    )
+      .lookupObject(compatibleId),
+    null,
+  );
+});
+
+test("MockContext portable lookup uses a per-call loader", async () => {
+  const did = await exportDidKey(ed25519PublicKey.publicKey);
+  const portableId = parseIri(`ap+ef61://${did}/notes/1`);
+  const compatibleId = toCompatibleEf61Id(portableId, "https://example.com");
+  const context = createFederation<void>().createContext(
+    new URL("https://example.com"),
+    undefined,
+  );
+  let loaded = 0;
+  const documentLoader = (url: string) => {
+    if (url !== compatibleId.href) return mockDocumentLoader(url);
+    loaded++;
+    return Promise.resolve({
+      contextUrl: null,
+      documentUrl: url,
+      document: {
+        "@context": "https://www.w3.org/ns/activitystreams",
+        id: formatIri(portableId),
+        type: "Note",
+      },
+    });
+  };
+  assertEquals(
+    await context.lookupObject(compatibleId, { documentLoader }),
+    null,
+  );
+  assertEquals(loaded, 0);
+  assertInstanceOf(
+    await context.lookupObject(compatibleId, {
+      documentLoader,
+      verifyPortableObject: () => Promise.resolve({ verified: true }),
+    }),
+    Note,
+  );
+  assertEquals(loaded, 1);
+  assertEquals(
+    await context.lookupObject("@alice@example.com", {
+      documentLoader,
+    }),
+    null,
+  );
+  assertEquals(
+    await context.lookupObject("https://example.com/users/alice", {
+      documentLoader,
+    }),
+    null,
+  );
+});
+
+test("MockContext carries an explicit portable request to dispatchers", async () => {
+  const did = await exportDidKey(ed25519PublicKey.publicKey);
+  const portableRequest = {
+    authority: did,
+    id: parseIri(`ap+ef61://${did}/users/alice`),
+  };
+  const federation = createFederation<void>();
+  federation.setActorDispatcher("/users/{identifier}", (ctx) => {
+    assertStrictEquals(ctx.portableRequest, portableRequest);
+    return new Person({ id: ctx.getPortableActorUri("alice", did) });
+  });
+  federation.setObjectDispatcher(Note, "/notes/{id}", (ctx) => {
+    assertStrictEquals(ctx.portableRequest, portableRequest);
+    return new Note({ id: ctx.getPortableObjectUri(Note, { id: "1" }, did) });
+  });
+  const request = new Request("https://example.com/.well-known/apgateway/test");
+  const context = federation.createContext(request, undefined, {
+    portableRequest,
+  });
+  assertStrictEquals(context.portableRequest, portableRequest);
+  assertStrictEquals(context.clone(undefined).portableRequest, portableRequest);
+  assertStrictEquals(context.clone(undefined).request, request);
+  assertInstanceOf(await context.getActor("alice"), Person);
+  assertInstanceOf(await context.getObject(Note, { id: "1" }), Note);
+  assertEquals(
+    federation.createContext(new URL(request.url), undefined).portableRequest,
+    undefined,
+  );
+  assertEquals(
+    federation.createContext(request, undefined).portableRequest,
+    undefined,
+  );
+  const createWithUnion = (
+    input: URL | Request,
+    options?: { portableRequest?: typeof portableRequest },
+  ) => federation.createContext(input, undefined, options);
+  assertStrictEquals(createWithUnion(request).request, request);
+  const unionContext = createWithUnion(request, { portableRequest });
+  assertStrictEquals(unionContext.request, request);
+  assertStrictEquals(unionContext.portableRequest, portableRequest);
+  assertInstanceOf(await unionContext.getActor("alice"), Person);
+  assertInstanceOf(await unionContext.getObject(Note, { id: "1" }), Note);
+});
+
+test("MockFederation.fetch() dispatches hashlink media", async () => {
+  const digest = await computeDigestMultibase(
+    new TextEncoder().encode("media"),
+  );
+  const path = `https://example.com/.well-known/apgateway/hl:${digest}`;
+  const request = new Request(`${path}?download=1`);
+  const federation = createFederation<{ id: number }>();
+  const expected = new Response("media", {
+    status: 206,
+    headers: { "Content-Type": "text/plain" },
+  });
+  let calls = 0;
+  federation.setHashlinkMediaDispatcher((ctx, media) => {
+    calls++;
+    assertStrictEquals(ctx.request, request);
+    assertEquals(ctx.data, { id: 42 });
+    assertEquals(ctx.portableRequest, undefined);
+    assertEquals(media.hashlink, `hl:${digest}`);
+    assertEquals(media.digestMultibase, digest);
+    assertEquals(media.algorithm, "sha2-256");
+    assertEquals(media.digest.length, 32);
+    assertEquals(media.multihash.length, 34);
+    return expected;
+  });
+  assertStrictEquals(
+    await federation.fetch(request, { contextData: { id: 42 } }),
+    expected,
+  );
+  assertEquals(calls, 1);
+  assertEquals(
+    (await federation.fetch(new Request(`${path}/extra`), {
+      contextData: { id: 42 },
+    })).status,
+    400,
+  );
+  assertEquals(calls, 1);
+  const method = await federation.fetch(
+    new Request(`${path}/extra`, { method: "POST" }),
+    { contextData: { id: 42 } },
+  );
+  assertEquals(method.status, 405);
+  assertEquals(method.headers.get("Allow"), "GET, HEAD");
+});
+
+test("MockFederation.fetch() handles hashlink variants and misses", async () => {
+  const digest = await computeDigestMultibase(
+    new TextEncoder().encode("media"),
+  );
+  const base = "https://example.com/.well-known/apgateway/";
+  const federation = createFederation<void>();
+  const missing = new Response("missing", { status: 404 });
+  let calls = 0;
+  federation.setHashlinkMediaDispatcher((_ctx, media) => {
+    calls++;
+    assertEquals(media.hashlink, `hl:${digest}`);
+    return null;
+  });
+  assertStrictEquals(
+    await federation.fetch(new Request(`${base}HL%3A${digest}?download=1`), {
+      contextData: undefined,
+      onNotFound: () => missing,
+    }),
+    missing,
+  );
+  assertEquals(calls, 1);
+  const malformed = await federation.fetch(new Request(`${base}hl:%ZZ`), {
+    contextData: undefined,
+  });
+  assertEquals(malformed.status, 400);
+  assertEquals(calls, 1);
+  const malformedHead = await federation.fetch(
+    new Request(`${base}hl:%ZZ`, { method: "HEAD" }),
+    { contextData: undefined },
+  );
+  assertEquals(malformedHead.status, 400);
+  assertEquals(malformedHead.body, null);
+  assertEquals(
+    (await federation.fetch(new Request(`${base}did:key:zabc/notes/1`), {
+      contextData: undefined,
+    })).status,
+    404,
+  );
+  assertEquals(
+    (await createFederation<void>().fetch(new Request(`${base}hl:${digest}`), {
+      contextData: undefined,
+    })).status,
+    404,
+  );
+});
+
+test("MockFederation.fetch() removes a HEAD response body", async () => {
+  const digest = await computeDigestMultibase(
+    new TextEncoder().encode("media"),
+  );
+  let cancelled = false;
+  const federation = createFederation<void>();
+  federation.setHashlinkMediaDispatcher(() =>
+    new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "Content-Type": "text/plain" },
+      },
+    )
+  );
+  const response = await federation.fetch(
+    new Request(`https://example.com/.well-known/apgateway/hl:${digest}`, {
+      method: "HEAD",
+    }),
+    { contextData: undefined },
+  );
+  assertEquals(response.status, 206);
+  assertEquals(response.statusText, "Partial Content");
+  assertEquals(response.headers.get("Content-Type"), "text/plain");
+  assertEquals(response.body, null);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(cancelled, true);
+});
+
+test("MockContext builds portable IDs", async (t) => {
+  const did = await exportDidKey(ed25519PublicKey.publicKey);
+  const mockFederation = createFederation<void>();
+  mockFederation.setActorDispatcher("/users/{identifier}", () => null);
+  mockFederation.setObjectDispatcher(Note, "/notes/{id}", () => null);
+  mockFederation.setInboxListeners("/users/{identifier}/inbox", "/inbox");
+  mockFederation.setOutboxDispatcher("/users/{identifier}/outbox", () => null);
+  mockFederation.setFollowingDispatcher(
+    "/users/{identifier}/following",
+    () => null,
+  );
+  mockFederation.setFollowersDispatcher(
+    "/users/{identifier}/followers",
+    () => null,
+  );
+  mockFederation.setLikedDispatcher("/users/{identifier}/liked", () => null);
+  mockFederation.setFeaturedDispatcher(
+    "/users/{identifier}/featured",
+    () => null,
+  );
+  mockFederation.setFeaturedTagsDispatcher(
+    "/users/{identifier}/tags",
+    () => null,
+  );
+  const context = mockFederation.createContext(
+    new URL("https://example.com"),
+    undefined,
+  );
+  const helpers: Record<string, [(authority: string) => URL, string]> = {
+    getPortableActorUri: [
+      (authority) => context.getPortableActorUri("alice", authority),
+      "/users/alice",
+    ],
+    getPortableObjectUri: [
+      (authority) => context.getPortableObjectUri(Note, { id: "1" }, authority),
+      "/notes/1",
+    ],
+    getPortableInboxUri: [
+      (authority) => context.getPortableInboxUri("alice", authority),
+      "/users/alice/inbox",
+    ],
+    getPortableOutboxUri: [
+      (authority) => context.getPortableOutboxUri("alice", authority),
+      "/users/alice/outbox",
+    ],
+    getPortableFollowingUri: [
+      (authority) => context.getPortableFollowingUri("alice", authority),
+      "/users/alice/following",
+    ],
+    getPortableFollowersUri: [
+      (authority) => context.getPortableFollowersUri("alice", authority),
+      "/users/alice/followers",
+    ],
+    getPortableLikedUri: [
+      (authority) => context.getPortableLikedUri("alice", authority),
+      "/users/alice/liked",
+    ],
+    getPortableFeaturedUri: [
+      (authority) => context.getPortableFeaturedUri("alice", authority),
+      "/users/alice/featured",
+    ],
+    getPortableFeaturedTagsUri: [
+      (authority) => context.getPortableFeaturedTagsUri("alice", authority),
+      "/users/alice/tags",
+    ],
+    getPortableCollectionUri: [
+      (authority) =>
+        context.getPortableCollectionUri("bookmarks", { id: "1" }, authority),
+      "/collections/bookmarks/id/1",
+    ],
+  };
+  for (const [name, [helper, path]] of Object.entries(helpers)) {
+    await t.step(name, () => {
+      assertEquals(formatIri(helper(did)), `ap+ef61://${did}${path}`);
+      assertEquals(
+        formatIri(helper(did.replace("did:key:", "DID:KEY:"))),
+        `ap+ef61://${did}${path}`,
+      );
+      for (
+        const authority of [
+          `${did}/extra`,
+          "https://example.com",
+          `did:key:u${did.slice("did:key:z".length)}`,
+          "did:key:z",
+        ]
+      ) {
+        assertThrows(() => helper(authority), TypeError, undefined, authority);
+      }
+    });
+  }
+});
+
+test("MockContext.parseUri() recognizes portable IDs on request", async () => {
+  const did = await exportDidKey(ed25519PublicKey.publicKey);
+  const context = createFederation<void>().createContext(
+    new URL("https://example.com/"),
+    undefined,
+  );
+  const portableIds = [
+    parseIri(`ap+ef61://${did}/users/alice`),
+    parseIri(`ap://${did}/users/alice?@gateway=https%3A%2F%2Fgw.example`),
+    new URL(
+      `https://gateway.example/.well-known/apgateway/${did}/users/alice`,
+    ),
+  ];
+  for (const uri of portableIds) {
+    assertEquals(context.parseUri(uri), null, uri.href);
+    assertEquals(
+      context.parseUri(uri, { portable: true }),
+      { type: "actor", identifier: "alice", authority: did },
+      uri.href,
+    );
+  }
+  const malformed = [
+    new URL(
+      `ap+ef61://${
+        encodeURIComponent(`did:key:u${did.slice("did:key:z".length)}`)
+      }/users/alice`,
+    ),
+    new URL(`ap+ef61://${encodeURIComponent(did)}/users/%ZZ`),
+    new URL(`ap+ef61://user@${encodeURIComponent(did)}/users/alice`),
+    new URL("https://gateway.example/.well-known/apgateway/did:/users/alice"),
+  ];
+  for (const uri of malformed) {
+    assertEquals(context.parseUri(uri, { portable: true }), null, uri.href);
+  }
+  assertEquals(context.parseUri(null, { portable: true }), null);
+  assertEquals(
+    context.parseUri(new URL("https://example.com/users/alice"), {
+      portable: true,
+    }),
+    { type: "actor", identifier: "alice" },
+  );
+});
+
+test("MockContext.getObject() suppresses tombstones unless passed through", async () => {
+  const federation = createFederation<void>();
+  federation.setObjectDispatcher(
+    Note,
+    "/notes/{id}",
+    (_ctx: unknown, values: Record<string, string>) =>
+      values.id === "deleted"
+        ? new Tombstone({ id: new URL("https://example.com/notes/deleted") })
+        : new Note({ id: new URL(`https://example.com/notes/${values.id}`) }),
+  );
+  federation.setObjectDispatcher(
+    ASObject,
+    "/objects/{id}",
+    () => new Tombstone({ id: new URL("https://example.com/objects/1") }),
+  );
+  const ctx = federation.createContext(
+    new URL("https://example.com/"),
+    undefined,
+  );
+
+  const defaultPromise = ctx.getObject(Note, { id: "deleted" });
+  const defaultResult: Note | null = await defaultPromise;
+  assertEquals(defaultResult, null);
+  const suppressed: Note | null = await ctx.getObject(Note, {
+    id: "deleted",
+  }, { tombstone: "suppress" });
+  assertEquals(suppressed, null);
+  assertInstanceOf(
+    await ctx.getObject(Note, { id: "deleted" }, { tombstone: "passthrough" }),
+    Tombstone,
+  );
+  assertInstanceOf(await ctx.getObject(Note, { id: "1" }), Note);
+  // A tombstone that is an instance of the requested class is returned:
+  assertInstanceOf(await ctx.getObject(ASObject, { id: "1" }), Tombstone);
+});
+
+test("MockFederation custom collection setters chain mapPortableOwner()", () => {
+  const federation = createFederation<void>();
+  const setters = federation.setCollectionDispatcher(
+    "bookmarks",
+    Note,
+    "/users/{identifier}/bookmarks",
+    () => ({ items: [] }),
+  );
+  assertEquals(setters.mapPortableOwner(() => null), setters);
+  const ordered = federation.setOrderedCollectionDispatcher(
+    "pins",
+    Note,
+    "/users/{identifier}/pins",
+    () => ({ items: [] }),
+  );
+  assertEquals(ordered.mapPortableOwner(() => null), ordered);
+  // The other setters return the same setters, so that they chain in any
+  // order:
+  assertEquals(
+    ordered
+      .setFirstCursor(() => "0")
+      .setLastCursor(() => "1")
+      .setCounter(() => 0)
+      .authorize(() => true)
+      .mapPortableOwner(() => null),
+    ordered,
+  );
+});
+
+test("RequestContext.isSignedByAudience() in test contexts", async (t) => {
+  const did = await exportDidKey(ed25519PublicKey.publicKey);
+  const portableId = parseIri(`ap+ef61://${did}/actor`);
+  const signer = new Person({
+    id: toCompatibleEf61Id(portableId, "https://other.example"),
+  });
+  const followers = new URL("https://example.com/followers");
+  const federation = createFederation<void>();
+  const url = new URL("https://example.com/");
+
+  await t.step("createRequestContext()", async () => {
+    const unsigned = createRequestContext<void>({
+      url,
+      data: undefined,
+      federation,
+    });
+    assertEquals(
+      await unsigned.isSignedByAudience(new Note({ to: PUBLIC_COLLECTION })),
+      true,
+    );
+    assertEquals(
+      await unsigned.isSignedByAudience(new Note({ to: portableId })),
+      false,
+    );
+    const signed = createRequestContext<void>({
+      url,
+      data: undefined,
+      federation,
+      getSignedKeyOwner: () => Promise.resolve(signer),
+    });
+    assertEquals(
+      await signed.isSignedByAudience(new Note({ to: portableId })),
+      true,
+    );
+    // Malformed portable IDs are skipped rather than thrown on:
+    assertEquals(
+      await signed.isSignedByAudience(
+        new Note({
+          tos: [
+            new URL(
+              `https://example.com/.well-known/apgateway/${did}/actor` +
+                "?@gateway=https%3A%2F%2Fexample.com",
+            ),
+            new URL("ap+ef61://bad/actor"),
+            portableId,
+          ],
+        }),
+      ),
+      true,
+    );
+    assertEquals(
+      await signed.isSignedByAudience(new Note({ cc: followers })),
+      false,
+    );
+    assertEquals(
+      await signed.isSignedByAudience(new Note({ cc: followers }), {
+        isMember: (addressee) => addressee.href === followers.href,
+      }),
+      true,
+    );
+  });
+
+  await t.step("MockContext", async () => {
+    const context = federation.createContext(url, undefined);
+    assertEquals(
+      await context.isSignedByAudience(new Note({ cc: PUBLIC_COLLECTION })),
+      true,
+    );
+    assertEquals(
+      await context.isSignedByAudience(new Note({ to: portableId })),
+      false,
+    );
+  });
 });

@@ -1,3 +1,10 @@
+import { InboxObservation } from "./inbox-observation.ts";
+import type { InboxRequestFinishedHandler } from "./inbox-report.ts";
+import {
+  observeAttempt,
+  snapshotKey,
+  verificationObservation,
+} from "../sig/verification.ts";
 import type { AcceptSignatureParameters } from "@fedify/fedify/sig";
 import type { Recipient } from "@fedify/vocab";
 import {
@@ -6,13 +13,25 @@ import {
   CollectionPage,
   type CryptographicKey,
   getTypeId,
+  isActor,
   Link,
   Object,
   OrderedCollection,
   OrderedCollectionPage,
   Tombstone,
 } from "@fedify/vocab";
-import type { DocumentLoader } from "@fedify/vocab-runtime";
+import {
+  canonicalizePortableUri,
+  type DocumentLoader,
+  parseIri,
+} from "@fedify/vocab-runtime";
+import { isCompatibleEf61Iri } from "@fedify/vocab-runtime/internal/portable-dereference";
+import {
+  BodyTooLargeError,
+  MAX_BODY_SIZE,
+  readBoundedText,
+} from "../utils/body.ts";
+import jsonld from "@fedify/vocab-runtime/jsonld";
 import { getLogger } from "@logtape/logtape";
 import type {
   MeterProvider,
@@ -26,7 +45,14 @@ import { uniq } from "es-toolkit";
 import metadata from "../../deno.json" with { type: "json" };
 import { formatAcceptSignature } from "../sig/accept.ts";
 import {
+  inspectCompoundPortableObjectApplicability,
+  verifyCompoundPortableObjectProofs,
+  verifyServedPortableObjects,
+} from "../sig/compound-proof.ts";
+import {
+  listRequestSignatures,
   parseRfc9421SignatureInput,
+  selectRequestSignature,
   verifyRequestDetailed,
 } from "../sig/http.ts";
 import {
@@ -41,7 +67,26 @@ import {
   wrapContextLoaderForJsonLd,
 } from "../sig/ld.ts";
 import { doesActorOwnKey } from "../sig/owner.ts";
-import { verifyObject } from "../sig/proof.ts";
+import {
+  getCanonicalPortableId,
+  getPortableDid,
+  hasPortableActor,
+  isPortableId,
+  isPortableKeyId,
+  isSameObjectId,
+} from "../sig/portable-key-id.ts";
+import {
+  getCompactRootId,
+  getLocalFirstGateway,
+  warnCompatibleId,
+} from "./compatible-id-warning.ts";
+import {
+  InvalidPortableObjectIdError,
+  verifyObject,
+  verifyPortableObjectProof,
+  type VerifyPortableObjectProofResult,
+  verifyPortableObjectProofWithRoot,
+} from "../sig/proof.ts";
 import type {
   ActorDispatcher,
   AuthorizePredicate,
@@ -56,8 +101,10 @@ import type {
   ObjectAuthorizePredicate,
   ObjectDispatcher,
   OutboxListenerErrorHandler,
+  PortableCollectionOwnerMapper,
   UnverifiedActivityHandler,
 } from "./callback.ts";
+import { isPubliclyAddressedNode } from "./audience.ts";
 import type { PageItems } from "./collection.ts";
 import type {
   Context,
@@ -72,7 +119,7 @@ import type {
   IdempotencyStrategy,
   InboxChallengePolicy,
 } from "./federation.ts";
-import { routeActivity } from "./inbox.ts";
+import { routeActivity, type RouteActivityResult } from "./inbox.ts";
 import { KvKeyCache } from "./keycache.ts";
 import type { KvKey, KvStore } from "./kv.ts";
 import {
@@ -90,11 +137,24 @@ import {
 } from "./metrics.ts";
 import type { MessageQueue } from "./mq.ts";
 import { acceptsJsonLd } from "./negotiation.ts";
+import { PORTABLE_OBJECT_CONTENT_TYPE } from "./portable.ts";
+import {
+  coversDelivery,
+  type PortableInboxRecipient,
+  type PortableInboxSignature,
+} from "./portable-inbox.ts";
 import { hasMalformedKnownTemporalLiteral } from "./temporal.ts";
 
 export const rawInboxContextFactorySymbol: unique symbol = Symbol(
   "fedify.rawInboxContextFactory",
 );
+
+const INBOX_COMPOUND_PROOF_LIMITS = {
+  maxDepth: 64,
+  maxMaps: 10_000,
+  maxProofs: 32,
+  maxBytes: 10 * 1024 * 1024,
+} as const;
 
 function isRemoteContextLoadingFailure(error: unknown): boolean {
   return error instanceof Error &&
@@ -133,7 +193,7 @@ function isInvalidJsonLdError(error: unknown): error is Error {
 
 function isValidationTypeError(error: unknown): error is TypeError {
   return error instanceof TypeError &&
-    (/^(Invalid JSON-LD:|Invalid type:|Unexpected type:|Invalid @id:)/
+    (/^(Invalid JSON-LD:|Invalid type:|Unexpected type:|Invalid @id:|Invalid FEP-ef61 gateway:)/
       .test(error.message) ||
       isInvalidUrlTypeError(error));
 }
@@ -267,12 +327,366 @@ export async function handleObject<TContextData>(
     }
   }
   const jsonLd = await object.toJsonLd(context);
+  if (object instanceof Tombstone) {
+    return new Response(
+      request.method === "HEAD" ? null : JSON.stringify(jsonLd),
+      {
+        status: 410,
+        headers: {
+          "Content-Type": "application/activity+json",
+          Vary: "Accept",
+        },
+      },
+    );
+  }
+  await warnServedCompatibleObject(context, object, getCompactRootId(jsonLd));
   return new Response(JSON.stringify(jsonLd), {
     headers: {
       "Content-Type": "application/activity+json",
       Vary: "Accept",
     },
   });
+}
+
+/**
+ * Parameters for handling an FEP-ef61 portable object request.
+ * @template TContextData The context data to pass to the context.
+ */
+export interface PortableObjectHandlerParameters<TContextData>
+  extends ObjectHandlerParameters<TContextData> {
+  /**
+   * The canonical form of the requested portable ID.
+   */
+  canonicalId: string;
+
+  /**
+   * The kind of the dispatcher that serves the portable object.  Without
+   * an authorization predicate, an object dispatcher's object is served only
+   * if it is publicly addressed, unless it is an actor, whereas whatever
+   * the actor dispatcher returns is served, as actors have no audience.
+   */
+  kind: "actor" | "object";
+}
+
+/**
+ * Handles an FEP-ef61 gateway request for a portable object through an object
+ * dispatcher, or the actor dispatcher adapted to one.  The object is served
+ * only if its ID canonically matches the requested portable ID and it
+ * satisfies the FEP-ef61 proof policy.
+ *
+ * FEP-ef61 forbids serving a non-public object to anyone but its intended
+ * audience.  If the dispatcher has an authorization predicate, it decides who
+ * may retrieve the object, and the response is marked with
+ * `Cache-Control: private`, as it depends on the requester.  Otherwise, only
+ * a publicly addressed object is served, and any other object is responded
+ * to with `404 Not Found`, as if this server did not store it.  Actors, and
+ * anything the actor dispatcher returns, are exempt from the latter, as
+ * actors have no audience.
+ *
+ * A {@link Tombstone} is served with `410 Gone` if it has an Object Integrity
+ * Proof made with a key of the DID in its ID.  An unsigned tombstone cannot
+ * be served as a portable object, so the response is the same as for
+ * an object that this server does not store, i.e., `404 Not Found`.
+ * @template TContextData The context data to pass to the context.
+ * @param request The HTTP request.
+ * @param parameters The parameters for handling the portable object.
+ * @returns A promise that resolves to an HTTP response.
+ */
+export async function handlePortableObject<TContextData>(
+  request: Request,
+  {
+    values,
+    context,
+    objectDispatcher,
+    authorizePredicate,
+    canonicalId,
+    kind,
+    onNotFound,
+    onUnauthorized,
+  }: PortableObjectHandlerParameters<TContextData>,
+): Promise<Response> {
+  const logger = getLogger(["fedify", "federation", "object"]);
+  if (objectDispatcher == null) return await onNotFound(request);
+  const object = await objectDispatcher(context, values);
+  if (object == null) return await onNotFound(request);
+  if (!isRequestedPortableObject(object, canonicalId)) {
+    // This is also what happens when an application that does not serve
+    // portable objects receives a gateway request, so it is not a warning:
+    logger.debug(
+      "The object {objectId} does not match the requested portable object " +
+        "{portableId}.",
+      { objectId: object.id?.href, portableId: canonicalId },
+    );
+    return await onNotFound(request);
+  }
+  if (authorizePredicate != null) {
+    if (!await authorizePredicate(context, values)) {
+      return await onUnauthorized(request);
+    }
+  }
+  // The same memoized context loader is used to decide who may see
+  // the document and to verify its proofs, so that both see the same
+  // contexts even if the application's context loader is nondeterministic:
+  const contextLoader = getNormalizationContextLoader(context.contextLoader);
+  let jsonLd: unknown;
+  let root: Record<string, unknown> | null;
+  try {
+    jsonLd = await object.toJsonLd(context);
+    root = await expandJsonLdRoot(jsonLd, contextLoader);
+  } catch (error) {
+    logger.error(
+      "Failed to serialize the portable object {portableId}:\n{error}",
+      { portableId: canonicalId, error },
+    );
+    return portableObjectInternalServerError(request);
+  }
+  // The serialized document can differ from object.id, e.g., when the object
+  // keeps its signed JSON-LD but its id URL was mutated afterwards, so check
+  // the ID that is actually served too:
+  const servedId = root?.["@id"];
+  if (
+    root == null || typeof servedId !== "string" ||
+    !isRequestedPortableId(servedId, canonicalId)
+  ) {
+    logger.debug(
+      "The serialized object does not match the requested portable object " +
+        "{portableId}.",
+      { portableId: canonicalId },
+    );
+    return await onNotFound(request);
+  }
+  // Decides on the served document rather than the object, as the two can
+  // differ, and before verifying the proofs, so that a request that may not
+  // see the object can neither trigger the verification nor tell its result:
+  if (
+    authorizePredicate == null && kind === "object" && !isActor(object) &&
+    !isPubliclyAddressedNode(root)
+  ) {
+    logger.debug(
+      "Not serving the portable object {portableId}, as it is not publicly " +
+        "addressed and its object dispatcher has no authorization predicate; " +
+        "responding as if this server did not store the object.  Set " +
+        "an authorization predicate that checks if the request is signed by " +
+        "an actor in the object's audience to serve it.",
+      { portableId: canonicalId },
+    );
+    return await onNotFound(request);
+  }
+  let result: VerifyPortableObjectProofResult;
+  try {
+    result = await verifyPortableObjectProof(jsonLd, {
+      contextLoader,
+      documentLoader: context.documentLoader,
+      tracerProvider: context.tracerProvider,
+      meterProvider: context.meterProvider,
+    });
+  } catch (error) {
+    logger.error(
+      "Failed to verify the Object Integrity Proofs of the portable object " +
+        "{portableId}:\n{error}",
+      { portableId: canonicalId, error },
+    );
+    return portableObjectInternalServerError(request);
+  }
+  const tombstone = object instanceof Tombstone;
+  if (!result.verified) {
+    if (tombstone && result.reason.type === "missingProof") {
+      // An application may have no key left to sign the tombstone of
+      // a deleted portable object with, e.g., after the key was lost:
+      logger.debug(
+        "Not serving the tombstone of the portable object {portableId}, as " +
+          "it has no Object Integrity Proof; responding as if this server " +
+          "did not store the object.",
+        { portableId: canonicalId },
+      );
+      return await onNotFound(request);
+    }
+    // Unsecured collections and other core types are exempt from the proof
+    // policy, but a tombstone is never served without a proof:
+    if (
+      tombstone || (
+        result.reason.type !== "unsecuredCollection" &&
+        result.reason.type !== "unsupportedObjectType"
+      )
+    ) {
+      if (result.reason.type === "invalidGateways") {
+        logger.error(
+          "Refusing to serve the portable actor {portableId}, as its " +
+            "gateways property is missing, empty, or has an item that is " +
+            "not an HTTP(S) origin.  FEP-ef61 requires a portable actor to " +
+            "list at least one gateway where it can be retrieved.",
+          { portableId: canonicalId, reason: result.reason.type },
+        );
+      } else {
+        logger.error(
+          "Refusing to serve the portable object {portableId}, as it does " +
+            "not satisfy the FEP-ef61 proof policy: {reason}.  Portable " +
+            "actors, activities, objects, and tombstones need an Object " +
+            "Integrity Proof made with a key of the DID in their ID.",
+          { portableId: canonicalId, reason: result.reason.type },
+        );
+      }
+      return portableObjectInternalServerError(request);
+    }
+  }
+  if (!tombstone) await warnServedCompatibleObject(context, object, servedId);
+  const headers = new Headers({
+    "Content-Type": PORTABLE_OBJECT_CONTENT_TYPE,
+    Vary: "Accept",
+  });
+  // A response allowed by an authorization predicate may be denied to other
+  // requesters, so shared caches must not reuse it for them:
+  if (authorizePredicate != null) headers.set("Cache-Control", "private");
+  return new Response(
+    request.method === "HEAD" ? null : JSON.stringify(jsonLd),
+    { status: tombstone ? 410 : 200, headers },
+  );
+}
+
+async function warnServedCompatibleObject<TContextData>(
+  context: RequestContext<TContextData>,
+  object: Object,
+  serializedId: string | URL | null,
+): Promise<void> {
+  try {
+    // Actor dispatchers already check their own compatible IDs.
+    if (isActor(object)) return;
+    const id = typeof serializedId === "string"
+      ? parseIri(serializedId)
+      : serializedId ?? object.id;
+    if (id == null || !isCompatibleEf61Iri(id)) return;
+    const did = getPortableDid(id);
+    if (did == null) return;
+    const ownerIds = object instanceof Activity
+      ? object.actorIds
+      : object.attributionIds;
+    for (const ownerId of ownerIds) {
+      if (getPortableDid(ownerId) !== did) continue;
+      const gateway = await getLocalFirstGateway(context, ownerId, did);
+      if (gateway == null) continue;
+      warnCompatibleId(
+        id,
+        did,
+        gateway,
+        object instanceof Activity ? "activity" : "object",
+      );
+      break;
+    }
+  } catch (error) {
+    getLogger(["fedify", "federation", "object"]).debug(
+      "Could not check the first gateway of {objectId}: {error}",
+      { objectId: object.id?.href, error },
+    );
+  }
+}
+
+function isRequestedPortableObject(
+  object: Object,
+  canonicalId: string,
+): boolean {
+  // The ID may be either a portable ID or a compatible identifier, on any
+  // gateway; FEP-ef61 treats objects on different gateways as instances of
+  // the same object:
+  return object.id != null && getCanonicalPortableId(object.id) === canonicalId;
+}
+
+async function expandJsonLdRoot(
+  jsonLd: unknown,
+  contextLoader: DocumentLoader,
+): Promise<Record<string, unknown> | null> {
+  // Expands the document rather than reading its keys, since the document
+  // may be in the expanded form or alias @id and addressing properties
+  // differently:
+  const expanded = await jsonld.expand(jsonLd, {
+    documentLoader: contextLoader,
+    keepFreeFloatingNodes: true,
+  });
+  if (expanded.length !== 1) return null;
+  return expanded[0] as Record<string, unknown>;
+}
+
+function isRequestedPortableId(id: string, canonicalId: string): boolean {
+  if (!/^ap(?:\+ef61)?:\/\//i.test(id)) {
+    // A compatible identifier, which is an ordinary HTTP(S) URL:
+    return URL.canParse(id) &&
+      getCanonicalPortableId(new URL(id)) === canonicalId;
+  }
+  try {
+    // Canonicalizes the raw string, since the URL class would normalize
+    // the opaque path of a portable ID:
+    return canonicalizePortableUri(id) === canonicalId;
+  } catch (error) {
+    if (error instanceof TypeError) return false;
+    throw error;
+  }
+}
+
+function portableObjectInternalServerError(request: Request): Response {
+  return new Response(
+    request.method === "HEAD" ? null : "Internal server error.",
+    {
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    },
+  );
+}
+
+/**
+ * Checks the portable objects embedded in a portable collection or its page
+ * that is about to be served against the FEP-ef61 proof policy.  See
+ * `verifyServedPortableObjects()`.
+ * @returns `true` if the collection can be served.
+ */
+async function verifyPortableCollection<TContextData>(
+  jsonLd: unknown,
+  context: RequestContext<TContextData>,
+  portable: PortableCollectionRepresentation,
+): Promise<boolean> {
+  const logger = getLogger(["fedify", "federation", "collection"]);
+  try {
+    const result = await verifyServedPortableObjects(jsonLd, {
+      contextLoader: context.contextLoader,
+      documentLoader: context.documentLoader,
+      tracerProvider: context.tracerProvider,
+      meterProvider: context.meterProvider,
+    });
+    if (result.verified) return true;
+    logger.error(
+      "Refusing to serve the portable collection {collectionId}, as the " +
+        "portable object {objectId} it embeds at {path} does not satisfy the " +
+        "FEP-ef61 proof policy: {reason}.  Embedded portable actors, " +
+        "activities, and objects need an Object Integrity Proof made with " +
+        "a key of the DID in their ID, and their own @context.",
+      {
+        collectionId: portable.id.href,
+        objectId: result.id,
+        path: result.path,
+        reason: result.reason,
+      },
+    );
+  } catch (error) {
+    logger.error(
+      "Failed to verify the portable objects embedded in the portable " +
+        "collection {collectionId}:\n{error}",
+      { collectionId: portable.id.href, error },
+    );
+  }
+  return false;
+}
+
+function respondWithPortableCollection(
+  request: Request,
+  jsonLd: unknown,
+): Response {
+  return new Response(
+    request.method === "HEAD" ? null : JSON.stringify(jsonLd),
+    {
+      headers: {
+        "Content-Type": PORTABLE_OBJECT_CONTENT_TYPE,
+        Vary: "Accept",
+      },
+    },
+  );
 }
 
 /**
@@ -315,6 +729,24 @@ export interface CollectionCallbacks<
 }
 
 /**
+ * How an FEP-ef61 portable collection is represented when it is served
+ * through the gateway endpoint.
+ * @since 2.4.0
+ */
+export interface PortableCollectionRepresentation {
+  /** The ID of the collection. */
+  readonly id: URL;
+  /**
+   * The URI that the collection's pages are relative to: the collection's ID
+   * with the query parameters of the requested view, but without `cursor`.
+   * A page's ID is this URI with the page's `cursor`.
+   */
+  readonly view: URL;
+  /** The ID of the actor that owns the collection. */
+  readonly attribution: URL;
+}
+
+/**
  * Parameters for handling a collection request.
  * @template TItem The type of items in the collection.
  * @template TContext The type of the context, extending {@link RequestContext}.
@@ -339,6 +771,13 @@ export interface CollectionHandlerParameters<
     TContextData,
     TFilter
   >;
+  /**
+   * How to represent the collection when it is served as an FEP-ef61
+   * portable collection through the gateway endpoint.  If it is present,
+   * `uriGetter` is not used.
+   * @since 2.4.0
+   */
+  portable?: PortableCollectionRepresentation;
   tracerProvider?: TracerProvider;
   /**
    * The meter provider for recording collection metrics.
@@ -439,6 +878,7 @@ export async function handleCollection<
     filterPredicate,
     context,
     collectionCallbacks,
+    portable,
     tracerProvider,
     meterProvider,
     onUnauthorized,
@@ -474,8 +914,17 @@ export async function handleCollection<
     if (collectionCallbacks == null) {
       return finish(await onNotFound(request), "not_found");
     }
+    // A portable collection's owner is already resolved, so the request is
+    // authorized before anything is dispatched:
+    if (portable != null && collectionCallbacks.authorizePredicate != null) {
+      if (!await collectionCallbacks.authorizePredicate(context, identifier)) {
+        return finish(await onUnauthorized(request), "unauthorized");
+      }
+    }
     let collection: OrderedCollection | OrderedCollectionPage;
-    const baseUri = uriGetter(identifier);
+    const baseUri = portable?.id ?? uriGetter(identifier);
+    const pageBase = portable?.view ?? context.url;
+    const attribution = portable?.attribution ?? null;
     if (cursor == null) {
       const firstCursor = await collectionCallbacks.firstCursor?.(
         context,
@@ -542,7 +991,14 @@ export async function handleCollection<
         }
         collection = new OrderedCollection({
           id: baseUri,
-          totalItems: totalItemCount ?? null,
+          attribution,
+          // A portable collection is served without a proof, so consumers tell
+          // it from other objects by its collection properties (FEP-2277).
+          // Without a counter, an empty one would have none of them, but
+          // the dispatcher has returned all the items, so their number is
+          // the total:
+          totalItems: totalItemCount ??
+            (portable == null ? null : itemsOrResponse.length),
           items: itemsOrResponse,
         });
       } else {
@@ -550,22 +1006,23 @@ export async function handleCollection<
           context,
           identifier,
         );
-        const first = new URL(context.url);
+        const first = new URL(pageBase);
         first.searchParams.set("cursor", firstCursor);
         let last = null;
         if (lastCursor != null) {
-          last = new URL(context.url);
+          last = new URL(pageBase);
           last.searchParams.set("cursor", lastCursor);
         }
         collection = new OrderedCollection({
           id: baseUri,
+          attribution,
           totalItems: totalItemCount ?? null,
           first,
           last,
         });
       }
     } else {
-      const uri = new URL(baseUri);
+      const uri = new URL(portable == null ? baseUri : pageBase);
       uri.searchParams.set("cursor", cursor);
       const pageOrResponse = await tracer.startActiveSpan(
         `activitypub.dispatch_collection_page ${name}`,
@@ -619,25 +1076,26 @@ export async function handleCollection<
       const { items, prevCursor, nextCursor } = pageOrResponse;
       let prev = null;
       if (prevCursor != null) {
-        prev = new URL(context.url);
+        prev = new URL(pageBase);
         prev.searchParams.set("cursor", prevCursor);
       }
       let next = null;
       if (nextCursor != null) {
-        next = new URL(context.url);
+        next = new URL(pageBase);
         next.searchParams.set("cursor", nextCursor);
       }
-      const partOf = new URL(context.url);
+      const partOf = new URL(pageBase);
       partOf.searchParams.delete("cursor");
       collection = new OrderedCollectionPage({
         id: uri,
+        attribution,
         prev,
         next,
         items,
         partOf,
       });
     }
-    if (collectionCallbacks.authorizePredicate != null) {
+    if (portable == null && collectionCallbacks.authorizePredicate != null) {
       if (
         !await collectionCallbacks.authorizePredicate(context, identifier)
       ) {
@@ -645,6 +1103,11 @@ export async function handleCollection<
       }
     }
     const jsonLd = await collection.toJsonLd(context);
+    if (portable != null) {
+      return await verifyPortableCollection(jsonLd, context, portable)
+        ? finish(respondWithPortableCollection(request, jsonLd), "served")
+        : finish(portableObjectInternalServerError(request), "error");
+    }
     return finish(
       new Response(JSON.stringify(jsonLd), {
         headers: {
@@ -872,8 +1335,13 @@ export async function handleOutbox<TContextData>(
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   }
+  // Portable actor IDs are compared by their canonical forms, so that
+  // an actor referred to with location hints or through a compatible
+  // identifier still matches the outbox owner:
   if (
-    !activity.actorIds.every((actorId) => actorId.href === expectedActorId.href)
+    !activity.actorIds.every((actorId) =>
+      isSameObjectId(actorId, expectedActorId)
+    )
   ) {
     const error = new Error(
       "The activity actor does not match the outbox owner.",
@@ -1243,6 +1711,10 @@ export async function handleMediaUpload<TContextData>(
  * @template TContextData The context data to pass to the context.
  */
 export interface InboxHandlerParameters<TContextData> {
+  /** Internal ingress-owned observation. */
+  observation?: InboxObservation;
+  /** Observer for direct handleInbox callers. */
+  inboxRequestFinishedHandler?: InboxRequestFinishedHandler<TContextData>;
   recipient: string | null;
   context: RequestContext<TContextData>;
   inboxContextFactory(
@@ -1269,6 +1741,11 @@ export interface InboxHandlerParameters<TContextData> {
   unverifiedActivityHandler?: UnverifiedActivityHandler<TContextData>;
   onNotFound(request: Request): Response | Promise<Response>;
   signatureTimeWindow: Temporal.Duration | Temporal.DurationLike | false;
+  /**
+   * The maximum number of RFC 9421 signatures of a request to verify.
+   * @since 2.4.0
+   */
+  maxHttpSignatures?: number;
   skipSignatureVerification: boolean;
   inboxChallengePolicy?: InboxChallengePolicy;
   idempotencyStrategy?:
@@ -1280,6 +1757,34 @@ export interface InboxHandlerParameters<TContextData> {
    */
   meterProvider?: MeterProvider;
   tracerProvider?: TracerProvider;
+  /**
+   * Set if the request is a delivery to an FEP-ef61 portable inbox through
+   * the gateway endpoint, whose recipient has already been resolved.
+   */
+  portableInbox?: PortableInboxDelivery;
+}
+
+/**
+ * A delivery to an FEP-ef61 portable inbox through the gateway endpoint.
+ */
+export interface PortableInboxDelivery {
+  /** The portable actor that owns the inbox. */
+  readonly recipient: PortableInboxRecipient;
+
+  /**
+   * Forwards the received activity to the other gateways of the recipient.
+   * @param activity The activity, exactly as it was received.
+   * @param activityId The ID of the activity.
+   * @param activityType The qualified URI of the activity type.
+   * @param signatures The HTTP Signatures of the delivery, which may identify
+   *                   the gateway that forwarded it.
+   */
+  forward(
+    activity: unknown,
+    activityId: URL,
+    activityType: string,
+    signatures: readonly PortableInboxSignature[],
+  ): Promise<unknown>;
 }
 
 /**
@@ -1293,6 +1798,21 @@ export async function handleInbox<TContextData>(
   request: Request,
   options: InboxHandlerParameters<TContextData>,
 ): Promise<Response> {
+  if (options.observation == null) {
+    const observation = new InboxObservation({
+      kind: options.portableInbox != null
+        ? "portable"
+        : options.recipient == null
+        ? "shared"
+        : "personal",
+      recipient: options.recipient,
+    });
+    return await observation.runAndFinish(
+      () => options.context,
+      options.inboxRequestFinishedHandler,
+      () => handleInbox(request, { ...options, observation }),
+    );
+  }
   const tracerProvider = options.tracerProvider ?? trace.getTracerProvider();
   const tracer = tracerProvider.getTracer(metadata.name, metadata.version);
   return await tracer.startActiveSpan(
@@ -1308,9 +1828,11 @@ export async function handleInbox<TContextData>(
       try {
         return await handleInboxInternal(request, options, span);
       } catch (e) {
+        options.observation!.hasException = true;
         span.setStatus({ code: SpanStatusCode.ERROR, message: String(e) });
         throw e;
       } finally {
+        options.observation!.project(span);
         span.end();
       }
     },
@@ -1344,11 +1866,17 @@ async function handleInboxInternal<TContextData>(
     unverifiedActivityHandler,
     onNotFound,
     signatureTimeWindow,
+    maxHttpSignatures,
     skipSignatureVerification,
     inboxChallengePolicy,
     meterProvider,
     tracerProvider,
+    portableInbox,
   } = parameters;
+  const observation = parameters.observation!;
+  const signatureObservation = {
+    [verificationObservation]: observation.verification,
+  };
   const logger = getLogger(["fedify", "federation", "inbox"]);
   if (actorDispatcher == null) {
     logger.error("Actor dispatcher is not set.", { recipient });
@@ -1357,7 +1885,8 @@ async function handleInboxInternal<TContextData>(
       message: "Actor dispatcher is not set.",
     });
     return await onNotFound(request);
-  } else if (recipient != null) {
+  } else if (recipient != null && portableInbox == null) {
+    // The recipient of a portable inbox delivery has already been resolved.
     const actor = await actorDispatcher(ctx, recipient);
     if (actor == null || actor instanceof Tombstone) {
       logger.error("Actor {recipient} not found.", { recipient });
@@ -1369,6 +1898,7 @@ async function handleInboxInternal<TContextData>(
     }
   }
   if (request.bodyUsed) {
+    observation.result = { disposition: "failed", reason: "bodyUnavailable" };
     logger.error("Request body has already been read.", { recipient });
     span.setStatus({
       code: SpanStatusCode.ERROR,
@@ -1379,6 +1909,7 @@ async function handleInboxInternal<TContextData>(
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   } else if (request.body?.locked) {
+    observation.result = { disposition: "failed", reason: "bodyUnavailable" };
     logger.error("Request body is locked.", { recipient });
     span.setStatus({
       code: SpanStatusCode.ERROR,
@@ -1389,10 +1920,24 @@ async function handleInboxInternal<TContextData>(
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   }
+  observation.stage = "parse";
+  observation.result = { disposition: "rejected", reason: "invalidJson" };
   let json: unknown;
   try {
-    json = await request.clone().json();
+    json = JSON.parse(
+      await readBoundedText(
+        request.clone(),
+        MAX_BODY_SIZE,
+        request.url,
+      ),
+    );
   } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      observation.result = { disposition: "rejected", reason: "bodyTooLarge" };
+      void request.body?.cancel(error).catch(() => {});
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
+      return new Response("Inbox body too large.", { status: 413 });
+    }
     logger.error("Failed to parse JSON:\n{error}", { recipient, error });
     try {
       await inboxErrorHandler?.(ctx, error as Error);
@@ -1411,6 +1956,12 @@ async function handleInboxInternal<TContextData>(
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   }
+  observation.payload = {
+    status: "parsed",
+    value: structuredClone(json) as import("./inbox-report.ts").InboxJsonValue,
+  };
+  observation.result = { disposition: "rejected", reason: "invalidActivity" };
+  observation.stage = "verify";
   const keyCache = new KvKeyCache(kv, kvPrefixes.publicKey, {
     documentLoader: ctx.documentLoader,
     contextLoader: ctx.contextLoader,
@@ -1442,6 +1993,7 @@ async function handleInboxInternal<TContextData>(
       code: SpanStatusCode.ERROR,
       message: `Failed to parse activity:\n${error}`,
     });
+    observation.result = { disposition: "rejected", reason: "invalidActivity" };
     return new Response("Invalid activity.", {
       status: 400,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -1456,11 +2008,22 @@ async function handleInboxInternal<TContextData>(
     } catch (error) {
       if (isInvalidJsonLdError(error)) {
         logger.error("Failed to parse JSON-LD:\n{error}", { recipient, error });
+        observation.result = {
+          disposition: "rejected",
+          reason: "invalidJsonLd",
+        };
         return new Response("Invalid JSON-LD.", {
           status: 400,
           headers: { "Content-Type": "text/plain; charset=utf-8" },
         });
       }
+      observation.verification.attempts.push({
+        mechanism: "linkedData",
+        subject: { id: null, pointer: "" },
+        checks: [],
+        status: "error",
+        error,
+      });
       if (!canAttemptAlternateAuthAfterLdSignatureFailure) throw error;
       // The presence of a proof block or HTTP signature headers is not enough
       // to discard a transient LDS normalization failure.  Keep that error
@@ -1479,6 +2042,7 @@ async function handleInboxInternal<TContextData>(
       compactedJsonWithoutSig = detachSignature(compactedJson);
       try {
         ldSigVerified = await verifyCompactJsonLd(compactedJson, {
+          ...signatureObservation,
           contextLoader: ctx.contextLoader,
           documentLoader: ctx.documentLoader,
           keyCache,
@@ -1500,6 +2064,10 @@ async function handleInboxInternal<TContextData>(
             recipient,
             error,
           });
+          observation.result = {
+            disposition: "rejected",
+            reason: "invalidJsonLd",
+          };
           return new Response("Invalid JSON-LD.", {
             status: 400,
             headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -1528,6 +2096,10 @@ async function handleInboxInternal<TContextData>(
                 recipient,
                 error: parseError,
               });
+              observation.result = {
+                disposition: "rejected",
+                reason: "invalidJsonLd",
+              };
               return new Response("Invalid JSON-LD.", {
                 status: 400,
                 headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -1548,13 +2120,19 @@ async function handleInboxInternal<TContextData>(
   }
   let activity: Activity | null = null;
   let activityVerified = false;
+  // Whether the activity is authenticated by its Object Integrity Proofs,
+  // as opposed to Linked Data Signatures or HTTP Signatures:
+  let proofVerified = false;
   if (ldSigVerified) {
     logger.debug("Linked Data Signatures are verified.", { recipient, json });
     try {
-      activity = await Activity.fromJsonLd(compactedJsonWithoutSig, {
-        ...ctx,
-        contextLoader: getNormalizationContextLoader(ctx.contextLoader),
-      });
+      activity = observation.activity = await Activity.fromJsonLd(
+        compactedJsonWithoutSig,
+        {
+          ...ctx,
+          contextLoader: getNormalizationContextLoader(ctx.contextLoader),
+        },
+      );
     } catch (error) {
       if (
         error instanceof RangeError &&
@@ -1569,6 +2147,28 @@ async function handleInboxInternal<TContextData>(
       return await respondInvalidActivity(error);
     }
     activityVerified = true;
+    if (!skipSignatureVerification && isPortableActivity(activity)) {
+      // A Linked Data Signature never authenticates a portable actor's
+      // activity, nor a portable activity; only an Object Integrity Proof
+      // made by its DID does:
+      try {
+        proofVerified = await verifyObject(Activity, jsonWithoutSig, {
+          ...signatureObservation,
+          contextLoader: wrapContextLoaderForJsonLd(ctx.contextLoader),
+          documentLoader: ctx.documentLoader,
+          keyCache,
+          meterProvider,
+          tracerProvider,
+        }) != null;
+      } catch (error) {
+        if (!isPermanentActivityParseError(error)) throw error;
+        logger.debug(
+          "Failed to verify the Object Integrity Proofs of the portable " +
+            "actor's activity:\n{error}",
+          { recipient, error },
+        );
+      }
+    }
   } else {
     logger.debug(
       "Linked Data Signatures are not verified.",
@@ -1576,11 +2176,13 @@ async function handleInboxInternal<TContextData>(
     );
     try {
       activity = await verifyObject(Activity, jsonWithoutSig, {
+        ...signatureObservation,
         contextLoader: wrapContextLoaderForJsonLd(ctx.contextLoader),
         documentLoader: ctx.documentLoader,
         keyCache,
         meterProvider,
         tracerProvider,
+        verifyPortableObject: ctx.verifyPortableObject,
       });
     } catch (error) {
       if (
@@ -1621,6 +2223,10 @@ async function handleInboxInternal<TContextData>(
         code: SpanStatusCode.ERROR,
         message: `Failed to parse activity:\n${error}`,
       });
+      observation.result = {
+        disposition: "rejected",
+        reason: "invalidActivity",
+      };
       return new Response("Invalid activity.", {
         status: 400,
         headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -1637,6 +2243,7 @@ async function handleInboxInternal<TContextData>(
         { recipient, activity: json },
       );
       activityVerified = true;
+      proofVerified = true;
     }
   }
   let httpSigKey: CryptographicKey | null = null;
@@ -1646,15 +2253,25 @@ async function handleInboxInternal<TContextData>(
   if (activity == null) {
     if (!skipSignatureVerification) {
       const verification = await verifyRequestDetailed(request, {
+        ...signatureObservation,
         contextLoader: ctx.contextLoader,
         documentLoader: ctx.documentLoader,
         timeWindow: signatureTimeWindow,
+        maxSignatures: maxHttpSignatures,
         keyCache,
         meterProvider,
         tracerProvider,
       });
       if (verification.verified === false) {
         if (deferredLdSignatureError != null) throw deferredLdSignatureError;
+        observation.authentication = {
+          status: "rejected",
+          reason: { type: "verificationFailed" },
+        };
+        observation.result = {
+          disposition: "rejected",
+          reason: "authentication",
+        };
         const reason = verification.reason;
         const remoteHost = "keyId" in reason && reason.keyId != null
           ? getRemoteHost(reason.keyId)
@@ -1681,7 +2298,10 @@ async function handleInboxInternal<TContextData>(
           );
         }
         try {
-          activity = await Activity.fromJsonLd(jsonWithoutSig, ctx);
+          activity = observation.activity = await Activity.fromJsonLd(
+            jsonWithoutSig,
+            ctx,
+          );
         } catch (error) {
           logger.error("Failed to parse activity:\n{error}", {
             recipient,
@@ -1696,6 +2316,10 @@ async function handleInboxInternal<TContextData>(
               { error, activity: json, recipient },
             );
           }
+          observation.result = {
+            disposition: "rejected",
+            reason: "invalidActivity",
+          };
           return new Response("Invalid activity.", {
             status: 400,
             headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -1738,6 +2362,11 @@ async function handleInboxInternal<TContextData>(
             reason,
           );
         } catch (error) {
+          observation.result = {
+            disposition: "failed",
+            reason: "listenerError",
+            error,
+          };
           logger.error(
             "An unexpected error occurred in unverified activity handler:\n" +
               "{error}",
@@ -1757,7 +2386,10 @@ async function handleInboxInternal<TContextData>(
             kvPrefixes,
           );
         }
-        if (response instanceof Response) return response;
+        if (response instanceof Response) {
+          observation.result = { disposition: "customResponse" };
+          return response;
+        }
         return await getFailedSignatureResponse(
           inboxChallengePolicy,
           kv,
@@ -1777,15 +2409,21 @@ async function handleInboxInternal<TContextData>(
       httpSigKey = verification.key;
     }
     try {
-      activity = await Activity.fromJsonLd(jsonWithoutSig, {
-        ...ctx,
-        contextLoader: wrapContextLoaderForJsonLd(ctx.contextLoader),
-      });
+      activity = observation.activity = await Activity.fromJsonLd(
+        jsonWithoutSig,
+        {
+          ...ctx,
+          contextLoader: wrapContextLoaderForJsonLd(ctx.contextLoader),
+        },
+      );
     } catch (error) {
       if (!isPermanentActivityParseError(error)) throw error;
       return await respondInvalidActivity(error);
     }
   }
+  observation.activity = activity;
+  observation.stage = "policy";
+  observation.result = { disposition: "rejected", reason: "authentication" };
   if (activity.id != null) {
     span.setAttribute("activitypub.activity.id", activity.id.href);
   }
@@ -1801,9 +2439,127 @@ async function handleInboxInternal<TContextData>(
   });
 
   if (
+    !skipSignatureVerification && !proofVerified &&
+    (isPortableActivity(activity) || isPortableActorKey(httpSigKey))
+  ) {
+    // HTTP Signatures made with a portable actor's key only tell that one of
+    // its gateways or clients sent the request.  FEP-ef61 authenticates
+    // portable actors' activities by the Object Integrity Proofs of their
+    // DIDs alone.
+    // This comes before the key ownership check, which cannot change the
+    // outcome, so that such a request costs no further fetches:
+    if (deferredLdSignatureError != null) throw deferredLdSignatureError;
+    observation.authentication = {
+      status: "rejected",
+      reason: { type: "proofPolicy", policy: "portableActor" },
+    };
+    logger.error(
+      "The activity {activityId} of the portable actor {actorId} is not " +
+        "authenticated by a valid Object Integrity Proof.",
+      {
+        activity: json,
+        recipient,
+        activityId: activity.id?.href,
+        actorId: activity.actorId?.href,
+        keyId: httpSigKey?.id?.href,
+      },
+    );
+    span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: `The activity of the portable actor ` +
+        `(${activity.actorId?.href}) is not authenticated by a valid ` +
+        `Object Integrity Proof.`,
+    });
+    return new Response(
+      "Activities of portable actors must have valid Object Integrity " +
+        "Proofs.",
+      {
+        status: 401,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      },
+    );
+  }
+  if (
+    !skipSignatureVerification && activity.id != null &&
+    isPortableId(activity.id)
+  ) {
+    // The proofs above authenticate the activity's actors, but not its own
+    // ID.  The ID of a portable activity, including a compatible identifier,
+    // has to belong to the DID that signed it, which the proof policy checks
+    // on the same document the proofs were verified for:
+    const rejection = await observeAttempt(
+      signatureObservation,
+      "objectIntegrity",
+      async (verification) => {
+        const rejection = await verifyPortableActivityId(
+          activity.id!,
+          jsonWithoutSig,
+          {
+            [verificationObservation]: verification,
+            contextLoader: wrapContextLoaderForJsonLd(ctx.contextLoader),
+            documentLoader: ctx.documentLoader,
+            keyCache,
+            meterProvider,
+            tracerProvider,
+          },
+        );
+        if (rejection != null) {
+          verification.attempt!.reason = {
+            type: "proofPolicy",
+            reason: rejection,
+          };
+        }
+        return rejection;
+      },
+      (value) => value == null,
+    );
+    if (rejection != null) {
+      if (deferredLdSignatureError != null) throw deferredLdSignatureError;
+      observation.authentication = {
+        status: "rejected",
+        reason: {
+          type: "proofPolicy",
+          policy: "portableActivity",
+          detail: rejection,
+        },
+      };
+      logger.error(
+        "The portable activity {activityId} is not authenticated by an " +
+          "Object Integrity Proof of its own DID: {reason}",
+        {
+          activity: json,
+          recipient,
+          activityId: activity.id.href,
+          reason: rejection.type,
+        },
+      );
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: `The portable activity (${activity.id.href}) is not ` +
+          `authenticated by an Object Integrity Proof of its own DID.`,
+      });
+      return new Response(
+        "Portable activities must have valid Object Integrity Proofs made " +
+          "by their own DIDs.",
+        {
+          status: 401,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        },
+      );
+    }
+  }
+  if (
     httpSigKey != null && !await doesActorOwnKey(activity, httpSigKey, ctx)
   ) {
     if (deferredLdSignatureError != null) throw deferredLdSignatureError;
+    observation.authentication = {
+      status: "rejected",
+      reason: {
+        type: "actorKeyMismatch",
+        key: snapshotKey(httpSigKey),
+        actorIds: activity.actorIds.map((id) => new URL(id.href)),
+      },
+    };
     getFederationMetrics(parameters.meterProvider)
       .recordSignatureVerificationFailure(
         "actorKeyMismatch",
@@ -1828,6 +2584,82 @@ async function handleInboxInternal<TContextData>(
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   }
+  if (!skipSignatureVerification) {
+    // A Linked Data Signature is made after the Object Integrity Proofs, so
+    // the top-level signature is excluded from their verification, as it is
+    // for verifyObject() above.  A signature property of an embedded map is
+    // kept, since it is part of what that map's own proof covers:
+    const compoundJson = Array.isArray(json) ? json : jsonWithoutSig;
+    const compoundApplicability = inspectCompoundPortableObjectApplicability(
+      compoundJson,
+      INBOX_COMPOUND_PROOF_LIMITS,
+    );
+    if (compoundApplicability !== "absent") {
+      const compoundProof = await observeAttempt(
+        signatureObservation,
+        "objectIntegrity",
+        async (verification) => {
+          const result = await verifyCompoundPortableObjectProofs(
+            compoundJson,
+            INBOX_COMPOUND_PROOF_LIMITS,
+            {
+              [verificationObservation]: verification,
+              documentLoader: ctx.documentLoader,
+              keyCache,
+              meterProvider,
+              tracerProvider,
+            },
+          );
+          if (result.status === "unsupported") {
+            verification.attempt!.reason = {
+              type: "proofPolicy",
+              reason: result.reason,
+            };
+          } else if (!result.verified) {
+            const failed = result.portableObjects.find((object) =>
+              !object.verified
+            );
+            verification.attempt!.reason = {
+              type: "proofPolicy",
+              reason: failed?.verified === false
+                ? failed.reason
+                : { type: "invalidProof" },
+            };
+          }
+          return result;
+        },
+        (result) => result.status === "ok" && result.verified,
+      );
+      if (compoundProof.status !== "ok" || !compoundProof.verified) {
+        observation.authentication = {
+          status: "rejected",
+          reason: { type: "proofPolicy", policy: "compound" },
+        };
+        logger.error(
+          "Failed to verify compound portable Object Integrity Proofs.",
+          {
+            recipient,
+            activity: json,
+            reason: compoundProof.status === "unsupported"
+              ? compoundProof.reason.type
+              : "invalidProof",
+          },
+        );
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message:
+            "Failed to verify compound portable Object Integrity Proofs.",
+        });
+        return new Response(
+          "Failed to verify compound portable Object Integrity Proofs.",
+          {
+            status: 401,
+            headers: { "Content-Type": "text/plain; charset=utf-8" },
+          },
+        );
+      }
+    }
+  }
   // Perform deferred nonce verification now that actor/key ownership is confirmed.
   if (pendingNonceLabel != null) {
     const nonceValid = await verifySignatureNonce(
@@ -1837,6 +2669,10 @@ async function handleInboxInternal<TContextData>(
       pendingNonceLabel,
     );
     if (!nonceValid) {
+      observation.authentication = {
+        status: "rejected",
+        reason: { type: "invalidNonce" },
+      };
       getFederationMetrics(parameters.meterProvider)
         .recordSignatureVerificationFailure(
           "invalidNonce",
@@ -1853,6 +2689,17 @@ async function handleInboxInternal<TContextData>(
       );
     }
   }
+  observation.authentication = skipSignatureVerification
+    ? { status: "skipped" }
+    : {
+      status: "verified",
+      attempts: observation.verification.attempts.filter((
+        attempt,
+      ): attempt is Extract<typeof attempt, { status: "verified" }> =>
+        attempt.status === "verified"
+      ),
+    };
+  observation.stage = "dispatch";
   const routeResult = await routeActivity({
     context: ctx,
     // Direct handleInbox() consumers may later forward the payload from the
@@ -1885,7 +2732,14 @@ async function handleInboxInternal<TContextData>(
         [rawInboxContextFactorySymbol]?: typeof inboxContextFactory;
       })[rawInboxContextFactorySymbol]
       : undefined,
-    inboxErrorHandler,
+    inboxErrorHandler: async (context, error) => {
+      observation.result = {
+        disposition: "failed",
+        reason: "listenerError",
+        error,
+      };
+      await inboxErrorHandler?.(context, error);
+    },
     kv,
     kvPrefixes,
     queue,
@@ -1894,7 +2748,72 @@ async function handleInboxInternal<TContextData>(
     tracerProvider,
     idempotencyStrategy: parameters.idempotencyStrategy,
   });
+  if (
+    portableInbox != null && activity.id != null &&
+    PORTABLE_INBOX_FORWARDABLE_RESULTS.has(routeResult)
+  ) {
+    // A Linked Data Signature never authenticates a portable actor's activity,
+    // but such an activity has been rejected above unless its Object
+    // Integrity Proof is verified:
+    if (skipSignatureVerification || !(ldSigVerified || proofVerified)) {
+      // The other gateways could not authenticate the activity, as the HTTP
+      // Signatures of forwarded requests, if any, are made by this gateway,
+      // not by the activity's actor, and with
+      // skipSignatureVerification, the FEP-ef61 proof policy has not been
+      // applied to the portable objects in the activity:
+      logger.debug(
+        "Not forwarding activity {activityId} to the other gateways of " +
+          "the portable inbox {inbox}, as it is not authenticated by its " +
+          "own proof.",
+        {
+          activityId: activity.id.href,
+          inbox: portableInbox.recipient.canonicalInboxId,
+        },
+      );
+    } else {
+      try {
+        await portableInbox.forward(
+          json,
+          activity.id,
+          getTypeId(activity).href,
+          // Signatures beyond the limit are ignored here as well, so that
+          // they cannot identify the sending gateway either:
+          listRequestSignatures(request, maxHttpSignatures).map((
+            signature,
+          ) => ({
+            keyId: signature.keyId,
+            coversDelivery: coversDelivery(signature),
+            verify: async () => {
+              const verification = await verifyRequestDetailed(
+                selectRequestSignature(request, signature),
+                {
+                  contextLoader: ctx.contextLoader,
+                  documentLoader: ctx.documentLoader,
+                  timeWindow: signatureTimeWindow,
+                  keyCache,
+                  meterProvider,
+                  tracerProvider,
+                },
+              );
+              return verification.verified ? verification.key : null;
+            },
+          })),
+        );
+      } catch (error) {
+        logger.error(
+          "Failed to forward activity {activityId} to the other gateways of " +
+            "the portable inbox {inbox}:\n{error}",
+          {
+            activityId: activity.id.href,
+            inbox: portableInbox.recipient.canonicalInboxId,
+            error,
+          },
+        );
+      }
+    }
+  }
   if (routeResult === "alreadyProcessed") {
+    observation.result = { disposition: "duplicate" };
     return new Response(
       `Activity <${activity.id}> has already been processed.`,
       {
@@ -1903,16 +2822,19 @@ async function handleInboxInternal<TContextData>(
       },
     );
   } else if (routeResult === "missingActor") {
+    observation.result = { disposition: "rejected", reason: "missingActor" };
     return new Response("Missing actor.", {
       status: 400,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   } else if (routeResult === "enqueued") {
+    observation.result = { disposition: "enqueued" };
     return new Response("Activity is enqueued.", {
       status: 202,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   } else if (routeResult === "unsupportedActivity") {
+    observation.result = { disposition: "unhandled" };
     return new Response("", {
       status: 202,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -1923,12 +2845,23 @@ async function handleInboxInternal<TContextData>(
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   } else {
+    observation.result = { disposition: "processed" };
     return new Response("", {
       status: 202,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   }
 }
+
+// The results of routeActivity() for which a delivery to a portable inbox is
+// accepted, and therefore forwarded to the other gateways:
+const PORTABLE_INBOX_FORWARDABLE_RESULTS: ReadonlySet<RouteActivityResult> =
+  new Set<RouteActivityResult>([
+    "success",
+    "enqueued",
+    "alreadyProcessed",
+    "unsupportedActivity",
+  ]);
 
 /**
  * Callbacks for handling a custom collection.
@@ -1976,6 +2909,13 @@ export interface CustomCollectionCallbacks<
     TContextData,
     TParam
   >;
+
+  /**
+   * A callback that maps the custom collection to the identifier of the actor
+   * that owns it, for serving it as an FEP-ef61 portable collection.
+   * @since 2.4.0
+   */
+  portableOwnerMapper?: PortableCollectionOwnerMapper<TContextData, TParam>;
 }
 
 /**
@@ -2002,6 +2942,12 @@ export interface CustomCollectionHandlerParameters<
     TContext,
     TContextData
   >;
+  /**
+   * How to represent the collection when it is served as an FEP-ef61
+   * portable collection through the gateway endpoint.
+   * @since 2.4.0
+   */
+  portable?: PortableCollectionRepresentation;
   tracerProvider?: TracerProvider;
   /**
    * The meter provider for recording collection metrics.
@@ -2098,6 +3044,7 @@ async function _handleCustomCollection<
     meterProvider,
     collectionCallbacks: callbacks,
     filterPredicate,
+    portable,
   }: CustomCollectionHandlerParameters<
     TItem,
     TParam,
@@ -2118,21 +3065,9 @@ async function _handleCustomCollection<
     Collection,
     CollectionPage,
     filterPredicate,
+    portable,
   ).fetchCollection(cursor);
-  try {
-    const response = await handler.toJsonLd().then(respondAsActivity);
-    handler.recordPendingCollectionMetrics("served", response);
-    return response;
-  } catch (e) {
-    if (
-      !deferPendingCollectionMetrics(
-        e,
-        (result, response) =>
-          handler.recordPendingCollectionMetrics(result, response),
-      )
-    ) handler.recordPendingCollectionMetrics("error");
-    throw e;
-  }
+  return await respondWithCustomCollection(request, handler, context, portable);
 }
 
 /**
@@ -2175,6 +3110,7 @@ async function _handleOrderedCollection<
     meterProvider,
     collectionCallbacks: callbacks,
     filterPredicate,
+    portable,
   }: CustomCollectionHandlerParameters<
     TItem,
     TParam,
@@ -2195,9 +3131,25 @@ async function _handleOrderedCollection<
     OrderedCollection,
     OrderedCollectionPage,
     filterPredicate,
+    portable,
   ).fetchCollection(cursor);
+  return await respondWithCustomCollection(request, handler, context, portable);
+}
+
+async function respondWithCustomCollection<TContextData>(
+  request: Request,
+  // deno-lint-ignore no-explicit-any
+  handler: CustomCollectionHandler<any, any, TContextData, any, any, any>,
+  context: RequestContext<TContextData>,
+  portable: PortableCollectionRepresentation | undefined,
+): Promise<Response> {
   try {
-    const response = await handler.toJsonLd().then(respondAsActivity);
+    const jsonLd = await handler.toJsonLd();
+    let response: Response;
+    if (portable == null) response = respondAsActivity(jsonLd);
+    else if (await verifyPortableCollection(jsonLd, context, portable)) {
+      response = respondWithPortableCollection(request, jsonLd);
+    } else throw new PortableCollectionRefusedError();
     handler.recordPendingCollectionMetrics("served", response);
     return response;
   } catch (e) {
@@ -2289,13 +3241,22 @@ class CustomCollectionHandler<
     private readonly Collection: ConstructorWithTypeId<TCollection>,
     private readonly CollectionPage: ConstructorWithTypeId<TCollectionPage>,
     private readonly filterPredicate?: (item: TItem) => boolean,
+    private readonly portable?: PortableCollectionRepresentation,
   ) {
     this.name = this.name.trim().replace(/\s+/g, "_");
     this.#tracer = this.tracerProvider.getTracer(
       metadata.name,
       metadata.version,
     );
-    this.#id = new URL(this.context.url);
+    if (portable == null) this.#id = new URL(this.context.url);
+    else {
+      // The ID of a portable collection or its page is built from the view,
+      // not from the gateway request URL:
+      const cursor = this.context.url.searchParams.get("cursor");
+      this.#id = cursor == null
+        ? new URL(portable.view)
+        : appendCursorIfExists(portable.view, cursor);
+    }
     this.#dispatcher = callbacks.dispatcher.bind(callbacks);
   }
 
@@ -2354,6 +3315,7 @@ class CustomCollectionHandler<
     this.recordPendingCollectionItemCount(true, items.length);
     return {
       id,
+      attribution: this.portable?.attribution ?? null,
       partOf,
       items,
       prev: this.appendToUrl(prevCursor),
@@ -2381,6 +3343,7 @@ class CustomCollectionHandler<
     }
     return {
       id: this.#id,
+      attribution: this.portable?.attribution ?? null,
       first: this.appendToUrl(firstCursor),
       last: this.appendToUrl(lastCursor),
       totalItems,
@@ -2398,6 +3361,7 @@ class CustomCollectionHandler<
     this.recordPendingCollectionItemCount(false, items.length);
     return {
       id: this.#id,
+      attribution: this.portable?.attribution ?? null,
       totalItems,
       items,
     };
@@ -2567,7 +3531,10 @@ class CustomCollectionHandler<
   appendToUrl<Cursor extends string | null | undefined>(
     cursor: Cursor,
   ): Cursor extends string ? URL : null {
-    return appendCursorIfExists(this.context.url, cursor);
+    return appendCursorIfExists(
+      this.portable?.view ?? this.context.url,
+      cursor,
+    );
   }
 
   /**
@@ -2669,6 +3636,15 @@ function exceptWrapper<TParams extends ErrorHandlers>(
           recordCollectionRequest(
             meterProvider,
             collectionAttributes(metricBase, "not_found", response),
+          );
+          return response;
+        }
+        case PortableCollectionRefusedError: {
+          const response = portableObjectInternalServerError(request);
+          recordDeferredPendingCollectionMetrics(error, "error", response);
+          recordCollectionRequest(
+            meterProvider,
+            collectionAttributes(metricBase, "error", response),
           );
           return response;
         }
@@ -2818,6 +3794,17 @@ class ItemsNotFoundError extends HandlerError {
 class UnauthorizedError extends HandlerError {
   constructor() {
     super("Unauthorized access to the collection.");
+  }
+}
+
+/**
+ * Error thrown when a portable collection is not served because it embeds
+ * portable objects that do not satisfy the FEP-ef61 proof policy.
+ * @since 2.4.0
+ */
+class PortableCollectionRefusedError extends HandlerError {
+  constructor() {
+    super("The portable collection embeds unverifiable portable objects.");
   }
 }
 
@@ -2989,3 +3976,67 @@ const MIN_COMPONENTS = [
   "@target-uri",
   "@authority",
 ];
+
+/**
+ * Checks whether an HTTP Signature key is a key of an FEP-ef61 portable
+ * actor, i.e., its ID is a compatible identifier or an `ap:` or `ap+ef61:`
+ * URI, and it is owned by a portable actor, which only the portable actor's
+ * signed document can establish.
+ */
+function isPortableActorKey(key: CryptographicKey | null): boolean {
+  return key?.id != null && isPortableKeyId(key.id) &&
+    key.ownerId != null && isPortableId(key.ownerId);
+}
+
+/**
+ * Checks whether an activity needs an Object Integrity Proof by its DID:
+ * either it is performed by an [FEP-ef61] portable actor, or its own ID is
+ * portable.  Both `ap:` URIs and compatible identifiers count as portable.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
+ */
+function isPortableActivity(activity: Activity): boolean {
+  return hasPortableActor(activity) ||
+    activity.id != null && isPortableId(activity.id);
+}
+
+/**
+ * Verifies that a portable activity's own ID belongs to the DID that signed
+ * it, on the JSON-LD document received.  The ID the proof policy checks has
+ * to be the parsed activity's ID, so that a remote context that changes
+ * between loads cannot make the two name different objects.
+ * @returns `null` if the ID is verified, or the reason why it is not.
+ */
+async function verifyPortableActivityId(
+  activityId: URL,
+  jsonLd: unknown,
+  options: Parameters<typeof verifyPortableObjectProofWithRoot>[1],
+): Promise<
+  import("../sig/verification.ts").InboxProofPolicyFailureReason | null
+> {
+  const expectedId = getCanonicalPortableId(activityId);
+  if (expectedId == null) return { type: "invalidObjectId" };
+  let verification: Awaited<
+    ReturnType<typeof verifyPortableObjectProofWithRoot>
+  >;
+  try {
+    verification = await verifyPortableObjectProofWithRoot(jsonLd, options);
+  } catch (error) {
+    if (error instanceof InvalidPortableObjectIdError) {
+      return { type: "invalidObjectId" };
+    }
+    if (!isPermanentActivityParseError(error)) throw error;
+    return { type: "invalidDocument" };
+  }
+  const { result, root } = verification;
+  if (!result.verified) return result.reason;
+  // The proof policy has already validated the ID of a verified document:
+  const rootId = root?.["@id"];
+  if (
+    typeof rootId !== "string" ||
+    getCanonicalPortableId(parseIri(rootId)) !== expectedId
+  ) {
+    return { type: "subjectMismatch" };
+  }
+  return null;
+}

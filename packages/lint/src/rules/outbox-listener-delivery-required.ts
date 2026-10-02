@@ -11,12 +11,18 @@ import type {
   AssignmentPattern,
   CallExpression,
   Expression,
-  FunctionNode,
   Identifier,
   Node,
   VariableDeclarator,
 } from "../lib/types.ts";
 
+import {
+  collectNestedFunctions,
+  collectReachableStatements,
+  computeUsedFunctions,
+  type FunctionLikeNode,
+  getRange,
+} from "../lib/reachability.ts";
 const MESSAGE =
   "Outbox listeners should deliver posted activities explicitly with ctx.sendActivity() or ctx.forwardActivity().";
 
@@ -43,19 +49,10 @@ const isChainedFromOutboxListeners = (
 
 const DELIVERY_METHOD_NAMES = new Set(["sendActivity", "forwardActivity"]);
 
-type FunctionLikeNode =
-  | FunctionNode
-  | (Node & {
-    type: "FunctionDeclaration";
-    id: Identifier | null;
-    params: unknown[];
-    body: unknown;
-  });
-
 const getMemberPropertyName = (expr: Expression): string | null => {
   if (expr.type !== "MemberExpression") return null;
   const property = expr.property as Node;
-  if (property.type === "Identifier") return property.name;
+  if (property.type === "Identifier" && !expr.computed) return property.name;
   if (property.type === "Literal" && typeof property.value === "string") {
     return property.value;
   }
@@ -69,6 +66,222 @@ function unwrapContextParam(node: Node | undefined): Node | null {
   }
   return current;
 }
+
+// Both linters attach parent links before the exit visitor runs.
+const getParent = (node: Node): Node | null =>
+  (node as Node & { parent?: Node }).parent ?? null;
+
+const isFunctionLike = (node: Node): node is FunctionLikeNode =>
+  node.type === "FunctionDeclaration" || isFunction(node as Expression);
+
+interface Binding {
+  value: Node | null;
+  initializedVariable?: boolean;
+}
+
+type Bindings = Map<string, Binding>;
+
+function bindPattern(node: Node, bindings: Bindings): void {
+  switch (node.type) {
+    case "Identifier":
+      bindings.set(node.name, { value: null });
+      break;
+    case "AssignmentPattern":
+      bindPattern(node.left as Node, bindings);
+      break;
+    case "RestElement":
+      bindPattern(node.argument as Node, bindings);
+      break;
+    case "ObjectPattern":
+      for (const property of node.properties) {
+        bindPattern(
+          property.type === "Property"
+            ? property.value as Node
+            : property as Node,
+          bindings,
+        );
+      }
+      break;
+    case "ArrayPattern":
+      for (const element of node.elements) {
+        if (element != null) bindPattern(element as Node, bindings);
+      }
+      break;
+  }
+}
+
+function createBindingIndex() {
+  const scopes = new Map<Node, Bindings>();
+  const scopeBindings = (scope: Node): Bindings => {
+    let bindings = scopes.get(scope);
+    if (bindings == null) {
+      bindings = new Map();
+      scopes.set(scope, bindings);
+      if (isFunctionLike(scope)) {
+        if (scope.type === "FunctionExpression" && scope.id != null) {
+          bindings.set(scope.id.name, { value: scope });
+        }
+        for (const param of scope.params) bindPattern(param as Node, bindings);
+      }
+      if (scope.type === "ClassExpression" && scope.id != null) {
+        bindings.set(scope.id.name, { value: null });
+      }
+      if (scope.type === "CatchClause" && scope.param != null) {
+        bindPattern(scope.param as Node, bindings);
+      }
+    }
+    return bindings;
+  };
+
+  const enclosingScope = (node: Node, functionScope = false): Node => {
+    let scope = getParent(node)!;
+    while (
+      scope.type !== "Program" && scope.type !== "StaticBlock" &&
+      scope.type !== "TSModuleBlock" &&
+      !isFunctionLike(scope) &&
+      (functionScope || ![
+        "BlockStatement",
+        "ForStatement",
+        "ForInStatement",
+        "ForOfStatement",
+        "SwitchStatement",
+        "CatchClause",
+      ].includes(scope.type))
+    ) scope = getParent(scope)!;
+    return scope;
+  };
+
+  const lookup = (node: Node, name: string): Binding | null => {
+    for (
+      let scope: Node | null = node;
+      scope != null;
+      scope = getParent(scope)
+    ) {
+      const binding = scopeBindings(scope).get(name);
+      if (binding != null) return binding;
+    }
+    return null;
+  };
+
+  return {
+    lookup,
+    declare(node: Node, pattern: Node, value: Node | null, hoisted = false) {
+      const bindings = scopeBindings(enclosingScope(node, hoisted));
+      if (pattern.type === "Identifier") {
+        // An uninitialized var redeclaration does not replace its value.
+        if (hoisted && value == null && bindings.has(pattern.name)) return;
+        // Function declarations hoist before variable initializers execute.
+        if (
+          node.type === "FunctionDeclaration" &&
+          bindings.get(pattern.name)?.initializedVariable
+        ) return;
+        bindings.set(pattern.name, {
+          value,
+          initializedVariable: node.type === "VariableDeclarator" &&
+            value != null,
+        });
+      } else bindPattern(pattern, bindings);
+    },
+  };
+}
+
+type BindingIndex = ReturnType<typeof createBindingIndex>;
+
+const position = (node: Node): number =>
+  (node as Node & { range?: [number, number]; start?: number }).range?.[0] ??
+    (node as Node & { start?: number }).start ?? -1;
+
+const enclosingFunction = (node: Node): FunctionLikeNode | null => {
+  for (
+    let parent = getParent(node);
+    parent != null;
+    parent = getParent(parent)
+  ) {
+    if (isFunctionLike(parent)) return parent;
+  }
+  return null;
+};
+
+const isInside = (node: Node, ancestor: Node): boolean => {
+  for (
+    let current: Node | null = node;
+    current != null;
+    current = getParent(current)
+  ) {
+    if (current === ancestor) return true;
+  }
+  return false;
+};
+
+// Only unconditional statements in a function body establish call order.
+const isDirectStatement = (node: Node, fn: FunctionLikeNode): boolean => {
+  let current = node;
+  while (getParent(current) !== fn.body) {
+    const parent = getParent(current);
+    if (
+      parent == null ||
+      ![
+        "AwaitExpression",
+        "ExpressionStatement",
+        "ReturnStatement",
+        "VariableDeclarator",
+        "VariableDeclaration",
+        "BlockStatement",
+      ].includes(parent.type)
+    ) {
+      return false;
+    }
+    current = parent;
+  }
+  return [
+    "ExpressionStatement",
+    "ReturnStatement",
+    "VariableDeclaration",
+    "BlockStatement",
+  ]
+    .includes(current.type);
+};
+
+const resolveBindingValue = (
+  expr: Node,
+  bindings: BindingIndex,
+  seen = new Set<Binding>(),
+): Node | null => {
+  if (expr.type !== "Identifier") return expr;
+  const binding = bindings.lookup(expr, expr.name);
+  if (binding == null || binding.value == null || seen.has(binding)) {
+    return null;
+  }
+  seen.add(binding);
+  // Follow aliases at their declaration, rather than in the caller's scope.
+  return resolveBindingValue(binding.value, bindings, seen);
+};
+
+const resolveListenerReference = (
+  expr: Expression,
+  bindings: BindingIndex,
+): FunctionLikeNode | null => {
+  const target = resolveBindingValue(expr as Node, bindings);
+  if (target == null) return null;
+  if (isFunctionLike(target)) return target;
+  if (target.type !== "MemberExpression") return null;
+  const object = resolveBindingValue(target.object as Node, bindings);
+  if (object?.type !== "ObjectExpression") return null;
+  const propertyName = getMemberPropertyName(target);
+  if (propertyName == null) return null;
+  for (const prop of object.properties) {
+    if (prop.type !== "Property") continue;
+    const keyName = prop.key.type === "Identifier" && !prop.computed
+      ? prop.key.name
+      : prop.key.type === "Literal" && typeof prop.key.value === "string"
+      ? prop.key.value
+      : null;
+    if (keyName !== propertyName) continue;
+    const value = resolveBindingValue(prop.value as Node, bindings);
+    if (value != null && isFunctionLike(value)) return value;
+  }
+  return null;
+};
 
 function escapeRegExp(value: string): string {
   return value.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -219,68 +432,308 @@ function buildContextExpressionPattern(contextName: string): string {
     .raw`(?:${boundedName}|\(\s*${boundedName}(?:\s+as\s+[^)]+)?\s*\))`;
 }
 
-const resolveListenerReference = (
-  expr: Expression,
-  bindings: Map<string, unknown>,
-  seen = new Set<string>(),
-): FunctionLikeNode | null => {
-  if (isFunction(expr)) return expr;
-  if (expr.type === "Identifier") {
-    if (seen.has(expr.name)) return null;
-    seen.add(expr.name);
-    const binding = bindings.get(expr.name);
-    if (binding == null || !isNode(binding)) return null;
-    if (
-      isFunction(binding as Expression) ||
-      (binding as { type?: string }).type === "FunctionDeclaration"
-    ) {
-      return binding as FunctionLikeNode;
-    }
-    if (binding.type === "Identifier") {
-      return resolveListenerReference(binding, bindings, seen);
-    }
-    return null;
-  }
-  if (
-    expr.type === "MemberExpression" && expr.object.type === "Identifier" &&
-    !expr.computed
-  ) {
-    const binding = bindings.get(expr.object.name);
-    if (
-      binding == null || !isNode(binding) || binding.type !== "ObjectExpression"
-    ) {
-      return null;
-    }
-    const propertyName = getMemberPropertyName(expr);
-    if (propertyName == null) return null;
-    for (const prop of binding.properties) {
-      if (!isNode(prop) || prop.type !== "Property") continue;
-      const keyName = prop.key.type === "Identifier"
-        ? prop.key.name
-        : prop.key.type === "Literal" && typeof prop.key.value === "string"
-        ? prop.key.value
-        : null;
-      if (keyName !== propertyName || !isNode(prop.value)) continue;
-      const value = prop.value as unknown;
-      if (
-        isFunction(value as Expression) ||
-        (value as { type?: string }).type === "FunctionDeclaration"
-      ) {
-        return value as FunctionLikeNode;
+/**
+ * Builds the source text to scan for a delivery call: the reachable
+ * statements of `root`, with every nested function literal either folded
+ * in (its own reachable text spliced in place, wherever that function's
+ * own declaration happens to live) or blanked out, depending on whether
+ * `used` (from `computeUsedFunctions`) says it is actually invoked.
+ *
+ * Splices each function by its own range rather than by matching its
+ * source text, and applies the splices from the end of the statement
+ * backward. That keeps two functions with byte-identical bodies (e.g. two
+ * object-literal methods that both merely call `ctx.sendActivity(...)`)
+ * from colliding: a text-based replacement would find and blank out both
+ * occurrences the first time either one is processed, since it matches by
+ * content everywhere in the statement rather than by which node is
+ * actually being replaced. Replacing from the end backward also means a
+ * later replacement's length change never shifts the still-unprocessed
+ * offsets of an earlier one.
+ */
+function collectDeliveryScanCode(
+  sourceCode: { getText(node: unknown): string },
+  root: Node,
+  used: ReadonlySet<FunctionLikeNode>,
+  ignored: ReadonlySet<FunctionLikeNode>,
+  visited: Set<Node>,
+): string {
+  if (visited.has(root)) return "";
+  visited.add(root);
+
+  const statements: Node[] = [];
+  collectReachableStatements(root, statements);
+
+  return statements
+    .map((statement) => {
+      const text = sourceCode.getText(statement);
+      const [statementStart] = getRange(statement);
+
+      const nested: FunctionLikeNode[] = [];
+      collectNestedFunctions(statement, nested);
+      const byDescendingStart = [...nested].sort((a, b) =>
+        getRange(b)[0] - getRange(a)[0]
+      );
+
+      let result = text;
+      for (const fn of byDescendingStart) {
+        const [fnStart, fnEnd] = getRange(fn);
+        const replacement = used.has(fn) && !ignored.has(fn)
+          ? collectDeliveryScanCode(
+            sourceCode,
+            fn.body as Node,
+            used,
+            ignored,
+            visited,
+          )
+          : "";
+        // A method's range starts right after its key (`go` in `go() {}`)
+        // on some parsers, so keep the spliced text apart from what
+        // surrounds it, or `go` and `ctx` fuse into a single `goctx`.
+        result = result.slice(0, fnStart - statementStart) +
+          `\n${replacement.length > 0 ? replacement : "()=>{}"}\n` +
+          result.slice(fnEnd - statementStart);
       }
+      return result;
+    })
+    .join("\n");
+}
+
+function unwrapArgument(node: Node): Node {
+  while (
+    node.type === "TSAsExpression" || node.type === "TSTypeAssertion" ||
+    node.type === "TSNonNullExpression"
+  ) node = node.expression as Node;
+  return node;
+}
+
+function ignoredLocalSetupFunctions(
+  listener: FunctionLikeNode,
+  bindings: BindingIndex,
+  calls: readonly CallExpression[],
+  assignments: readonly Node[],
+): FunctionLikeNode[] {
+  const ignored: FunctionLikeNode[] = [];
+  const directCalls = calls.filter((call) =>
+    enclosingFunction(call as Node) === listener &&
+    isDirectStatement(call as Node, listener)
+  );
+
+  for (const assignment of assignments) {
+    if (
+      assignment.type !== "AssignmentExpression" ||
+      assignment.operator !== "=" ||
+      assignment.left.type !== "MemberExpression" ||
+      !isFunction(assignment.right as Expression)
+    ) continue;
+    const setup = enclosingFunction(assignment as Node);
+    if (
+      setup == null || setup === listener || !isInside(setup, listener)
+    ) continue;
+    const setupParent = getParent(setup);
+    const namedLocalSetup = enclosingFunction(setup) === listener &&
+      (setup.type === "FunctionDeclaration" ||
+        (setupParent?.type === "VariableDeclarator" &&
+          setupParent.init === setup && setupParent.id.type === "Identifier"));
+    const passedToCall = calls.some((call) =>
+      call.arguments.some((argument) =>
+        argument.type !== "SpreadElement" &&
+        resolveListenerReference(argument as Expression, bindings) === setup
+      )
+    );
+    if (!namedLocalSetup || passedToCall) continue;
+    const installed = assignment.right as FunctionLikeNode;
+    if (
+      !isDirectStatement(assignment as Node, setup) ||
+      assignment.left.object.type !== "Identifier"
+    ) {
+      ignored.push(installed);
+      continue;
+    }
+    const property = getMemberPropertyName(assignment.left);
+    if (property == null) continue;
+
+    const setupCalls = directCalls.filter((call) =>
+      resolveListenerReference(call.callee as Expression, bindings) === setup
+    );
+    if (setupCalls.length === 0) {
+      const called = calls.some((call) =>
+        resolveListenerReference(call.callee as Expression, bindings) === setup
+      );
+      ignored.push(called ? assignment.right as FunctionLikeNode : setup);
+      continue;
+    }
+
+    const objectBinding = bindings.lookup(
+      assignment.left.object as Node,
+      assignment.left.object.name,
+    );
+    const deliveryCalls = directCalls.filter((call) => {
+      const callee = call.callee;
+      return callee.type === "MemberExpression" &&
+        callee.object.type === "Identifier" &&
+        getMemberPropertyName(callee) === property &&
+        bindings.lookup(callee.object as Node, callee.object.name) ===
+          objectBinding;
+    });
+    const installedBeforeUse = objectBinding != null &&
+      setupCalls.some((setupCall) =>
+        deliveryCalls.some((deliveryCall) =>
+          position(setupCall as Node) >= 0 &&
+          position(setupCall as Node) < position(deliveryCall as Node)
+        )
+      );
+    if (!installedBeforeUse) ignored.push(installed);
+  }
+  return ignored;
+}
+
+function functionCallsDelivery(
+  sourceCode: { getText(node: unknown): string },
+  listener: FunctionLikeNode,
+  bindings: BindingIndex,
+  calls: readonly CallExpression[],
+  assignments: readonly Node[],
+  contextIndex = 0,
+  visited = new Map<FunctionLikeNode, Set<number>>(),
+): boolean {
+  let indices = visited.get(listener);
+  if (indices?.has(contextIndex)) return false;
+  if (indices == null) visited.set(listener, indices = new Set());
+  indices.add(contextIndex);
+  const ignored = ignoredLocalSetupFunctions(
+    listener,
+    bindings,
+    calls,
+    assignments,
+  );
+  if (
+    listenerCallsDeliveryMethod(
+      sourceCode,
+      listener,
+      contextIndex,
+      ignored,
+      bindings,
+      calls,
+      assignments,
+    )
+  ) {
+    return true;
+  }
+
+  const param = unwrapContextParam(listener.params[contextIndex] as Node);
+  if (param?.type !== "Identifier") return false;
+  const contextBinding = bindings.lookup(listener, param.name);
+  const reachable: Node[] = [];
+  collectReachableStatements(listener.body as Node, reachable);
+  for (const call of calls) {
+    // Calls in uncalled nested functions must not credit a module helper.
+    let child = call as Node;
+    let owner = getParent(child);
+    while (owner != null && !isFunctionLike(owner)) {
+      // AccessorProperty is emitted by both parsers but absent from Node's
+      // declared union. Instance initializers are deferred; keys run now.
+      const field = owner as { type: string; static?: boolean; value?: Node };
+      if (
+        (field.type === "PropertyDefinition" ||
+          field.type === "AccessorProperty") &&
+        !field.static && field.value === child
+      ) break;
+      child = owner;
+      owner = getParent(owner);
+    }
+    if (owner !== listener) continue;
+    const [callStart, callEnd] = getRange(call as Node);
+    if (
+      !reachable.some((statement) => {
+        const [start, end] = getRange(statement);
+        return start <= callStart && callEnd <= end;
+      })
+    ) continue;
+    const helper = resolveListenerReference(
+      call.callee as Expression,
+      bindings,
+    );
+    // Calling a generator creates an iterator without executing its body.
+    if (helper == null || ("generator" in helper && helper.generator)) continue;
+    for (const [index, argument] of call.arguments.entries()) {
+      if (argument.type === "SpreadElement") break;
+      const arg = unwrapArgument(argument as Node);
+      if (
+        arg.type !== "Identifier" || arg.name !== param.name ||
+        bindings.lookup(arg, arg.name) !== contextBinding ||
+        (helper.params[index] as Node | undefined)?.type === "RestElement"
+      ) continue;
+      if (
+        functionCallsDelivery(
+          sourceCode,
+          helper,
+          bindings,
+          calls,
+          assignments,
+          index,
+          visited,
+        )
+      ) return true;
     }
   }
-  return null;
-};
+  return false;
+}
 
 const listenerCallsDeliveryMethod = (
   sourceCode: { getText(node: unknown): string },
   listener: FunctionLikeNode,
+  contextIndex: number,
+  ignored: readonly FunctionLikeNode[],
+  bindings: BindingIndex,
+  calls: readonly CallExpression[],
+  assignments: readonly Node[],
 ): boolean => {
-  const code = stripCommentsAndStrings(sourceCode.getText(listener));
+  const used = computeUsedFunctions(listener.body as Node);
+  const ignoredSet = new Set(ignored);
+  for (const assignment of assignments) {
+    if (
+      assignment.type !== "AssignmentExpression" ||
+      assignment.left.type !== "MemberExpression" ||
+      assignment.left.object.type !== "Identifier" ||
+      !isFunction(assignment.right as Expression) ||
+      !isInside(assignment, listener)
+    ) continue;
+    const property = getMemberPropertyName(assignment.left);
+    const objectBinding = bindings.lookup(
+      assignment.left.object as Node,
+      assignment.left.object.name,
+    );
+    if (
+      property == null || objectBinding == null ||
+      !calls.some((call) =>
+        enclosingFunction(call as Node) === listener &&
+        call.callee.type === "MemberExpression" &&
+        call.callee.object.type === "Identifier" &&
+        getMemberPropertyName(call.callee) === property &&
+        bindings.lookup(call.callee.object as Node, call.callee.object.name) ===
+          objectBinding
+      )
+    ) continue;
+    const installed = assignment.right as FunctionLikeNode;
+    if (ignoredSet.has(installed)) continue;
+    for (
+      let fn: FunctionLikeNode | null = installed;
+      fn != null && fn !== listener && !ignoredSet.has(fn);
+      fn = enclosingFunction(fn)
+    ) used.add(fn);
+  }
+  const code = stripCommentsAndStrings(
+    collectDeliveryScanCode(
+      sourceCode,
+      listener.body as Node,
+      used,
+      ignoredSet,
+      new Set(),
+    ),
+  );
   const aliases = new Set<string>();
   const contextParam = unwrapContextParam(
-    listener.params[0] as Node | undefined,
+    listener.params[contextIndex] as Node | undefined,
   );
   const contextName = contextParam?.type === "Identifier"
     ? contextParam.name
@@ -351,8 +804,9 @@ function createRule<Context = Deno.lint.RuleContext | Rule.RuleContext>(
 ) {
   return (context: Context) => {
     const federationTracker = trackFederationVariables();
-    const bindings = new Map<string, unknown>();
+    const bindings = createBindingIndex();
     const pendingCalls: CallExpression[] = [];
+    const pendingAssignments: Node[] = [];
     const sourceCode =
       (context as { sourceCode: { getText(node: unknown): string } })
         .sourceCode;
@@ -381,7 +835,15 @@ function createRule<Context = Deno.lint.RuleContext | Rule.RuleContext>(
           : null;
       if (resolvedListener == null) return;
 
-      if (listenerCallsDeliveryMethod(sourceCode, resolvedListener)) return;
+      if (
+        functionCallsDelivery(
+          sourceCode,
+          resolvedListener,
+          bindings,
+          pendingCalls,
+          pendingAssignments,
+        )
+      ) return;
 
       (context as { report: (arg: unknown) => void }).report({
         node: resolvedListener,
@@ -392,9 +854,15 @@ function createRule<Context = Deno.lint.RuleContext | Rule.RuleContext>(
     return {
       VariableDeclarator(node: VariableDeclarator): void {
         federationTracker.VariableDeclarator(node);
-        if (node.id.type === "Identifier" && node.init != null) {
-          bindings.set(node.id.name, node.init);
-        }
+        const declaration = getParent(node as Node) as
+          | (Node & { kind?: string })
+          | null;
+        bindings.declare(
+          node as Node,
+          node.id as Node,
+          node.init as Node | null,
+          declaration?.kind === "var",
+        );
       },
 
       FunctionDeclaration(
@@ -403,11 +871,33 @@ function createRule<Context = Deno.lint.RuleContext | Rule.RuleContext>(
           id: Identifier | null;
         },
       ): void {
-        if (node.id != null) bindings.set(node.id.name, node);
+        if (node.id == null) return;
+        const parent = getParent(node);
+        const owner = parent == null ? null : getParent(parent);
+        const inVarBody = parent?.type === "BlockStatement" &&
+          owner != null && (owner.type === "StaticBlock" ||
+            (isFunctionLike(owner) && owner.body === parent));
+        bindings.declare(node, node.id, node, inVarBody);
+      },
+
+      ImportDeclaration(
+        node: Node & { specifiers: { local: Identifier }[] },
+      ): void {
+        for (const specifier of node.specifiers) {
+          bindings.declare(node, specifier.local, null);
+        }
+      },
+
+      ClassDeclaration(node: Node & { id: Identifier | null }): void {
+        if (node.id != null) bindings.declare(node, node.id, null);
       },
 
       CallExpression(node: CallExpression): void {
         pendingCalls.push(node);
+      },
+
+      AssignmentExpression(node: Node): void {
+        pendingAssignments.push(node);
       },
 
       "Program:exit"(): void {

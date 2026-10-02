@@ -1,12 +1,26 @@
-import type { GetUserAgentOptions } from "@fedify/vocab-runtime";
+import type {
+  GetUserAgentOptions,
+  PortableObjectVerifier,
+} from "@fedify/vocab-runtime";
 import {
+  canonicalizePortableUri,
   type DocumentLoader,
+  formatIri,
   getDocumentLoader,
   haveSameFe34Origin,
   haveSameIriOrigin,
   parseIri,
   type RemoteDocument,
 } from "@fedify/vocab-runtime";
+import {
+  createSnapshotContextLoader,
+  dereferencePortableIri,
+  getPortableGatewayCandidates,
+  getPortableResponseClaim,
+  isPortableIri,
+  parseCompatibleEf61Reference,
+  PortableObjectRejectedError,
+} from "@fedify/vocab-runtime/internal/portable-dereference";
 import { lookupWebFinger } from "@fedify/webfinger";
 import { getLogger } from "@logtape/logtape";
 import {
@@ -59,6 +73,9 @@ function getLookupRemoteHost(identifier: string | URL): string | undefined {
   let url: URL | undefined;
   if (identifier instanceof URL) {
     url = identifier;
+  } else if (PORTABLE_IRI_PATTERN.test(identifier)) {
+    // The authority of a portable IRI is a DID, not a host:
+    return undefined;
   } else {
     try {
       url = new URL(identifier);
@@ -70,6 +87,7 @@ function getLookupRemoteHost(identifier: string | URL): string | undefined {
       return extractHandleHost(stripped);
     }
   }
+  if (isPortableIri(url)) return undefined;
   if (url.host !== "") return url.host;
   // `acct:` URIs are opaque (no `//host` form), so the URL host is empty.
   // The user and authority live in `url.pathname` as
@@ -166,7 +184,57 @@ export interface LookupObjectOptions {
    * @since 1.8.0
    */
   signal?: AbortSignal;
+
+  /**
+   * The [FEP-ef61] gateways to try when looking up a portable
+   * (`ap:`/`ap+ef61:`) object, in order.  Each must be an HTTP(S) origin.
+   * An explicit list replaces `@gateway` location hints, including when
+   * it is empty.  The gateway named by a compatible identifier or the
+   * WebFinger server is still tried first.  At most five gateways are
+   * requested per lookup, including those given here.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  gateways?: readonly (string | URL)[];
+
+  /**
+   * The [FEP-ef61] policy to apply to portable objects, typically
+   * `verifyPortableObject()` from `@fedify/fedify`, which
+   * `Context.lookupObject()` uses by default.
+   *
+   * When it is given, portable `ap:`/`ap+ef61:` identifiers and compatible
+   * identifiers (e.g., `https://server.example/.well-known/apgateway/did:...`),
+   * whether they are looked up directly or found in the `self` links of
+   * a WebFinger response, are fetched through FEP-ef61 gateways.  A fetched
+   * portable object is returned only if its `@id` identifies the requested
+   * portable object and this function accepts it.  A document fetched from
+   * an ordinary HTTP(S) URL is checked the same way if its final URL or its
+   * `@id` is a portable or compatible identifier, instead of being trusted
+   * because of its origin.  Note that `crossOrigin: "trust"` does not skip
+   * these checks.
+   *
+   * Without it, portable identifiers are not looked up, and compatible
+   * identifiers are fetched as ordinary HTTP(S) URLs, whose objects with
+   * a portable `@id` are refused as cross-origin objects, even with
+   * `crossOrigin: "trust"`.
+   *
+   * The returned object also uses it by default for dereferencing its
+   * properties, as if it were passed to its property accessors.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  verifyPortableObject?: PortableObjectVerifier;
 }
+
+/**
+ * The maximum number of requests to FEP-ef61 gateways that a single
+ * {@link lookupObject} call makes for portable objects.  Gateways come from
+ * possibly untrusted WebFinger responses and location hints, so they are
+ * bounded to keep a single lookup from fanning out to many servers.
+ */
+const MAX_PORTABLE_ATTEMPTS = 5;
 
 /**
  * Looks up an ActivityStreams object by its URI (including `acct:` URIs)
@@ -194,6 +262,14 @@ export interface LookupObjectOptions {
  * await lookupObject(new URL("https://todon.eu/@hongminhee/112060633798771581"));
  * // returning a `Note` object.
  * ```
+ *
+ * [FEP-ef61] portable objects, including portable actors found through
+ * WebFinger, are looked up only if the `verifyPortableObject` option is
+ * given; see {@link LookupObjectOptions.verifyPortableObject}.  Pass
+ * {@link LookupObjectOptions.gateways} to look up a portable ID without
+ * `@gateway` location hints.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
  *
  * @param identifier The URI or fediverse handle to look up.
  * @param options Lookup options.
@@ -272,11 +348,47 @@ async function lookupObjectInternal(
 ): Promise<Object | null> {
   const documentLoader = options.documentLoader ??
     getDocumentLoader({ userAgent: options.userAgent });
+  const portable: PortableLookup = {
+    options,
+    documentLoader,
+    attempted: new Set(),
+    remaining: MAX_PORTABLE_ATTEMPTS,
+  };
   if (typeof identifier === "string") {
-    identifier = toAcctUrl(identifier) ?? new URL(identifier);
+    if (PORTABLE_IRI_PATTERN.test(identifier)) {
+      const candidate = parsePortableCandidate(identifier);
+      if (candidate == null) return null;
+      return await lookupPortableObject(portable, candidate, undefined);
+    }
+    // Check the raw spelling before WHATWG URL can erase dot segments from a
+    // compatible identifier.  It cannot be recovered from the parsed URL.
+    if (
+      options.verifyPortableObject != null &&
+      parseCompatibleEf61Reference(identifier) === null
+    ) return null;
+    identifier = toAcctUrl(identifier) ?? parseIri(identifier);
+  }
+  if (isPortableIri(identifier)) {
+    let candidate: URL;
+    try {
+      candidate = parseIri(identifier);
+    } catch (error) {
+      if (error instanceof TypeError) return null;
+      throw error;
+    }
+    return await lookupPortableObject(portable, candidate, undefined);
   }
   let remoteDoc: RemoteDocument | null = null;
   if (identifier.protocol === "http:" || identifier.protocol === "https:") {
+    const compatible = getCompatibleCandidate(identifier.href, options);
+    if (compatible !== undefined) {
+      if (compatible == null) return null;
+      return await lookupPortableObject(
+        portable,
+        compatible.id,
+        [compatible.gateway],
+      );
+    }
     try {
       remoteDoc = await documentLoader(identifier.href, {
         signal: options.signal,
@@ -295,6 +407,7 @@ async function lookupObjectInternal(
       signal: options.signal,
     });
     if (jrd?.links == null) return null;
+    const webFingerGateway = getWebFingerGateway(identifier);
     for (const l of jrd.links) {
       if (
         l.type !== "application/activity+json" &&
@@ -302,6 +415,44 @@ async function lookupObjectInternal(
             /application\/ld\+json;\s*profile="https:\/\/www.w3.org\/ns\/activitystreams"/,
           ) || l.rel !== "self" || l.href == null
       ) continue;
+      if (PORTABLE_IRI_PATTERN.test(l.href)) {
+        // FEP-ef61 says the WebFinger host is the actor's first gateway, so
+        // ask it first, and then the location hints in the link:
+        if (options.verifyPortableObject == null) {
+          logger.debug(
+            "Skipping the portable self link {href}, as the " +
+              "verifyPortableObject option is not given.",
+            { href: l.href },
+          );
+          continue;
+        }
+        const candidate = parsePortableCandidate(l.href);
+        if (candidate == null) continue;
+        const gateways = webFingerGateway == null ? [] : [webFingerGateway];
+        if (options.gateways == null) {
+          gateways.push(...getPortableGatewayCandidates(candidate));
+        }
+        const object = await lookupPortableObject(
+          portable,
+          candidate,
+          gateways,
+        );
+        if (object != null) return object;
+        if (options.signal?.aborted) return null;
+        continue;
+      }
+      const compatible = getCompatibleCandidate(l.href, options);
+      if (compatible !== undefined) {
+        if (compatible == null) continue;
+        const object = await lookupPortableObject(
+          portable,
+          compatible.id,
+          [compatible.gateway],
+        );
+        if (object != null) return object;
+        if (options.signal?.aborted) return null;
+        continue;
+      }
       try {
         remoteDoc = await documentLoader(l.href, {
           signal: options.signal,
@@ -314,49 +465,286 @@ async function lookupObjectInternal(
     }
   }
   if (remoteDoc == null) return null;
-  let object: Object;
-  let documentUrl: URL;
+  // With verifyPortableObject, the document may turn out to be a portable
+  // object, which has to be verified with the same context documents:
+  const snapshot = options.verifyPortableObject == null
+    ? null
+    : createSnapshotContextLoader(
+      options.contextLoader ??
+        getDocumentLoader({ userAgent: options.userAgent }),
+    );
   try {
-    documentUrl = parseIri(remoteDoc.documentUrl);
-    object = await Object.fromJsonLd(remoteDoc.document, {
-      documentLoader,
-      contextLoader: options.contextLoader,
-      tracerProvider: options.tracerProvider,
-      baseUrl: documentUrl,
-    });
+    let object: Object;
+    let documentUrl: URL;
+    try {
+      documentUrl = parseIri(remoteDoc.documentUrl);
+      object = await Object.fromJsonLd(remoteDoc.document, {
+        documentLoader,
+        contextLoader: snapshot?.loader ?? options.contextLoader,
+        tracerProvider: options.tracerProvider,
+        verifyPortableObject: options.verifyPortableObject,
+        baseUrl: documentUrl,
+      });
+    } catch (error) {
+      if (error instanceof TypeError) {
+        logger.debug(
+          "Failed to parse JSON-LD document: {error}\n{document}",
+          { ...remoteDoc, error },
+        );
+        return null;
+      }
+      throw error;
+    }
+    if (snapshot != null) {
+      // A document whose final URL or @id stands for a portable object is
+      // verified as one instead of being trusted because of its origin:
+      const claim = getPortableResponseClaim(remoteDoc.documentUrl, object.id);
+      if (claim === null) {
+        logger.debug(
+          "Refusing the document {documentUrl}, as it claims to be " +
+            "a portable object with a malformed compatible identifier.",
+          { documentUrl: remoteDoc.documentUrl },
+        );
+        return null;
+      } else if (claim != null) {
+        const explicit = getExplicitGateways(portable, claim.id);
+        return await dereference(
+          portable,
+          claim.id,
+          claim.inferredGateways,
+          explicit,
+          { response: remoteDoc, contextLoader: snapshot.loader },
+        );
+      }
+    }
+    if (
+      object.id != null &&
+      // A portable object belongs to its DID, not to the server that serves
+      // it, so crossOrigin: "trust" does not let a server vouch for it:
+      (options.crossOrigin !== "trust" || isPortableIri(object.id)) &&
+      !haveSameIriOrigin(object.id, documentUrl) &&
+      !haveSameFe34Origin(object.id, documentUrl)
+    ) {
+      if (options.crossOrigin === "throw") {
+        throw new Error(
+          `The object's @id (${object.id.href}) has a different origin than ` +
+            `the document URL (${remoteDoc.documentUrl}); refusing to return ` +
+            `the object.  If you want to bypass this check and are aware of ` +
+            `the security implications, set the crossOrigin option to "trust".`,
+        );
+      }
+      logger.warn(
+        "The object's @id ({objectId}) has a different origin than the " +
+          "document URL ({documentUrl}); refusing to return the object.  If " +
+          "you want to bypass this check and are aware of the security " +
+          'implications, set the crossOrigin option to "trust".',
+        { ...remoteDoc, objectId: object.id.href },
+      );
+      return null;
+    }
+    return object;
+  } finally {
+    snapshot?.release();
+  }
+}
+
+const PORTABLE_IRI_PATTERN = /^ap(?:\+ef61)?:/i;
+
+interface PortableLookup {
+  readonly options: LookupObjectOptions;
+  readonly documentLoader: DocumentLoader;
+  /** Pairs of a canonical portable ID and a gateway already asked. */
+  readonly attempted: Set<string>;
+  /** The number of gateway requests left for this lookup. */
+  remaining: number;
+  /** Validated only when the lookup reaches a portable object. */
+  explicitGateways?: URL[];
+}
+
+function getExplicitGateways(
+  lookup: PortableLookup,
+  id: URL,
+): URL[] | undefined {
+  if (lookup.options.gateways == null) return undefined;
+  return lookup.explicitGateways ??= getPortableGatewayCandidates(
+    id,
+    lookup.options.gateways,
+  );
+}
+
+/**
+ * Parses a raw portable IRI.  URL parsing normalizes dot segments in the
+ * opaque path, which would make the parsed IRI identify another portable
+ * object, so such IRIs are refused.
+ */
+function parsePortableCandidate(iri: string): URL | null {
+  try {
+    const parsed = parseIri(iri);
+    if (
+      canonicalizePortableUri(iri) !==
+        canonicalizePortableUri(formatIri(parsed))
+    ) {
+      logger.debug(
+        "Refusing to look up the portable IRI {iri}, as its path cannot be " +
+          "represented without changing the identified object.",
+        { iri },
+      );
+      return null;
+    }
+    return parsed;
   } catch (error) {
     if (error instanceof TypeError) {
-      logger.debug(
-        "Failed to parse JSON-LD document: {error}\n{document}",
-        { ...remoteDoc, error },
-      );
+      logger.debug("Invalid portable IRI {iri}: {error}", { iri, error });
       return null;
     }
     throw error;
   }
-  if (
-    options.crossOrigin !== "trust" && object.id != null &&
-    !haveSameIriOrigin(object.id, documentUrl) &&
-    !haveSameFe34Origin(object.id, documentUrl)
+}
+
+/**
+ * Recognizes an FEP-ef61 compatible identifier to look up as a portable
+ * object.
+ * @returns `undefined` if the URL should be fetched as an ordinary HTTP(S)
+ *          URL, i.e., it is not a compatible identifier, or the
+ *          `verifyPortableObject` option is not given; `null` if it is
+ *          a malformed compatible identifier; otherwise, the portable ID and
+ *          the gateway to ask.
+ */
+function getCompatibleCandidate(
+  href: string,
+  options: LookupObjectOptions,
+): { readonly id: URL; readonly gateway: URL } | null | undefined {
+  if (options.verifyPortableObject == null) return undefined;
+  return parseCompatibleEf61Reference(href);
+}
+
+/**
+ * Gets the origin of the WebFinger server that {@link lookupWebFinger} asks
+ * for the identifier, which is also the first gateway of a portable actor.
+ */
+function getWebFingerGateway(identifier: URL): URL | undefined {
+  let url: URL;
+  if (identifier.protocol === "acct:") {
+    const host = extractHandleHost(identifier.pathname);
+    if (host == null) return undefined;
+    url = new URL(`https://${host}/`);
+  } else if (
+    identifier.protocol === "http:" || identifier.protocol === "https:"
   ) {
-    if (options.crossOrigin === "throw") {
-      throw new Error(
-        `The object's @id (${object.id.href}) has a different origin than ` +
-          `the document URL (${remoteDoc.documentUrl}); refusing to return ` +
-          `the object.  If you want to bypass this check and are aware of ` +
-          `the security implications, set the crossOrigin option to "trust".`,
-      );
-    }
-    logger.warn(
-      "The object's @id ({objectId}) has a different origin than the document " +
-        "URL ({documentUrl}); refusing to return the object.  If you want to " +
-        "bypass this check and are aware of the security implications, " +
-        'set the crossOrigin option to "trust".',
-      { ...remoteDoc, objectId: object.id.href },
+    url = new URL(identifier.origin);
+  } else {
+    return undefined;
+  }
+  return url.username === "" && url.password === "" ? url : undefined;
+}
+
+/**
+ * Looks up a portable object through FEP-ef61 gateways.
+ * @param inferredGateways Gateways inferred from a compatible identifier or
+ *                         WebFinger.  If omitted, location hints in the IRI
+ *                         are used unless explicit gateways were given.
+ */
+async function lookupPortableObject(
+  lookup: PortableLookup,
+  id: URL,
+  inferredGateways: readonly URL[] | undefined,
+): Promise<Object | null> {
+  const { options } = lookup;
+  const iri = formatIri(id);
+  const explicitGateways = getExplicitGateways(lookup, id);
+  if (options.verifyPortableObject == null) {
+    logger.debug(
+      "Cannot look up the portable object {iri}, as the " +
+        "verifyPortableObject option is not given.",
+      { iri },
     );
     return null;
   }
-  return object;
+  const canonicalId = canonicalizePortableUri(iri);
+  const inferred = inferredGateways ??
+    (explicitGateways == null ? getPortableGatewayCandidates(id) : []);
+  const candidates = [...inferred];
+  for (const gateway of explicitGateways ?? []) {
+    if (!candidates.some((candidate) => candidate.href === gateway.href)) {
+      candidates.push(gateway);
+    }
+  }
+  if (candidates.length < 1 && inferredGateways == null) {
+    // No gateway to ask; a custom document loader may know how to
+    // retrieve the portable IRI itself:
+    const key = `${canonicalId} `;
+    if (lookup.remaining < 1 || lookup.attempted.has(key)) return null;
+    lookup.attempted.add(key);
+    lookup.remaining--;
+    return await dereference(
+      lookup,
+      id,
+      [],
+      explicitGateways == null ? undefined : [],
+    );
+  }
+  const selected: URL[] = [];
+  for (const gateway of candidates) {
+    if (selected.length >= lookup.remaining) break;
+    const key = `${canonicalId} ${gateway.href}`;
+    if (lookup.attempted.has(key)) continue;
+    lookup.attempted.add(key);
+    selected.push(gateway);
+  }
+  if (selected.length < 1) return null;
+  lookup.remaining -= selected.length;
+  const selectedInferred = selected.filter((candidate) =>
+    inferred.some((gateway) => gateway.href === candidate.href)
+  );
+  const selectedExplicit = explicitGateways?.filter((gateway) =>
+    selected.some((candidate) => candidate.href === gateway.href)
+  );
+  return await dereference(
+    lookup,
+    id,
+    selectedInferred,
+    selectedExplicit,
+  );
+}
+
+async function dereference(
+  { options, documentLoader }: PortableLookup,
+  id: URL,
+  inferredGateways: readonly URL[],
+  gateways?: readonly URL[],
+  extra: { response?: RemoteDocument; contextLoader?: DocumentLoader } = {},
+): Promise<Object | null> {
+  const tracerProvider = options.tracerProvider ?? trace.getTracerProvider();
+  try {
+    return await dereferencePortableIri(id, {
+      documentLoader,
+      contextLoader: extra.contextLoader ?? options.contextLoader ??
+        getDocumentLoader({ userAgent: options.userAgent }),
+      tracerProvider,
+      // Preserve where the gateways came from for the verifier:
+      inferredGateways,
+      ...(gateways == null ? {} : { gateways }),
+      response: extra.response,
+      verifyPortableObject: options.verifyPortableObject,
+      crossOrigin: options.crossOrigin === "throw" ? "throw" : "ignore",
+      signal: options.signal,
+      parse: (document, { contextLoader, baseUrl }) =>
+        Object.fromJsonLd(document, {
+          documentLoader,
+          contextLoader,
+          tracerProvider,
+          verifyPortableObject: options.verifyPortableObject,
+          baseUrl,
+        }),
+    });
+  } catch (error) {
+    if (error instanceof PortableObjectRejectedError) throw error;
+    logger.debug(
+      "Failed to look up the portable object {iri}:\n{error}",
+      { iri: formatIri(id), error },
+    );
+    return null;
+  }
 }
 
 /**
@@ -387,6 +775,45 @@ export interface TraverseCollectionOptions {
    * @default `{ seconds: 0 }`
    */
   interval?: Temporal.Duration | Temporal.DurationLike;
+  /**
+   * Whether to trust objects whose origin differs from the collection or page
+   * that refers to them.  See the `crossOrigin` option of property accessors
+   * such as `Collection.getItems()`.
+   * @since 2.4.0
+   */
+  crossOrigin?: "ignore" | "throw" | "trust";
+
+  /**
+   * The [FEP-ef61] gateways to fetch portable (`ap:`/`ap+ef61:`) pages and
+   * items through, in order.  See the `gateways` option of property
+   * accessors.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  gateways?: readonly (string | URL)[];
+
+  /**
+   * The policy to apply to portable pages and items fetched through
+   * gateways, typically `verifyPortableObject()` from `@fedify/fedify`.
+   * Portable pages and items are not fetched without it.  Pages and items
+   * that are fetched use it as their default verifier, unless
+   * {@link TraverseCollectionOptions.inheritPortableObjectVerifier} is
+   * `false`.
+   * @since 2.4.0
+   */
+  verifyPortableObject?: PortableObjectVerifier;
+
+  /**
+   * Whether pages and items that are newly fetched use
+   * {@link TraverseCollectionOptions.verifyPortableObject} as their default
+   * verifier for their property accessors.  Defaults to `true`.  If `false`,
+   * they use the default verifier of the object they are obtained from, if
+   * any, instead.  See the `inheritPortableObjectVerifier` option of property
+   * accessors such as `Collection.getItems()`.
+   * @since 2.4.0
+   */
+  inheritPortableObjectVerifier?: boolean;
 }
 
 /**

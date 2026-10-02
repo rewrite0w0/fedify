@@ -15,6 +15,8 @@ export {
   type GetDocumentLoaderOptions,
   getRemoteDocument,
   type RemoteDocument,
+  resolveDocumentLoaderTimeout,
+  withDocumentLoaderTimeout,
 } from "./docloader.ts";
 export {
   type DidKeyVerificationMethod,
@@ -46,6 +48,17 @@ export {
 } from "./digest.ts";
 export { LanguageString } from "./langstr.ts";
 export {
+  fetchPortableMedia,
+  type FetchPortableMediaOptions,
+  type PortableMedia,
+} from "./portable-media.ts";
+export type {
+  PortableObjectReferrer,
+  PortableObjectVerification,
+  PortableObjectVerifier,
+  PortableObjectVerifierOptions,
+} from "./portable.ts";
+export {
   decodeMultibase,
   encodeMultibase,
   encodingFromBaseData,
@@ -68,7 +81,9 @@ export {
   canonicalizePortableUri,
   expandIPv6Address,
   formatIri,
+  fromCompatibleEf61Id,
   getFe34Origin,
+  getGatewayHints,
   haveSameFe34Origin,
   haveSameIriOrigin,
   isGatewayUrl,
@@ -77,6 +92,9 @@ export {
   parseGatewayUrl,
   parseIri,
   parseJsonLdId,
+  toCompatibleEf61Id,
   UrlError,
   validatePublicUrl,
+  withGatewayHints,
+  withoutGatewayHints,
 } from "./url.ts";

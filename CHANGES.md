@@ -3,12 +3,355 @@
 Fedify changelog
 ================
 
-Version 2.4.0
+Version 2.5.0
 -------------
 
 To be released.
 
+
+Version 2.4.0
+-------------
+
+Released on October 1, 2026.
+
 ### @fedify/fedify
+
+ -  Added `onRequestFinished()` to observe every inbox delivery, including
+    rejected requests and preparation errors, with signature/proof checks,
+    actual verification keys, the final authentication decision, and the
+    processing outcome.  The callback is awaited independently of trace
+    sampling, and its errors do not change delivery results.  [[#1191], [#1201]]
+
+ -  Added support for [FEP-ef61] portable objects, whose IDs are `ap:` or
+    `ap+ef61:` URIs with a DID instead of a host, e.g.,
+    `ap://did:key:z6Mk.../actor`.  A Fedify server can now act as a gateway for
+    portable actors: it serves their actor documents, objects, collections, and
+    hashlink media, accepts deliveries to their inboxes, and sends their
+    activities.  It can also consume the portable objects of others.  The new
+    [*Portable objects*] chapter of the manual walks through
+    running portable actors, and describes the FEP-ef61 profile that Fedify
+    supports, including where it deliberately differs from the FEP and what it
+    does not implement.  Applications without portable actors are unaffected,
+    except that their dispatchers may be called for requests to the gateway
+    endpoint, */.well-known/apgateway/*, and that `Context.sendActivity()` may
+    reject activities that embed others' portable objects (see below).
+    [[#288], [#1151], [#1198]]
+
+     -  Added `verifyPortableObjectProof()`, which enforces the FEP-ef61 proof
+        policy: a portable actor, activity, or object needs an [FEP-8b32]
+        Object Integrity Proof whose `verificationMethod` is a DID URL of
+        the DID in its ID, and a portable actor needs a non-empty `gateways`
+        list of HTTP(S) origins.  A document whose ID is a compatible
+        identifier, e.g.,
+        `https://gw.example/.well-known/apgateway/did:key:z6Mk.../actor`, is
+        verified against the DID in it.  Its detailed result distinguishes
+        documents outside the policy, unsecured collections, missing or invalid
+        proofs, invalid gateways, unsupported verification methods, and DID
+        mismatches.  [[#832], [#968], [#1093], [#1105], [#1148], [#1178]]
+
+     -  Added `verifyPortableObject()`, which verifies proofs like
+        `verifyPortableObjectProof()`, and also accepts an actor's `inbox`,
+        `outbox`, `followers`, `following`, or `liked` collection without
+        a proof if a gateway that the actor lists served it, as FEP-ef61
+        allows.  The `VerifyPortableObjectOptions`,
+        `VerifyPortableObjectResult`, and `VerifyPortableObjectFailureReason`
+        types describe it.  [[#836], [#1084], [#1093], [#1105]]
+
+     -  Added the `Context.verifyPortableObject` property, which is
+        `verifyPortableObject()` with the context's loaders.  Since it has
+        the same name as the option of property accessors, passing a context
+        as their options, e.g., `await create.getObject(ctx)`, verifies
+        portable objects.  Inboxes use it as the default verifier of received
+        activities, as do `Context.lookupObject()`,
+        `Context.traverseCollection()`, and the `onOutboxError` callback.
+        Added the `verifyPortableObject` option to `VerifyObjectOptions`.
+        [[#1107], [#1120]]
+
+     -  `verifyProof()` now resolves Ed25519 `did:key` verification methods,
+        e.g., `did:key:z6Mk...#z6Mk...`, locally without fetching them, and
+        `verifyObject()` accepts a proof made by a DID as authenticating
+        an actor or attribution whose portable ID or compatible identifier
+        has that DID.  [[#827], [#829], [#915], [#926], [#1093], [#1105]]
+
+     -  Added the `Context.getPortableActorUri()`,
+        `Context.getPortableObjectUri()`, `Context.getPortableInboxUri()`,
+        `Context.getPortableOutboxUri()`, `Context.getPortableFollowingUri()`,
+        `Context.getPortableFollowersUri()`, `Context.getPortableLikedUri()`,
+        `Context.getPortableFeaturedUri()`,
+        `Context.getPortableFeaturedTagsUri()`, and
+        `Context.getPortableCollectionUri()` methods, which build portable IDs
+        from the paths of the corresponding dispatchers and a DID.  Custom
+        implementations of the `Context` interface need to implement them.
+        [[#835], [#839], [#841], [#1076], [#1092], [#1111], [#1114], [#1142]]
+        They throw a `TypeError` for a `did:key` DID that is not encoded in
+        base58-btc, as FEP-ef61 requires, or for an identifier that has
+        a `.` or `..` path segment.  [[#841], [#1114], [#1154], [#1186]]
+
+     -  Added the `portable` option to `Context.parseUri()` and
+        the `ParseUriOptions` interface.  With `{ portable: true }`,
+        the method also recognizes portable IDs and their compatible
+        identifiers, and the result has the DID in its new `authority`
+        property.  [[#1143], [#1145]]
+
+     -  Object dispatchers and the actor dispatcher now serve portable objects
+        and actors through the gateway endpoint, e.g.,
+        `GET /.well-known/apgateway/did:key:z6Mk.../notes/123`, with the path
+        after the DID.  An object is served only if its ID canonically equals
+        the requested portable ID and it has a proof made with a key of
+        the DID.  A non-public object is served only if the dispatcher has
+        an authorization predicate, as FEP-ef61 forbids gateways to serve it
+        to anyone but its audience.  Signed tombstones are served with
+        `410 Gone`.  Added the `RequestContext.portableRequest` property,
+        which tells the dispatcher the requested DID and ID.
+        [[#835], [#841], [#1076], [#1113], [#1114], [#1124], [#1153], [#1183]]
+
+     -  Added the `RequestContext.isSignedByAudience()` method and
+        the `IsSignedByAudienceOptions` interface, which check whether
+        a request is signed by an actor in the audience of an object, e.g.,
+        in the authorization predicate of an object dispatcher.  Custom
+        implementations of the `RequestContext` interface need to implement
+        the method.  [[#1153], [#1183]]
+
+     -  Collection dispatchers now serve the collections of portable actors
+        through the gateway endpoint, e.g.,
+        `GET /.well-known/apgateway/did:key:z6Mk.../users/alice/outbox`, if
+        the actor is a portable actor under the requested DID whose
+        corresponding property refers to the collection.  A collection that
+        is not paginated always has `totalItems`, so that consumers can tell
+        an empty one from other objects.  Added
+        the `CustomCollectionCallbackSetters.mapPortableOwner()` method and
+        the `PortableCollectionOwnerMapper` type, which tie a custom
+        collection to its portable owner.  [[#1111], [#1142]]
+
+     -  Added `Federatable.setHashlinkMediaDispatcher()` and
+        the `HashlinkMediaRequest` interface, which serve resources that
+        portable objects refer to with SHA-256 hashlinks, e.g.,
+        `GET /.well-known/apgateway/hl:zQm...`.  Fedify does not verify the
+        dispatcher's response against the digest.  Added `hashlink_media` to
+        the values of the `fedify.endpoint` metric attribute.
+        [[#838], [#1080]]
+
+     -  Inbox listeners now accept deliveries to portable inboxes through
+        the gateway endpoint, e.g.,
+        `POST /.well-known/apgateway/did:key:z6Mk.../users/alice/inbox`, if
+        the actor dispatcher returns a portable actor whose `inbox` is
+        the requested inbox and whose `gateways` include this server.
+        [[#839], [#1092]]
+
+     -  Fedify now forwards an activity delivered to a portable inbox to
+        the actor's other gateways at most once, as FEP-ef61 recommends, if
+        the activity is authenticated by its own proof or Linked Data
+        Signature and the `KvStore` supports `cas()`.  Forwarded requests are
+        signed with this server's RSA gateway key for the actor if the key
+        pairs dispatcher returns one, and are sent unsigned otherwise.  An
+        activity is not forwarded back to the gateway that forwarded it if
+        Fedify can identify that gateway by its gateway key signature on the
+        delivery.  Added the `FederationOptions.portableInboxForwarding` and
+        `FederationKvPrefixes.portableInboxForwarding` options.
+        [[#839], [#1092], [#1100], [#1101], [#1104], [#1110]]
+
+     -  `Context.sendActivity()` and `InboxContext.forwardActivity()` now
+        deliver to portable inboxes through the recipient's gateways, or else
+        the `@gateway` location hints of the inbox, trying at most five of
+        them until one accepts the activity.  Previously, such a delivery
+        failed with `UrlError: Unsupported protocol: ap+ef61:`.  Queue
+        workers of older Fedify versions deliver such queued activities only
+        through the first gateway, so upgrade them before the servers that
+        enqueue deliveries.  [[#1147], [#1180]]
+
+     -  Added the `ActorCallbackSetters.mapPortableActorId()` method and
+        the `PortableActorIdMapper` type.  For an actor that the callback
+        maps to a portable ID, `Context.getActorKeyPairs()` identifies its key
+        pairs by the actor's compatible identifier on this server, e.g.,
+        `https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice#main-key`,
+        so that they serve as this server's *gateway keys* for the actor, which
+        sign HTTP requests made on behalf of the actor, but never make Object
+        Integrity Proofs or Linked Data Signatures.  [[#840], [#1099]]
+
+     -  HTTP Signature verification now accepts a gateway key of a portable
+        actor if the actor document at the key ID has a valid proof by
+        the actor's DID, embeds the key in its `assertionMethod`, or else in
+        its `publicKey`, and lists the gateway in its `gateways`.  Such a key
+        is owned by the portable actor, so
+        `RequestContext.getSignedKeyOwner()`, `getKeyOwner()`, and
+        `doesActorOwnKey()` return or match the actor.  Keys at compatible
+        identifiers are cached apart for each purpose, for an hour at most.
+        [[#840], [#1095], [#1099], [#1105], [#1119], [#1123], [#1164]]
+        A key at an `ap:` key ID is accepted likewise if an actor document
+        fetched through the key ID's location hints vouches for it.
+        [[#1096], [#1132], [#1134], [#1165]]
+
+     -  Inboxes accept an activity of a portable actor, or an activity with
+        a portable ID, only if it has a valid proof made by the DID of that
+        ID; an HTTP Signature or a Linked Data Signature does not
+        authenticate it, and such an activity is rejected with
+        `401 Unauthorized`.  [[#840], [#1099]]
+
+     -  Inboxes independently verify each portable actor, activity, and
+        object embedded in a compound document, e.g., the `Note` in
+        a `Create`, against its own proof before dispatch, following Fedify's
+        interim *map-local* profile, since neither FEP-8b32 nor Verifiable
+        Credential Data Integrity defines the boundaries of embedded proofs
+        yet.  A valid outer proof does not authenticate an unsigned or invalid
+        embedded portable object.  Documents with proof sets, or that exceed
+        the traversal limits, are rejected.  A key embedded in a verified
+        portable actor needs no proof of its own if the key's ID is the actor's
+        ID plus a fragment.  This profile may change in Fedify 3.0.
+        [[#938], [#1041], [#1094], [#1102], [#1133], [#1138]]
+
+     -  `Context.sendActivity()` gives an activity that contains portable
+        objects at most one proof: an activity that already has one is sent
+        as is, and a portable activity is signed only by the key whose ID is
+        a DID URL for its DID.  An activity of a portable actor has to have
+        a portable ID or a compatible identifier of the actor's DID, and never
+        gets a Linked Data Signature.  Otherwise, `sendActivity()` rejects with
+        a `TypeError` before anything is delivered or queued.  So does a
+        non-portable activity that embeds portable objects, including ones with
+        compatible identifiers, when several Ed25519 keys are available, and an
+        activity with portable objects in which any map carries a proof set, or
+        an embedded map carries a proof but not its own `@context`, e.g.,
+        a received signed `Follow` embedded in an `Accept`, which Fedify
+        inboxes would reject; refer to such an object by its ID instead.
+        Sign portable activities with `signObject()` beforehand, or pass the
+        DID's key as an explicit sender key.
+        [[#840], [#1041], [#1045], [#1073], [#1099]]
+
+     -  Your portable actors and objects may have compatible identifiers as
+        their IDs, e.g.,
+        `https://example.com/.well-known/apgateway/did:key:z6Mk.../actor`,
+        for interoperability with software that cannot handle portable IDs.
+        Fedify treats them as portable wherever it serves or sends them, and
+        warns if such an ID is malformed or is not on the owner's first
+        gateway, as FEP-ef61 requires.  Build them with `toCompatibleEf61Id()`
+        before signing the documents.  [[#1106], [#1109], [#1155], [#1188]]
+
+     -  The WebFinger endpoint now serves portable actors: the domain of
+        the actor's address comes from the first gateway in its `gateways`,
+        and its `self` link is its compatible identifier on that gateway.
+        WebFinger resources can be portable IDs, which are passed to
+        `mapAlias()`.  `Context.lookupObject()` resolves the handles of
+        portable actors on other servers.  [[#837], [#1082], [#1106], [#1109]]
+
+     -  Fedify logs a warning if an actor dispatcher returns a portable actor
+        whose `gateways` are invalid, or whose collections are not the
+        portable IDs or compatible identifiers that the corresponding
+        `Context.getPortable*Uri()` methods build, instead of warning that
+        a portable actor's ID or collections do not match the URIs that
+        `Context.getActorUri()` and the like build.
+        [[#837], [#1082], [#1111], [#1142], [#1148], [#1178]]
+
+     -  `Context.routeActivity()` routes a portable activity that has no
+        valid proof only if all of its actors have the same DID as
+        the activity, comparing [FEP-fe34] origins, where the origin of
+        a portable ID or a compatible identifier is its DID.  [[#1146], [#1171]]
+
+     -  Outbox listeners compare the `actor` of a posted activity with
+        a portable outbox owner by their canonical portable IDs, so that
+        the actor can be referred to with `@gateway` location hints, another
+        URI scheme, or as a compatible identifier on another gateway.
+        [[#1159], [#1189]]
+
+ -  Changed Fedify to treat documents whose IDs are [FEP-ef61] compatible
+    identifiers, such as
+    `https://gw.example/.well-known/apgateway/did:key:z6Mk.../actor`, as
+    the portable objects they stand for, as FEP-ef61 requires, instead of
+    trusting them by the web origin that served them.  Previously, any server
+    could act as
+    `https://evil.example/.well-known/apgateway/did:key:z6MkAlice/actor`
+    without a proof by Alice's DID.  Some implementations, e.g., tootik,
+    identify their portable actors this way.  [[#288], [#1093], [#1105]]
+
+     -  Inboxes now reject an activity of an actor whose ID is a compatible
+        identifier with `401 Unauthorized` unless it has a valid Object
+        Integrity Proof made by the actor's DID.  Activities of actors that
+        publish compatible identifiers without signing them, or whose DIDs
+        use key types Fedify does not support, are no longer accepted.
+
+     -  `verifyObject()` never authenticates an attribution or actor whose ID
+        is a compatible identifier by a key at an ordinary URL.
+
+     -  HTTP Signature verification rejects a key at a compatible identifier
+        unless the actor document has a valid proof by the actor's DID and
+        vouches for the key.  A key at an ordinary URL that claims a portable
+        actor as its owner or controller is no longer that actor's key, and
+        `getKeyOwner()` and `doesActorOwnKey()` no longer resolve portable
+        actors by web origin.
+
+ -  Changed property accessors to verify the [FEP-ef61] portable objects that
+    they dereference when a `Context` is passed as their options, e.g.,
+    `await create.getObject(ctx)`, since the new `Context.verifyPortableObject`
+    property has the same name as their `verifyPortableObject` option.  This
+    also applies to objects with ordinary HTTP(S) IDs: their references to
+    compatible identifiers are now verified as portable objects instead of
+    being trusted because of their origin.  In inbox listeners, accessors do
+    so even without options.  [[#288], [#1107], [#1120]]
+
+ -  Fixed `signObject()` so that a signed object keeps verifying after it is
+    assigned to a typed parent and the parent is serialized.  `signObject()`
+    now captures the secured JSON document its proof covers, and nested
+    serialization embeds that document verbatim instead of rebuilding the
+    child under the parent's JSON-LD context.  Producing a compound document,
+    such as a signed `Note` in a signed [FEP-ef61] portable `Create`, with
+    `signObject()` no longer requires assembling the JSON by hand.
+    [[#288], [#1041], [#1044], [#1051]]
+
+     -  The captured document is a snapshot: `clone()` does not carry it, and
+        mutating a signed object in place does not change it.  Sign a clone
+        again when it has to be embedded as a secured child.
+     -  Serialization falls back to the previous behavior for objects parsed
+        with `fromJsonLd()`, objects that already carried a proof, and
+        `toJsonLd()` calls whose `context` option could hide the internal
+        placeholder.
+     -  Outgoing JSON-LD compatibility normalization now leaves a nested
+        self-contained secured document untouched while signing and sending,
+        so it cannot rewrite bytes that the child's own proof covers.
+        Inbound verification is unaffected.
+     -  Fanout delivery now reuses the document the activity was already
+        serialized into instead of reparsing and reserializing it, which
+        previously invalidated an embedded signed child and the outer proof
+        that covered it.
+
+ -  Allowed object dispatchers to return `Tombstone` for deleted objects, as
+    actor dispatchers already can.  Fedify now serves such object URIs with
+    `410 Gone` and the serialized tombstone body, as ActivityPub recommends,
+    after applying the authorization predicate as for other objects, so that
+    applications no longer need a separate route in front of Fedify for
+    deleted posts.  Fedify logs a warning if the tombstone's `id` does not
+    match `Context.getObjectUri()`.  [[#1112], [#1117]]
+
+     -  Changed the return type of `ObjectDispatcher` from
+        `TObject | null` to `TObject | Tombstone | null`.
+     -  Added a `RequestContext.getObject()` overload that takes
+        a `GetObjectOptions` object.  By default, `getObject()` still returns
+        `null` for a tombstone unless the tombstone is an instance of
+        the requested class, e.g., `Object` or `Tombstone`.  Pass
+        `{ tombstone: "passthrough" }` to receive tombstones.
+     -  Added the `GetObjectOptions` interface.
+     -  Changed object dispatchers registered for `Tombstone` or `Object`
+        that return tombstones to be served with `410 Gone` instead of
+        `200 OK`.
+
+ -  Changed HTTP Signature verification to verify at most the first three
+    RFC 9421 signatures of a request, in the order of its `Signature-Input`
+    header, and to ignore the rest.  Each signature may make Fedify fetch the
+    key that it names from a URL of the sender's choosing, so a single
+    unauthenticated request with many signatures could make Fedify fetch any
+    number of URLs.  A signature counts even if it fails before its key is
+    fetched, and a key is now looked up only once for all the signatures of
+    a request that name it.  A request whose only valid signature comes after
+    the first three is no longer accepted; senders usually put a single
+    signature on a request.  [[#1130], [#1166]]
+
+     -  Added the `FederationOptions.maxHttpSignatures` option to change the
+        limit for the inbox and `RequestContext.getSignedKey()`, and the
+        `maxSignatures` option of `verifyRequest()` and
+        `verifyRequestDetailed()` for verifying requests directly.  Both
+        have to be positive integers or `Infinity`, which turns the limit
+        off; other values throw a `RangeError`.
+
+     -  When a cached key does not verify a signature, Fedify now fetches it
+        again for that signature only, instead of verifying every signature
+        of the request once more without the key cache.
 
  -  Changed cached actor public keys and remembered per-origin HTTP Message
     Signatures specs to expire, so a `KvStore` that never sees an explicit
@@ -29,32 +372,41 @@ To be released.
         the new *Clearing legacy cache entries* section of the
         [key–value store guide] to clear them proactively instead of waiting.
 
+ -  Changed the built-in document loader, context loader, and authenticated
+    document loader to time out each call after 10 seconds by default.
+    Previously, a remote server that responded slowly or never could hold
+    a request for as long as the runtime and the network allowed, e.g.,
+    an incoming activity whose signature key Fedify fetched, and the sender
+    picks such key URLs.  The time limit covers the whole call, including
+    every redirect and alternate document it follows, double-knocking
+    retries, and reading the response body.  A call that times out throws
+    a `FetchError` without a response, whose `cause` is a `DOMException`
+    named `"TimeoutError"`, so a key fetch that times out is reported as
+    a `keyFetchError` by `verifyRequestDetailed()` and is cached like other
+    failures to fetch a key.  Custom document loaders are not affected.
+    [[#1131], [#1169]]
+
+     -  Added `FederationOptions.documentLoaderTimeout` option to change
+        the time limit, or to turn it off with `null`.
+
+     -  Added the `timeout` option to `getAuthenticatedDocumentLoader()`.
+
+ -  Changed the built-in document loaders to read the body of an error
+    response before they throw a `FetchError`, at most 1 MiB, so that
+    the time limit also bounds reading it.  `FetchError.response` keeps
+    the body byte for byte, or only the status and headers if the body is
+    larger than that.  [[#1131], [#1169]]
+
+ -  Fixed outbound delivery circuit breaker transitions when a key–value
+    store compares encoded values.  Existing half-open states can now recover
+    after switching to a CAS-capable store.  [[#1163], [#1167]]
+
  -  Fixed `verifyProof()` so Ed25519 JCS proofs authenticate every received
     proof option except `proofValue`, including `expires`, `domain`,
     `challenge`, `nonce`, and extension options.  It now rejects expired or
     malformed proof options, and callers can provide expected `domain` and
     `challenge` values through `VerifyProofOptions` to prevent cross-domain or
     replay use.  [[#968]]
-
- -  Added `verifyPortableObjectProof()` to enforce the [FEP-ef61] proof policy
-    for portable actors, activities, objects, and signed collections.  Its
-    detailed result distinguishes documents outside the policy, unsecured
-    collections, missing or invalid [FEP-8b32] proofs, unsupported verification
-    methods, DID authority mismatches, and successful verification.
-    [[#832], [#968]]
-
- -  Updated `verifyObject()` so [FEP-8b32] proofs signed by `did:key`
-    verification methods can authenticate portable objects whose owner is an
-    `ap:` or `ap+ef61:` URI with the same [FEP-fe34] cryptographic origin.
-    [[#829], [#926]]
-
- -  Added local `did:key` verification method resolution for
-    [FEP-8b32] Object Integrity Proofs.  `verifyProof()` can now verify
-    Ed25519 `eddsa-jcs-2022` proofs whose `verificationMethod` is a
-    `did:key:z...#z...` DID URL without fetching the verification method
-    as a remote JSON-LD document, which is required for [FEP-ef61]
-    portable objects.
-    [[#827], [#915]]
 
  -  Added support for the [ActivityPub Media Upload extension] so that servers
     can accept client-to-server media uploads:
@@ -127,13 +479,15 @@ To be released.
     `esnext.temporal` lib reference.
     [[#823], [#925]]
 
-[key–value store guide]: https://fedify.dev/manual/kv
 [FEP-ef61]: https://w3id.org/fep/ef61
+[*Portable objects*]: https://fedify.dev/manual/portable
 [FEP-8b32]: https://w3id.org/fep/8b32
 [FEP-fe34]: https://w3id.org/fep/fe34
+[key–value store guide]: https://fedify.dev/manual/kv
 [ActivityPub Media Upload extension]: https://www.w3.org/wiki/SocialCG/ActivityPub/MediaUpload
 [Standard Schema]: https://standardschema.dev/
 [#206]: https://github.com/fedify-dev/fedify/issues/206
+[#288]: https://github.com/fedify-dev/fedify/issues/288
 [#754]: https://github.com/fedify-dev/fedify/issues/754
 [#797]: https://github.com/fedify-dev/fedify/issues/797
 [#798]: https://github.com/fedify-dev/fedify/issues/798
@@ -145,6 +499,13 @@ To be released.
 [#827]: https://github.com/fedify-dev/fedify/issues/827
 [#829]: https://github.com/fedify-dev/fedify/issues/829
 [#832]: https://github.com/fedify-dev/fedify/issues/832
+[#835]: https://github.com/fedify-dev/fedify/issues/835
+[#836]: https://github.com/fedify-dev/fedify/issues/836
+[#837]: https://github.com/fedify-dev/fedify/issues/837
+[#838]: https://github.com/fedify-dev/fedify/issues/838
+[#839]: https://github.com/fedify-dev/fedify/issues/839
+[#840]: https://github.com/fedify-dev/fedify/issues/840
+[#841]: https://github.com/fedify-dev/fedify/issues/841
 [#915]: https://github.com/fedify-dev/fedify/pull/915
 [#923]: https://github.com/fedify-dev/fedify/pull/923
 [#925]: https://github.com/fedify-dev/fedify/pull/925
@@ -152,9 +513,89 @@ To be released.
 [#927]: https://github.com/fedify-dev/fedify/pull/927
 [#930]: https://github.com/fedify-dev/fedify/issues/930
 [#934]: https://github.com/fedify-dev/fedify/pull/934
+[#938]: https://github.com/fedify-dev/fedify/issues/938
 [#968]: https://github.com/fedify-dev/fedify/pull/968
 [#1017]: https://github.com/fedify-dev/fedify/issues/1017
 [#1027]: https://github.com/fedify-dev/fedify/pull/1027
+[#1041]: https://github.com/fedify-dev/fedify/pull/1041
+[#1044]: https://github.com/fedify-dev/fedify/issues/1044
+[#1045]: https://github.com/fedify-dev/fedify/issues/1045
+[#1051]: https://github.com/fedify-dev/fedify/pull/1051
+[#1073]: https://github.com/fedify-dev/fedify/pull/1073
+[#1076]: https://github.com/fedify-dev/fedify/pull/1076
+[#1080]: https://github.com/fedify-dev/fedify/pull/1080
+[#1082]: https://github.com/fedify-dev/fedify/pull/1082
+[#1084]: https://github.com/fedify-dev/fedify/pull/1084
+[#1092]: https://github.com/fedify-dev/fedify/pull/1092
+[#1093]: https://github.com/fedify-dev/fedify/issues/1093
+[#1094]: https://github.com/fedify-dev/fedify/issues/1094
+[#1095]: https://github.com/fedify-dev/fedify/issues/1095
+[#1096]: https://github.com/fedify-dev/fedify/issues/1096
+[#1099]: https://github.com/fedify-dev/fedify/pull/1099
+[#1100]: https://github.com/fedify-dev/fedify/issues/1100
+[#1101]: https://github.com/fedify-dev/fedify/issues/1101
+[#1102]: https://github.com/fedify-dev/fedify/pull/1102
+[#1104]: https://github.com/fedify-dev/fedify/pull/1104
+[#1105]: https://github.com/fedify-dev/fedify/pull/1105
+[#1106]: https://github.com/fedify-dev/fedify/issues/1106
+[#1107]: https://github.com/fedify-dev/fedify/issues/1107
+[#1109]: https://github.com/fedify-dev/fedify/pull/1109
+[#1110]: https://github.com/fedify-dev/fedify/pull/1110
+[#1111]: https://github.com/fedify-dev/fedify/issues/1111
+[#1112]: https://github.com/fedify-dev/fedify/issues/1112
+[#1113]: https://github.com/fedify-dev/fedify/issues/1113
+[#1114]: https://github.com/fedify-dev/fedify/pull/1114
+[#1117]: https://github.com/fedify-dev/fedify/pull/1117
+[#1119]: https://github.com/fedify-dev/fedify/pull/1119
+[#1120]: https://github.com/fedify-dev/fedify/pull/1120
+[#1123]: https://github.com/fedify-dev/fedify/issues/1123
+[#1124]: https://github.com/fedify-dev/fedify/pull/1124
+[#1130]: https://github.com/fedify-dev/fedify/issues/1130
+[#1131]: https://github.com/fedify-dev/fedify/issues/1131
+[#1132]: https://github.com/fedify-dev/fedify/issues/1132
+[#1133]: https://github.com/fedify-dev/fedify/issues/1133
+[#1134]: https://github.com/fedify-dev/fedify/pull/1134
+[#1138]: https://github.com/fedify-dev/fedify/pull/1138
+[#1142]: https://github.com/fedify-dev/fedify/pull/1142
+[#1143]: https://github.com/fedify-dev/fedify/issues/1143
+[#1145]: https://github.com/fedify-dev/fedify/pull/1145
+[#1146]: https://github.com/fedify-dev/fedify/issues/1146
+[#1147]: https://github.com/fedify-dev/fedify/issues/1147
+[#1148]: https://github.com/fedify-dev/fedify/issues/1148
+[#1151]: https://github.com/fedify-dev/fedify/issues/1151
+[#1153]: https://github.com/fedify-dev/fedify/issues/1153
+[#1154]: https://github.com/fedify-dev/fedify/issues/1154
+[#1155]: https://github.com/fedify-dev/fedify/issues/1155
+[#1159]: https://github.com/fedify-dev/fedify/issues/1159
+[#1163]: https://github.com/fedify-dev/fedify/issues/1163
+[#1164]: https://github.com/fedify-dev/fedify/pull/1164
+[#1165]: https://github.com/fedify-dev/fedify/pull/1165
+[#1166]: https://github.com/fedify-dev/fedify/pull/1166
+[#1167]: https://github.com/fedify-dev/fedify/pull/1167
+[#1169]: https://github.com/fedify-dev/fedify/pull/1169
+[#1171]: https://github.com/fedify-dev/fedify/pull/1171
+[#1178]: https://github.com/fedify-dev/fedify/pull/1178
+[#1180]: https://github.com/fedify-dev/fedify/pull/1180
+[#1183]: https://github.com/fedify-dev/fedify/pull/1183
+[#1186]: https://github.com/fedify-dev/fedify/pull/1186
+[#1188]: https://github.com/fedify-dev/fedify/pull/1188
+[#1189]: https://github.com/fedify-dev/fedify/pull/1189
+[#1191]: https://github.com/fedify-dev/fedify/issues/1191
+[#1198]: https://github.com/fedify-dev/fedify/pull/1198
+[#1201]: https://github.com/fedify-dev/fedify/pull/1201
+
+### @fedify/adonisjs
+
+ -  Added the new *@fedify/adonisjs* package, an integration for the AdonisJS
+    framework.  It provides a server middleware that mounts a `Federation`
+    inside an AdonisJS application, a service provider that owns the
+    federation's lifecycle, a `node ace configure` hook that scaffolds
+    *config/fedify.ts* and the federation preload files, and a `ctx.federation`
+    request context.  The package targets Node.js and is published to npm only.
+    [[#139], [#1006] by Samuel Brinkmann\]
+
+[#139]: https://github.com/fedify-dev/fedify/issues/139
+[#1006]: https://github.com/fedify-dev/fedify/pull/1006
 
 ### @fedify/astro
 
@@ -173,19 +614,78 @@ To be released.
  -  Added \[SvelteKit\] option to `fedify init` command. This option allows
     users to initialize a new Fedify project with SvelteKit integration.
     [[#892], [#971] by Jang Hanarae\]
+
  -  Added `fedify.com.es` as a tunneling service.  The CLI pins the service's
     SSH host key and rejects a mismatched server before exposing a local port.
     [[#940]]
+
  -  Removed `localhost.run` as a tunneling service.  The service is no longer
     available, and the CLI now rejects attempts to use it.
     [[#940]]
+
  -  Switched the CLI's Temporal runtime dependency from
     `@js-temporal/polyfill` to `temporal-polyfill`.
     [[#823], [#925]]
 
+ -  Added support for [FEP-ef61] portable objects to the `fedify` command.
+    [[#288], [#1156], [#1199]]
+
+     -  `fedify lookup` now looks up portable objects by their `ap:` and
+        `ap+ef61:` IDs, compatible identifiers, and the WebFinger handles of
+        portable actors, and verifies their Object Integrity Proofs.
+        Previously, it failed to look up portable IDs, and refused portable
+        objects found through compatible identifiers as cross-origin objects.
+        The same applies to the collections that `-t`/`--traverse` traverses
+        and the objects that `--recurse` follows.  When no gateway returns
+        an acceptable object, the command tells why, e.g., that the object's
+        proof is invalid.
+
+     -  Added the `--gateway` option to `fedify lookup`, `fedify inbox`, and
+        `fedify webfinger`, which specifies the gateways to look up portable
+        objects from, e.g., for portable IDs without `@gateway` location
+        hints.
+
+     -  `fedify inbox -f`/`--follow` now follows portable actors, and
+        the `-a`/`--accept-follow` option of `fedify inbox` and
+        the `-a`/`--accept-follow` and `-r`/`--reject-follow` options of
+        `fedify relay` accept portable IDs and compatible identifiers, which
+        match the actor regardless of `@gateway` location hints and
+        the gateway of a compatible identifier.
+
+     -  `fedify webfinger` now accepts portable actor IDs.  As such an ID
+        does not tell which server to ask, the command looks up the actor
+        and then its WebFinger address, which consists of its
+        `preferredUsername` and the host of its first gateway, and reports
+        whether the response links back to the actor.
+
+ -  Fixed `fedify lookup --recurse` reporting a timeout or another network
+    failure of the first object or of a linked object as a possibly private
+    object, suggesting the `-a`/`--authorized-fetch` option.  It now reports
+    the actual cause, e.g., “Request timed out after 10 seconds,” like the
+    other modes of `fedify lookup` do.  [[#1156], [#1199]]
+
+ -  Fixed the `-p`/`--allow-private-address` option of `fedify webfinger`
+    being ignored.  [[#1156], [#1199]]
+
+ -  Changed `fedify lookup` to time out each request after 10 seconds when
+    the `-T`/`--timeout` option is not given, since the document loaders it
+    uses now have a default timeout.  Previously, there was no timeout by
+    default.  The `-T`/`--timeout` option now also limits how long
+    a request waits for a DNS lookup, though it cannot stop the lookup
+    itself.  [[#1131], [#1169]]
+
+ -  Updated Optique to 1.3.2.  This fixes several command-line parsing
+    issues, so options with attached values such as `--timeout=30` are
+    handled consistently, typo suggestions for mistyped options are more
+    accurate, and errors for known options are no longer hidden by
+    positional arguments before `--`.  [[#1197]]
+
 [#892]: https://github.com/fedify-dev/fedify/issues/892
 [#940]: https://github.com/fedify-dev/fedify/pull/940
 [#971]: https://github.com/fedify-dev/fedify/pull/971
+[#1156]: https://github.com/fedify-dev/fedify/issues/1156
+[#1197]: https://github.com/fedify-dev/fedify/pull/1197
+[#1199]: https://github.com/fedify-dev/fedify/pull/1199
 
 ### @fedify/debugger
 
@@ -259,8 +759,72 @@ To be released.
     when an actor dispatcher's return value does not include a
     `preferredUsername` property. [[#895], [#1022] by Jae-Hyuk-Jang\]
 
+ -  Added the `outbox-listener-delivery-not-awaited` rule to `@fedify/lint`.
+    It reports an outbox listener that calls `ctx.sendActivity()` or
+    `ctx.forwardActivity()` and drops the returned promise, so that the
+    activity may never leave on a runtime such as Cloudflare Workers, which
+    discards pending work once the response is returned. A call counts as
+    handled when its promise is awaited, returned, passed to `Promise.all()`
+    or `Promise.allSettled()`, or handed to `waitUntil()`, and `void`,
+    `Promise.race()` and `Promise.any()` are accepted as deliberate choices to
+    stop waiting.
+    The ESLint `recommended` configuration enables the rule as a warning and
+    `strict` as an error, and Oxlint users enable it by name. It is not
+    available in Deno Lint, which turns on every rule of a plugin at once.
+    [[#1057], [#1067] by Jae-Hyuk-Jang\]
+
+ -  Changed `outbox-listener-delivery-required` (`@fedify/lint`) to decide
+    whether a `ctx.sendActivity()`/`ctx.forwardActivity()` call actually
+    runs, instead of scanning the listener's source as a flat block of text.
+    It now reports a listener whose only delivery calls sit behind a dead
+    branch, after an unconditional `return`/`throw`, or inside a function
+    that is never used. When it cannot tell whether a delivery call runs, it
+    stays quiet: a function held under a name counts as used as soon as that
+    name is mentioned, however it is passed around, and an inline callback
+    counts wherever it is passed.
+    [[#900], [#1050] by Jae-Hyuk-Jang\]
+
+ -  Changed the actor URI mismatch rules to accept the [FEP-ef61] portable
+    IDs of actors and collections, and the compatible identifiers built from
+    them, so that applications can use the `getPortable*Uri()` methods of
+    `Context` in actor dispatchers without disabling these rules.
+    [[#288], [#1157], [#1179]]
+
+ -  Fixed `outbox-listener-delivery-required` and
+    `outbox-listener-delivery-not-awaited` (`@fedify/lint`) losing track of
+    the functions an object already holds when a nested helper in the
+    listener assigns another property of that object, as in
+    `target.fallback = () => {}`.  A listener that delivers through
+    `target.deliver()` after such an assignment is no longer reported as
+    undelivered, and a dropped delivery promise inside `target.deliver()` is
+    now reported.  A helper that declares its own object of the same name is
+    still checked separately from the outer one.  [[#1125], [#1140]]
+
+ -  Fixed `outbox-listener-delivery-required` and
+    `outbox-listener-delivery-not-awaited` (`@fedify/lint`) to properly
+    evaluate reachability in statically false loops (like `while (false)`) and
+    to correctly traverse `for...of` and `for...in` loop binding patterns.
+    Unreachable loop branches no longer count as deliveries, and
+    `outbox-listener-delivery-not-awaited` now correctly catches dropped
+    promises inside loop binding patterns.
+    Loop default functions are checked only when the bound value or target
+    object is referenced.  Delivery helpers used after an assignment-form
+    loop default remain recognized, including when unrelated blocks reuse
+    their names.
+    [[#1071], [#1088] by @ArchieTansaria\]
+
 [#895]: https://github.com/fedify-dev/fedify/issues/895
+[#900]: https://github.com/fedify-dev/fedify/issues/900
 [#1022]: https://github.com/fedify-dev/fedify/pull/1022
+[#1050]: https://github.com/fedify-dev/fedify/pull/1050
+[#1057]: https://github.com/fedify-dev/fedify/issues/1057
+[#1067]: https://github.com/fedify-dev/fedify/pull/1067
+[#1071]: https://github.com/fedify-dev/fedify/issues/1071
+[#1088]: https://github.com/fedify-dev/fedify/pull/1088
+[#1125]: https://github.com/fedify-dev/fedify/issues/1125
+[#1140]: https://github.com/fedify-dev/fedify/pull/1140
+[#1157]: https://github.com/fedify-dev/fedify/issues/1157
+[#1179]: https://github.com/fedify-dev/fedify/pull/1179
 
 ### @fedify/mysql
 
@@ -286,6 +850,22 @@ To be released.
 
 [#1010]: https://github.com/fedify-dev/fedify/issues/1010
 [#1029]: https://github.com/fedify-dev/fedify/pull/1029
+
+### @fedify/next
+
+ -  Added support for [FEP-ef61] hashlink media requests, e.g.,
+    `GET /.well-known/apgateway/hl:zQm...`, to `fedifyWith()`.  Clients fetch
+    such media with, e.g., `Accept: image/*`, so these requests were not
+    passed to Fedify unless they had federation media types in their headers,
+    and Next.js answered them instead of the hashlink media dispatcher.
+    `isFederationRequest()` now recognizes them by their paths regardless of
+    their headers.  To make Next.js run the middleware for them, add
+    `{ source: "/.well-known/apgateway/:path*" }` to the `matcher` of your
+    *middleware.ts* or *proxy.ts* file.  [[#288], [#1149], [#1170]]
+ -  Added `isHashlinkMediaRequest()` function.  [[#288], [#1149], [#1170]]
+
+[#1149]: https://github.com/fedify-dev/fedify/issues/1149
+[#1170]: https://github.com/fedify-dev/fedify/pull/1170
 
 ### @fedify/pglite
 
@@ -320,6 +900,12 @@ To be released.
 
 ### @fedify/redis
 
+ -  Added atomic `RedisKvStore.cas()` for standalone Redis and Redis Cluster.
+    Redis-backed deployments can now use portable inbox forwarding and other
+    features that need compare-and-swap.  Custom codecs must encode equal
+    values identically, and Redis must permit `EVAL`; deployments that deny
+    scripting can no longer rely on the previous non-CAS fallback.
+    [[#1163], [#1167]]
  -  Fixed the CommonJS Redis adapter build so it no longer requires
     `@js-temporal/polyfill` at runtime.  The build now bundles
     `temporal-polyfill`, while type declarations rely on the standard
@@ -351,86 +937,349 @@ To be released.
 
 ### @fedify/testing
 
+ -  Added support for [FEP-ef61] portable objects to the mock federation and
+    contexts, following the new APIs of `@fedify/fedify`, so that tests can
+    exercise portable objects without a live gateway.  [[#288]]
+
+     -  Added the `getPortableActorUri()`, `getPortableObjectUri()`,
+        `getPortableInboxUri()`, `getPortableOutboxUri()`,
+        `getPortableFollowingUri()`, `getPortableFollowersUri()`,
+        `getPortableLikedUri()`, `getPortableFeaturedUri()`,
+        `getPortableFeaturedTagsUri()`, and `getPortableCollectionUri()`
+        methods to the mock contexts.  They reject `did:key` DIDs that are
+        not encoded in base58-btc.
+        [[#835], [#839], [#841], [#1092], [#1111], [#1114], [#1142]]
+
+     -  Added the `portable` option to `parseUri()` of the mock contexts.
+        Without it, `parseUri()` no longer recognizes a portable ID or
+        compatible identifier whose path starts with `/users/`; with it,
+        the result has the DID in its `authority` property.  It also returns
+        `null` for `null`.  [[#1143], [#1145]]
+
+     -  The mock contexts that `createContext()` creates keep
+        the `verifyPortableObject` property given to them, and their
+        `lookupObject()` and `traverseCollection()` pass it on.
+        `createFederation()` accepts a fixture `documentLoader`,
+        a `contextLoader`, and `verifyPortableObject`, which mock context
+        lookups use for portable IDs.  [[#1107], [#1120], [#1161], [#1196]]
+
+     -  Added the `isSignedByAudience()` method to the mock request contexts,
+        which checks the audience against the actor that
+        `getSignedKeyOwner()` returns.  [[#1153], [#1183]]
+
+     -  `federation.createContext()` accepts an explicit `portableRequest`
+        for a request context, which dispatchers can inspect.
+        [[#1161], [#1196]]
+
+     -  Added the `mapPortableActorId()` method to the setters that
+        `MockFederation.setActorDispatcher()` returns, the
+        `mapPortableOwner()` method to the mock custom collection setters,
+        and the `setHashlinkMediaDispatcher()` method to the mock federation,
+        which serves hashlink media responses.
+        [[#838], [#840], [#1080], [#1099], [#1111], [#1142], [#1161], [#1196]]
+
+ -  Added support for registering `onRequestFinished()` on mock federations so
+    applications can reuse their inbox configuration in tests.
+    [[#1191], [#1201]]
+
  -  Added `testKvStore()`, a conformance test suite for `KvStore`
     implementations, complementing `testMessageQueue()`.
     [[#1018], [#1020] by ChanHaeng Lee\]
+
+ -  Changed `getObject()` of the mock context that `createFederation()`
+    creates to follow `RequestContext.getObject()` of `@fedify/fedify`: it
+    now returns `null` for a `Tombstone` that the object dispatcher returns,
+    unless the tombstone is an instance of the requested class or
+    `{ tombstone: "passthrough" }` is given.  [[#1112], [#1117]]
+
  -  Fixed the CommonJS testing utilities build so it no longer requires
     `@js-temporal/polyfill` at runtime.  The build now bundles
     `temporal-polyfill`, while type declarations rely on the standard
     `esnext.temporal` lib reference.
     [[#823], [#925]]
 
+[#1161]: https://github.com/fedify-dev/fedify/issues/1161
+[#1196]: https://github.com/fedify-dev/fedify/pull/1196
+
 ### @fedify/vocab
 
- -  Added [FEP-ef61] vocabulary terms for portable ActivityPub objects.
-    Actor classes now expose ordered `gateways` lists, and `Link` plus
-    document/media classes expose `digestMultibase` for external resource
-    integrity metadata.
-    [[#830], [#928]]
- -  Updated [FEP-fe34] cross-origin checks to understand cryptographic origins
-    for [FEP-ef61] portable ActivityPub IDs and DID URLs.  Generated property
-    accessors and `lookupObject()` now treat `ap:`/`ap+ef61:` IDs and matching
-    `did:key` verification method IDs as same-origin when their DID components
-    match.
-    [[#829], [#926]]
- -  Added support for [FEP-ef61] portable ActivityPub IRIs in generated
-    vocabulary codecs.  `ap:` and `ap+ef61:` values with decoded or
-    percent-encoded DID authorities now parse as `URL` objects, and JSON-LD
-    serialization emits canonical `ap+ef61:` values with decoded DID
-    authorities.
-    [[#826], [#850]]
+ -  Added support for [FEP-ef61] portable objects, whose IDs are `ap:` or
+    `ap+ef61:` URIs with a DID instead of a host, e.g.,
+    `ap://did:key:z6Mk.../actor`, and which are retrieved through the
+    servers listed in their actors' `gateways`.  See the
+    [*Portable objects*] chapter of the manual for the
+    FEP-ef61 profile that Fedify supports.  [[#288]]
+
+     -  Generated vocabulary classes now accept portable IDs with decoded or
+        percent-encoded DID authorities wherever an IRI is expected, and
+        serialize them as canonical `ap+ef61:` IRIs with decoded DID
+        authorities.  Inspecting vocabulary objects, e.g., with
+        `console.log()`, also shows them in this form.
+        [[#826], [#850], [#1156], [#1199]]
+
+     -  Added the `gateways` property to actor classes, and the
+        `digestMultibase` property to `Link` and document and media classes.
+        Gateways are serialized as origins without a trailing slash.
+        A portable actor that uses the `gateways` term without mapping it in
+        its JSON-LD context, as tootik does, is also read.
+        [[#830], [#928], [#1097], [#1202]]
+
+     -  Added the optional `Recipient.gateways` property, through which Fedify
+        delivers activities to portable inboxes.  Applications that build
+        `Recipient` objects by hand, e.g., in followers collection
+        dispatchers, need to set it for portable actors.  [[#1147], [#1180]]
+
+     -  Property accessors such as `Create.getObject()` now fetch portable
+        references through gateways: those in the new `gateways` option, or
+        else those in the `@gateway` location hints of the reference.  A
+        reference without hints that has the same DID as a portable actor it
+        was reached from, e.g., the actor's `outbox`, is fetched through that
+        actor's `gateways`. A fetched object is returned only if its `@id`
+        identifies the referenced portable object and the verifier given as the
+        new `verifyPortableObject` option accepts it, typically
+        `verifyPortableObject()` from `@fedify/fedify`, or a `Context` passed
+        as the options.  Portable references cannot be dereferenced without the
+        option, and `crossOrigin: "trust"` does not skip these checks.
+        [[#834], [#1077], [#1093], [#1105]]
+
+     -  Property accessors tell the `verifyPortableObject` function where
+        a portable object was retrieved from and which objects led to it, so
+        that it can accept a portable collection without a proof if a gateway
+        that its owner lists served it.  Objects embedded in such a collection
+        are fetched and verified one by one.  Added the `crossOrigin`,
+        `gateways`, and `verifyPortableObject` options to
+        `TraverseCollectionOptions` as well.  [[#836], [#1084]]
+
+     -  Added the `verifyPortableObject` option to the constructors,
+        the `fromJsonLd()` methods, and the `clone()` methods of vocabulary
+        classes, which sets the verifier that the object's property accessors
+        use by default.  Objects embedded in the parsed document, and objects
+        that accessors and `traverseCollection()` fetch, get the verifier of
+        the call or of their parent by default, so that, e.g.,
+        `(await create.getObject(ctx))?.getAttribution()` verifies portable
+        objects without passing `ctx` again.  Having a default verifier does
+        not mean that an object was verified.  Added
+        the `inheritPortableObjectVerifier` option to property accessors and
+        `TraverseCollectionOptions` to limit a verifier to a single call.
+        [[#1107], [#1120], [#1129], [#1137]]
+
+     -  Added the `verifyPortableObject` and `gateways` options to
+        `LookupObjectOptions`.  With the former, `lookupObject()` looks up
+        portable IDs through their `@gateway` location hints or the gateways
+        given by the latter, compatible identifiers through the gateways they
+        name, and the handles of portable actors through their WebFinger
+        responses, trying at most five gateways per lookup.  The gateways
+        that it infers from compatible identifiers, WebFinger responses, and
+        location hints are passed to the `verifyPortableObject` function as
+        `gatewayHints`, while `gateways` has the ones given explicitly.
+        [[#837], [#1082], [#1090], [#1091], [#1158], [#1194]]
+
+     -  `getActorHandle()` now supports portable actors.  It takes the domain
+        of a portable actor's handle from the first gateway in its `gateways`,
+        and returns the handle only if its WebFinger response links back to
+        the actor.  [[#837], [#1082]]
+
+     -  Exported the portable object verifier types and other types used in
+        vocabulary API signatures from `@fedify/vocab`, so that custom
+        verifiers can be typed without importing `@fedify/vocab-runtime`.
+        [[#1160], [#1184]]
+
+ -  Changed property accessors and `lookupObject()` so that they no longer
+    trust [FEP-ef61] compatible identifiers, i.e., HTTP(S) URLs under
+    a gateway's */.well-known/apgateway/* path such as
+    `https://gw.example/.well-known/apgateway/did:key:z6Mk.../actor`, because
+    of the origin that serves them.  Anyone can serve a compatible identifier
+    for any DID, so previously anyone could serve an unsigned object that
+    claimed to be someone else's portable object.
+    [[#288], [#837], [#1082], [#1090], [#1091], [#1107], [#1120]]
+
+     -  With the `verifyPortableObject` option, a compatible identifier is
+        dereferenced as the portable object it stands for: through the
+        gateway that it names and then the gateways in the `gateways` option,
+        only if the option accepts the object.  A document fetched from
+        an ordinary HTTP(S) URL is verified the same way if its final URL is
+        a compatible identifier or its `@id` is a portable ID.  Malformed
+        compatible identifiers are rejected without a request.
+
+     -  Without the option, accessors keep fetching compatible identifiers as
+        ordinary HTTP(S) URLs, but no longer cache the results in the parent
+        objects, so that a later call with the option verifies them.
+        However, accessors of an object whose ID is a portable ID or
+        a compatible identifier now throw a `TypeError` (or return `null` with
+        `suppressError: true`) for such references without the option, as
+        for portable IDs.
+
+     -  Accessors no longer trust an embedded object whose `@id` is
+        a compatible identifier, or a portable ID with a DID other than its
+        parent's, even with `crossOrigin: "trust"`; they dereference and
+        verify it on its own.  Likewise, `crossOrigin: "trust"` no longer
+        makes `lookupObject()` return an object with a portable `@id` from
+        a document URL of another origin.
+
+ -  Updated [FEP-fe34] cross-origin checks to understand the cryptographic
+    origins of [FEP-ef61] portable IDs and DID URLs.  Property accessors and
+    `lookupObject()` now treat `ap:` and `ap+ef61:` IDs and `did:key`
+    verification method IDs as the same origin when their DIDs match.
+    [[#288], [#829], [#926]]
+
+ -  Changed nested serialization so that an object carrying the signed
+    JSON-LD representation that `signObject()` retains is embedded with that
+    exact representation, including its own `@context`, rather than being
+    rebuilt under the parent's context, so that its proof keeps verifying.
+    `clone()` never carries the retained representation, because a clone may
+    differ from the document the proof covers.  [[#288], [#1044], [#1051]]
+
  -  Added vocabulary support for [FEP-7aa9], including
     `FeaturedCollection`, `FeaturedItem`, `FeatureRequest`, and
     `FeatureAuthorization`, plus actor `featuredCollections` and
     `InteractionPolicy.canFeature` properties.
     [[#810], [#914]]
+
  -  Added the `Endpoints.uploadMedia` property, the standard ActivityStreams
     endpoint for the [ActivityPub Media Upload extension].
     [[#754], [#927]]
+
  -  Fixed the CommonJS vocabulary build so it no longer requires
     `@js-temporal/polyfill` at runtime.  The build now bundles
     `temporal-polyfill`, while type declarations rely on the standard
     `esnext.temporal` lib reference.
     [[#823], [#925]]
 
+ -  Added vocabulary support for the [FEP-22cd] draft, associating each
+    translated version with its translators, source object, and optional source
+    review timestamp.  [[#1037], [#1038]]
+
+     -  Added `Translation` class with `id`, `language`, `original`,
+        `sourceUpdated`, `basis`, `url`, and `urls` properties.
+     -  Added `Translation.getTranslator()`/`Translation.translatorId` and
+        `Translation.getTranslators()`/`Translation.translatorIds` for
+        accessing credited actors.  The constructor accepts `translator`
+        and `translators` values.
+     -  Added `Object.translations` property, inherited by `Article`,
+        `Note`, and other object types, for per-language translation
+        metadata without creating separate posts.
+
+[FEP-22cd]: https://w3id.org/fep/22cd
 [#810]: https://github.com/fedify-dev/fedify/issues/810
 [#826]: https://github.com/fedify-dev/fedify/issues/826
 [#830]: https://github.com/fedify-dev/fedify/issues/830
+[#834]: https://github.com/fedify-dev/fedify/issues/834
 [#850]: https://github.com/fedify-dev/fedify/pull/850
 [#914]: https://github.com/fedify-dev/fedify/pull/914
 [#928]: https://github.com/fedify-dev/fedify/pull/928
+[#1037]: https://github.com/fedify-dev/fedify/issues/1037
+[#1038]: https://github.com/fedify-dev/fedify/pull/1038
+[#1077]: https://github.com/fedify-dev/fedify/pull/1077
+[#1090]: https://github.com/fedify-dev/fedify/issues/1090
+[#1091]: https://github.com/fedify-dev/fedify/pull/1091
+[#1097]: https://github.com/fedify-dev/fedify/issues/1097
+[#1129]: https://github.com/fedify-dev/fedify/issues/1129
+[#1137]: https://github.com/fedify-dev/fedify/pull/1137
+[#1158]: https://github.com/fedify-dev/fedify/issues/1158
+[#1160]: https://github.com/fedify-dev/fedify/issues/1160
+[#1184]: https://github.com/fedify-dev/fedify/pull/1184
+[#1194]: https://github.com/fedify-dev/fedify/pull/1194
+[#1202]: https://github.com/fedify-dev/fedify/pull/1202
 
 ### @fedify/vocab-runtime
 
- -  Added SHA-256 `digestMultibase` and simple `hl:` hashlink helpers for
-    computing, parsing, creating, and verifying portable media resource
-    digests as required by [FEP-ef61].
-    [[#831], [#935]]
- -  Added the [FEP-ef61] JSON-LD context to the preloaded context registry so
-    portable actor and media documents can compact and expand `gateways` and
-    `digestMultibase` without fetching the context remotely.
-    [[#830], [#928]]
- -  Added `getFe34Origin()` and `haveSameFe34Origin()` for comparing ordinary
-    web origins and [FEP-ef61] cryptographic origins with one shared
-    [FEP-fe34] helper.  HTTP(S) URLs keep web-origin semantics, while
-    `ap:`/`ap+ef61:` URIs and DID URLs use their DID component as the origin.
-    [[#829], [#926]]
- -  Added `canonicalizePortableUri()` and `arePortableUrisEqual()` for
-    comparing [FEP-ef61] portable ActivityPub URI strings.  The helpers accept
-    `ap:` and `ap+ef61:` values with decoded or percent-encoded DID
-    authorities, normalize them to `ap+ef61:`, and ignore query hints such as
-    `gateways` during comparison.
-    [[#828], [#924]]
+ -  Added <https://w3id.org/fep/22cd> to preloaded JSON-LD contexts.
+    [[#1037], [#1038]]
+
+ -  Added support for [FEP-ef61] portable objects, whose IDs are `ap:` or
+    `ap+ef61:` URIs with a DID instead of a host, e.g.,
+    `ap://did:key:z6Mk.../actor`.  See the
+    [*Portable objects*] chapter of the manual for the
+    FEP-ef61 profile that Fedify supports.  [[#288]]
+
+     -  Added `parseIri()`, `formatIri()`, `parseJsonLdId()`, and
+        `haveSameIriOrigin()`, which parse, format, and compare IRIs,
+        including portable IDs with decoded or percent-encoded DID
+        authorities.  The `URL` objects that represent portable IDs keep
+        their DIDs percent-encoded, and `formatIri()` formats them in their
+        canonical form, e.g., `ap+ef61://did:key:z6Mk.../actor`.  Portable
+        IDs and compatible identifiers whose paths have `.` or `..`
+        segments, which the `URL` class would remove, are rejected with
+        a `TypeError`.  [[#826], [#850], [#1154], [#1186]]
+
+     -  Added `canonicalizePortableUri()` and `arePortableUrisEqual()` for
+        comparing portable IDs.  They accept both schemes with decoded or
+        percent-encoded DID authorities, normalize them to `ap+ef61:`, and
+        ignore the query, including `@gateway` location hints.
+        Fedify deliberately canonicalizes to `ap+ef61:` rather than `ap:`,
+        which FEP-ef61 currently recommends, and this may change in
+        Fedify 3.0, so compare portable IDs with
+        `arePortableUrisEqual()` rather than as strings.
+        [[#828], [#924], [#1151], [#1198]]
+
+     -  Added `getFe34Origin()` and `haveSameFe34Origin()`, which compare
+        [FEP-fe34] origins: HTTP(S) URLs have their web origins, while
+        portable IDs and DID URLs have their DIDs as their cryptographic
+        origins.  [[#829], [#926]]
+
+     -  Added `exportDidKey()`, `importDidKey()`, and
+        `parseDidKeyVerificationMethod()` for Ed25519 `did:key` DIDs and
+        their verification method DID URLs.  `exportDidKey()` always
+        encodes DIDs in base58-btc, as FEP-ef61 requires.  [[#827], [#915]]
+
+     -  Added `toCompatibleEf61Id()` and `fromCompatibleEf61Id()` for
+        converting between portable IDs and compatible identifiers, i.e.,
+        HTTP(S) URLs under a gateway's */.well-known/apgateway/* path such as
+        `https://example.com/.well-known/apgateway/did:key:z6Mk.../actor`,
+        which software without portable ID support can use.
+        `fromCompatibleEf61Id()` returns `null` for URLs that are not
+        compatible identifiers, and throws a `TypeError` for malformed ones,
+        including those with location hints.  Converting a compatible
+        identifier does not authenticate it.  [[#833], [#1074]]
+
+     -  Added `isGatewayUrl()` and `parseGatewayUrl()`, which check that
+        a gateway is an HTTP(S) origin without credentials, a path, a query,
+        or a fragment, as FEP-ef61 requires.
+        [[#830], [#928], [#1176], [#1190]]
+
+     -  Added `withGatewayHints()`, `withoutGatewayHints()`, and
+        `getGatewayHints()` to add, remove, and read the `@gateway` location
+        hints of portable IDs, which tell consumers where to retrieve
+        a referenced portable actor.  [[#1159], [#1189]]
+
+     -  Added SHA-256 `digestMultibase` and `hl:` hashlink helpers:
+        `computeDigestMultibase()`, `parseDigestMultibase()`,
+        `verifyDigestMultibase()`, `createHashlink()`, `parseHashlink()`,
+        and `verifyHashlink()`.  [[#831], [#935]]
+
+     -  Added `fetchPortableMedia()`, which retrieves the media of a portable
+        object through its owner's gateways, or an HTTP(S) resource directly,
+        and returns it only after verifying its `digestMultibase`.
+        It limits the response size and rejects private network addresses by
+        default.  [[#1152], [#1182]]
+
+     -  Added the FEP-ef61 JSON-LD context to the preloaded contexts, so that
+        `gateways` and `digestMultibase` can be compacted and expanded
+        without fetching the context.  [[#830], [#928]]
+
+     -  Added the `PortableObjectVerifier`, `PortableObjectVerifierOptions`,
+        `PortableObjectVerification`, and `PortableObjectReferrer` types,
+        which describe the `verifyPortableObject` option of property
+        accessors.  A verifier receives a fetched document along with its
+        final URL, the gateways used, and the chain of objects that referred
+        to it, and can accept a collection without a proof as `unsecured`.
+        [[#834], [#836], [#1077], [#1084]]
+
+     -  Added the `verifyPortableObject` property to
+        `PropertyPreprocessorContext`, the default verifier that objects
+        returned by a property preprocessor should use.  [[#1107], [#1120]]
+
+ -  Changed the `Accept` header that document loaders send when fetching
+    ActivityPub objects to
+    `application/activity+json, application/ld+json; profile="https://www.w3.org/ns/activitystreams"`,
+    as ActivityPub and [FEP-ef61] gateways require.  Previously, the JSON-LD
+    media type lacked the ActivityStreams profile.  [[#288], [#834], [#1077]]
+
  -  Added the [FEP-7aa9] JSON-LD context to the preloaded context registry so
     FEP-7aa9 documents can be compacted and expanded without fetching the
     context remotely.
     [[#810], [#914]]
- -  Added helpers for Ed25519 `did:key` DIDs and verification method DID
-    URLs: `exportDidKey()` exports public keys to base58-btc `did:key` DIDs,
-    `importDidKey()` imports supported DIDs back to `CryptoKey`, and
-    `parseDidKeyVerificationMethod()` validates `did:key:z...#z...`
-    verification methods.
-    [[#827], [#915]]
+
  -  Changed `getDocumentLoader()` to reject HTML and XHTML responses that do
     not advertise an ActivityPub alternate document with a `FetchError`
     instead of attempting to parse the HTML as JSON.  This makes remote HTML
@@ -438,12 +1287,392 @@ To be released.
     content type, rather than generic JSON parser crashes.
     [[#912], [#913]]
 
+ -  Changed `getDocumentLoader()` to time out each call after 10 seconds by
+    default.  The time limit covers the whole call, including every redirect
+    and alternate document it follows and reading the response body.
+    A call that times out throws a `FetchError` without a response, whose
+    `cause` is a `DOMException` named `"TimeoutError"`.  An `AbortSignal`
+    passed as the `signal` option still cancels a call as before.
+    [[#1131], [#1169]]
+
+     -  Added `DocumentLoaderFactoryOptions.timeout` option, in milliseconds,
+        to change the time limit, or to turn it off with `null`.
+
+ -  Changed `getDocumentLoader()` to read the body of an error response
+    before it throws a `FetchError`, at most 1 MiB, so that the time limit
+    also bounds reading it.  `FetchError.response` keeps the body byte for
+    byte, or only the status and headers if the body is larger than that.
+    [[#1131], [#1169]]
+
 [#828]: https://github.com/fedify-dev/fedify/issues/828
 [#831]: https://github.com/fedify-dev/fedify/issues/831
+[#833]: https://github.com/fedify-dev/fedify/issues/833
 [#912]: https://github.com/fedify-dev/fedify/issues/912
 [#913]: https://github.com/fedify-dev/fedify/pull/913
 [#924]: https://github.com/fedify-dev/fedify/pull/924
 [#935]: https://github.com/fedify-dev/fedify/pull/935
+[#1074]: https://github.com/fedify-dev/fedify/pull/1074
+[#1152]: https://github.com/fedify-dev/fedify/issues/1152
+[#1176]: https://github.com/fedify-dev/fedify/issues/1176
+[#1182]: https://github.com/fedify-dev/fedify/pull/1182
+[#1190]: https://github.com/fedify-dev/fedify/pull/1190
+
+### @fedify/vocab-tools
+
+ -  Added the `extraContext` property schema option to include a JSON-LD
+    context only when its terms are used, preserving existing output for
+    objects without the extension.  [[#1037], [#1038]]
+ -  Added the `trustEmbeddedObjects` type schema option so embedded metadata
+    identifiers need not establish trust in linked actors.  [[#1037], [#1038]]
+ -  Changed suppressed vocabulary fetch and parsing failures to log at the
+    warning level so that intentionally handled failures are not reported as
+    application errors.  [[#933], [#1035] by Jae Hui Hong\]
+
+[#933]: https://github.com/fedify-dev/fedify/issues/933
+[#1035]: https://github.com/fedify-dev/fedify/pull/1035
+
+
+Version 2.3.10
+--------------
+
+Released on September 30, 2026.
+
+### @fedify/fedify
+
+ -  Fixed `Context.routeActivity()` passing the caller's unverified document to
+    inbox queues and forwarding after verifying a fetched activity.  Queued
+    listeners and forwarding now use the verified activity's document.
+    [[GHSA-39gj-rchc-q5m3]]
+ -  Fixed custom collections named with symbols so they can be served and
+    parsed, including ordered collections and pages.  Applications using
+    symbol names no longer need to replace them with strings.
+    [[#1144], [#1173]]
+
+[GHSA-39gj-rchc-q5m3]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-39gj-rchc-q5m3
+[#1144]: https://github.com/fedify-dev/fedify/issues/1144
+[#1173]: https://github.com/fedify-dev/fedify/pull/1173
+
+### @fedify/cfworkers
+
+ -  Fixed `WorkersKvStore` treating stored `null` values as missing keys when
+    reading or listing.  Applications can now store and retrieve `null`
+    without losing it.
+    [[#1175], [#1181]]
+
+[#1175]: https://github.com/fedify-dev/fedify/issues/1175
+[#1181]: https://github.com/fedify-dev/fedify/pull/1181
+
+### @fedify/denokv
+
+ -  Fixed `DenoKvStore` treating stored `null` values as missing keys when
+    reading, listing, or comparing values.  Applications can now store and
+    retrieve `null` without losing it.
+    [[#1175], [#1181]]
+
+### @fedify/lint
+
+ -  Fixed `outbox-listener-delivery-required` treating a delivery function
+    installed by an uncalled or late local setup helper as delivered.  The rule
+    now considers a direct setup call before the installed function is used.
+    [[#1126], [#1174]]
+
+[#1126]: https://github.com/fedify-dev/fedify/issues/1126
+[#1174]: https://github.com/fedify-dev/fedify/pull/1174
+
+
+Version 2.3.9
+-------------
+
+Released on September 29, 2026.
+
+### @fedify/fedify
+
+ -  DNS failures during initial inbox validation now record failed delivery
+    metrics, matching DNS failures during redirect validation.  Both paths
+    count toward the outbox circuit breaker, including DNS lookups that
+    return no usable IP addresses.  Private-address rejections retain their
+    existing behavior. [[#1055]]
+ -  Fixed an unhandled error when a POST request has multiple RFC 9421
+    signatures covering `Content-Digest` and an earlier signature fails.
+    Verification now reads the body once, allowing later valid signatures
+    to be accepted and invalid requests to receive `401 Unauthorized`.
+    [[#1108], [#1128]]
+ -  Fixed `getAuthenticatedDocumentLoader()` and `getNodeInfo()` logging
+    hostnames that fail to resolve as if they had been blocked for pointing
+    at a private address, which could send operators looking for an SSRF
+    attempt when a remote instance was simply gone.  These failures are now
+    logged as “DNS lookup failed for {url}”: at the debug level by
+    `getAuthenticatedDocumentLoader()`, and at the error level by
+    `getNodeInfo()`, as with its other network failures.
+    [[#1062], [#1065]]
+ -  Fixed `getAuthenticatedDocumentLoader()` following unbounded chains of
+    alternate document links, which could exhaust resources during remote key
+    and document resolution.  Alternate links now share the 20-hop limit and
+    loop detection with HTTP redirects, and preserve the caller's cancellation
+    signal.  \[[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed malformed activity URLs causing an unhandled error on Cloudflare
+    Workers instead of a `400 Bad Request` response.
+    [[#1115], [#1121]]
+ -  Fixed outbound delivery raising `UrlError` instead of `FetchError` when
+    resolving an inbox or redirect hostname fails or returns no usable IP
+    addresses.  Applications can now distinguish these network failures from
+    disallowed destinations; the original error is preserved in `cause`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+
+[GHSA-97w4-f4rq-mgqm]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-97w4-f4rq-mgqm
+[#1055]: https://github.com/fedify-dev/fedify/issues/1055
+[#1060]: https://github.com/fedify-dev/fedify/pull/1060
+[#1062]: https://github.com/fedify-dev/fedify/issues/1062
+[#1065]: https://github.com/fedify-dev/fedify/pull/1065
+[#1108]: https://github.com/fedify-dev/fedify/issues/1108
+[#1115]: https://github.com/fedify-dev/fedify/issues/1115
+[#1121]: https://github.com/fedify-dev/fedify/pull/1121
+[#1128]: https://github.com/fedify-dev/fedify/pull/1128
+
+### @fedify/cli
+
+ -  Fixed `fedify lookup` suggesting authorized fetch when a DNS URL validation
+    error reaches its error handler.  The hint now suggests checking the
+    hostname and network connectivity, and distinguishes DNS failures from
+    private-address rejections. [[#1064]]
+ -  The `fedify lookup` command now reports HTTP, DNS, and parsing failures
+    instead of suggesting authorized fetch for every failure.  It only suggests
+    `-a`/`--authorized-fetch` for unsigned object requests that return HTTP 401,
+    403, or 404.  Failed lookups retain successful results from other URLs, and
+    request timeouts report the `-T`/`--timeout` guidance.
+    [[#1063], [#1116]]
+
+[#1063]: https://github.com/fedify-dev/fedify/issues/1063
+[#1064]: https://github.com/fedify-dev/fedify/issues/1064
+[#1116]: https://github.com/fedify-dev/fedify/pull/1116
+
+### @fedify/express
+
+ -  Fixed `integrateFederation()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+[#1059]: https://github.com/fedify-dev/fedify/issues/1059
+[#1061]: https://github.com/fedify-dev/fedify/pull/1061
+[#1068]: https://github.com/fedify-dev/fedify/pull/1068
+
+### @fedify/fastify
+
+ -  Fixed the plugin failing every request with a body on Node.js.  Building
+    the `Request` for Fedify threw
+    `RequestInit: duplex option is required when sending a body.`, so every
+    `POST` or `PUT` got a 500 response, including activities delivered to the
+    inbox.
+    [[#1059], [#1061]]
+ -  Fixed the plugin breaking the request bodies of routes that Fedify does
+    not handle.  The plugin started reading the body of every non-`GET`
+    request in its `onRequest` hook, before Fedify decided whether the route
+    was its own.  On Deno, which does not require the `duplex` option,
+    Fastify's own parsing of a large body could then hang.  The plugin now
+    reads the body only when Fedify handles the request.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/koa
+
+ -  Fixed `createMiddleware()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/lint
+
+ -  Fixed `outbox-listener-delivery-required` reporting a warning when an outbox
+    listener delegates delivery to a helper declared in the same file.  Called
+    helpers are now followed through function declarations, function bindings,
+    and object-literal methods, including recursive helper calls.  Helpers
+    imported from other files are not analyzed.
+    [[#1054], [#1103]]
+
+[#1054]: https://github.com/fedify-dev/fedify/issues/1054
+[#1103]: https://github.com/fedify-dev/fedify/pull/1103
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` rejecting `null` values with a PostgreSQL constraint
+    error.  Callers can now store JSON `null`.
+    [[#1042], [#1056]]
+ -  Fixed `PostgresMessageQueue.listen()` returning before `UNLISTEN` finished
+    after aborting.  Awaiting the listener now waits for subscription cleanup
+    before the SQL client can be closed.  Cleanup errors are logged instead of
+    becoming unhandled rejections.
+    [[#1081], [#1089]]
+
+[#1042]: https://github.com/fedify-dev/fedify/issues/1042
+[#1056]: https://github.com/fedify-dev/fedify/pull/1056
+[#1081]: https://github.com/fedify-dev/fedify/issues/1081
+[#1089]: https://github.com/fedify-dev/fedify/pull/1089
+
+### @fedify/testing
+
+ -  Fixed mock actor, object, and collection dispatcher setters returning the
+    federation instead of the setters object, which caused chained settings
+    to fail with a `TypeError`.  Settings can now be chained as with a real
+    federation.
+    [[#1098], [#1127]]
+
+[#1098]: https://github.com/fedify-dev/fedify/issues/1098
+[#1127]: https://github.com/fedify-dev/fedify/pull/1127
+
+### @fedify/vocab
+
+ -  Fixed parsing a `Note`, `Article`, `ChatMessage`, or `Question` throwing
+    `TypeError: Invalid URL` when the sender's JSON-LD context declared
+    `_misskey_quote`, `quoteUri`, or `quoteUrl` with `"@type": "@id"`, as
+    Misskey-compatible servers do.  Such terms expand to a node carrying `@id`
+    rather than `@value`, and only `@value` was read.  A quote URL that cannot
+    be parsed at all, such as an inlined quote object without an `id`, is now
+    ignored instead of failing the whole object, and ATProto `at://` quote
+    URLs are accepted.
+    [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed `suppressError: true` being ignored when vocabulary accessors parsed
+    embedded JSON-LD values.  Malformed values are now skipped by iterators or
+    returned as `null` by singular accessors; calls without suppression continue
+    to throw.
+    [[#937], [#1136]]
+
+[#937]: https://github.com/fedify-dev/fedify/issues/937
+[#1015]: https://github.com/fedify-dev/fedify/issues/1015
+[#1043]: https://github.com/fedify-dev/fedify/pull/1043
+[#1136]: https://github.com/fedify-dev/fedify/pull/1136
+
+### @fedify/vocab-runtime
+
+ -  Added `UrlError.reason` to distinguish DNS resolution failures (`"dns"`)
+    from disallowed URLs (`"disallowed"`) without inspecting error messages
+    or `cause`.  Existing constructor calls default to `"disallowed"`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+ -  Added the [FEP-7aa9] context to the preloaded JSON-LD contexts.  The default
+    document loader now resolves <https://w3id.org/fep/7aa9> locally, so
+    transient Codeberg Pages outages no longer prevent otherwise valid inbound
+    documents from being parsed or verified.
+    [[#1078], [#1079]]
+ -  Fixed `getDocumentLoader()` following unbounded chains of alternate document
+    links, which could exhaust resources during remote key and document
+    resolution.  Alternate links now share the 20-hop limit and loop detection
+    with HTTP redirects, and preserve the caller's cancellation signal.
+    [[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed `getDocumentLoader()` logging hostnames that fail to resolve as
+    “Disallowed private URL” errors, as if they had been blocked for pointing
+    at a private address.  These failures are now logged as “DNS lookup
+    failed for {url}” at the debug level, and the thrown `UrlError` is
+    unchanged.  [[#1062]]
+
+[#1078]: https://github.com/fedify-dev/fedify/issues/1078
+[#1079]: https://github.com/fedify-dev/fedify/pull/1079
+
+### @fedify/vocab-tools
+
+ -  Fixed generated decoders for properties whose range is `fedify:url`
+    reading only literal (`@value`) values, so an IRI-valued (`@id`) value
+    made them throw `TypeError: Invalid URL`.  They now read both forms,
+    accept ATProto `at://` URIs, and skip a value that cannot be parsed
+    instead of throwing.
+    [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed generated vocabulary accessors ignoring `suppressError: true` when
+    parsing embedded JSON-LD values.  Generated iterators now skip malformed
+    values, and singular accessors return `null`; calls without suppression
+    continue to throw.
+    [[#937], [#1136]]
+
+### @fedify/webfinger
+
+ -  Fixed `lookupWebFinger()` logging hostnames that fail to resolve as
+    “Invalid URL for WebFinger resource descriptor” errors.  These failures
+    are now logged as “DNS lookup failed for {url}” at the debug level.
+    `lookupWebFinger()` still returns `null` in this case.
+    [[#1062]]
+
+
+Version 2.3.8
+-------------
+
+Released on September 22, 2026.
+
+### @fedify/fedify
+
+ -  Fixed the inbox accepting activities from any actor at all.  Fedify
+    verified the signature on an incoming delivery, but took the signing key's
+    own word for whom it belonged to: the `owner` of a `CryptographicKey` and
+    the `controller` of a `Multikey` were believed as served, even though the
+    key document and the claim inside it come from the same host.  Anyone with
+    an ordinary HTTP server could therefore have an activity accepted as
+    coming from any actor in the world, whether or not that actor existed.
+    All three inbound authentication paths were affected—HTTP Signatures,
+    Linked Data Signatures, and Object Integrity Proofs—and the latter two
+    require no HTTP signature on the request at all.  A key's claimed owner is
+    now resolved and has to link back to the key before the key is usable, and
+    a key that names no owner of its own is attributed to the actor whose
+    document carried it.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed `getKeyOwner()`, and therefore `Context.getSignedKeyOwner()`,
+    accepting a key document dressed up as another origin's actor document.
+    A host that served a key could describe itself as any actor and list the
+    key as that actor's own, which let an attacker pass an authorized fetch
+    under a borrowed identity and read whatever access control had reserved
+    for it.  Only the origin that serves an actor id can now speak for it.
+    [[GHSA-q9f8-5hc7-898f]]
+ -  Public keys cached before this release are no longer read back, since the
+    owner recorded in them was never verified.  Applications using the
+    built-in key cache need no action; those passing a custom `KeyCache`
+    implementation to `verifyRequest()`, `verifyJsonLd()`, or `verifyObject()`
+    should discard its contents once on upgrade.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed an SSRF vulnerability in outbound activity delivery that allowed inbox
+    URLs and redirects to target private network addresses.  Delivery now checks
+    each destination unless `allowPrivateAddress` is explicitly enabled for
+    local testing.  \[[GHSA-f59r-8gcj-68f2]]
+ -  Fixed unbounded reads of authenticated documents, NodeInfo responses, and
+    inbox bodies that could exhaust memory.  JSON bodies are now limited to 16
+    MiB.  Oversized inbox requests receive `413 Content Too Large`.
+    [[GHSA-mc44-6cfg-2v6w]]
+
+[GHSA-q9f8-5hc7-898f]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-q9f8-5hc7-898f
+[GHSA-f59r-8gcj-68f2]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-f59r-8gcj-68f2
+[GHSA-mc44-6cfg-2v6w]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-mc44-6cfg-2v6w
+
+### @fedify/redis
+
+ -  Fixed `RedisKvStore.set()` failing when the `ttl` option was not a whole
+    number of seconds.  The duration was handed to Redis `SETEX` unchanged, and
+    `SETEX` takes only whole seconds, so the write was rejected with
+    `ERR value is not an integer or out of range` instead of being stored with
+    a rounded expiry.  The TTL is now rounded up to the next whole second.  A
+    zero or negative duration, which `SETEX` also rejects, now stores the value
+    for one second, the shortest expiry that command can express.  The
+    one-second granularity is `SETEX`'s rather than Redis's; `SET` with `PX`
+    supports millisecond expiries.
+    [[#1028], [#1034] by Heewon Chae\]
+
+[#1028]: https://github.com/fedify-dev/fedify/issues/1028
+[#1034]: https://github.com/fedify-dev/fedify/issues/1034
+
+### @fedify/vocab-runtime
+
+ -  Fixed unbounded reads of remote JSON-LD and HTML documents that could
+    exhaust memory.  JSON responses are now limited to 16 MiB after
+    decompression; HTML discovery is limited to 1 MiB.  \[[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/webfinger
+
+ -  Fixed unbounded reads of WebFinger descriptors that could exhaust memory.
+    Responses are now limited to 16 MiB after decompression; oversized
+    responses return `null`.  \[[GHSA-mc44-6cfg-2v6w]]
 
 
 Version 2.3.7
@@ -1270,6 +2499,289 @@ Released on June 25, 2026.
 [#756]: https://github.com/fedify-dev/fedify/pull/756
 
 
+Version 2.2.15
+--------------
+
+Released on September 30, 2026.
+
+### @fedify/fedify
+
+ -  Fixed `Context.routeActivity()` passing the caller's unverified document to
+    inbox queues and forwarding after verifying a fetched activity.  Queued
+    listeners and forwarding now use the verified activity's document.
+    [[GHSA-39gj-rchc-q5m3]]
+ -  Fixed custom collections named with symbols so they can be served and
+    parsed, including ordered collections and pages.  Applications using
+    symbol names no longer need to replace them with strings.
+    [[#1144], [#1173]]
+
+### @fedify/cfworkers
+
+ -  Fixed `WorkersKvStore` treating stored `null` values as missing keys when
+    reading or listing.  Applications can now store and retrieve `null`
+    without losing it.
+    [[#1175], [#1181]]
+
+### @fedify/denokv
+
+ -  Fixed `DenoKvStore` treating stored `null` values as missing keys when
+    reading, listing, or comparing values.  Applications can now store and
+    retrieve `null` without losing it.
+    [[#1175], [#1181]]
+
+### @fedify/lint
+
+ -  Fixed `outbox-listener-delivery-required` treating a delivery function
+    installed by an uncalled or late local setup helper as delivered.  The rule
+    now considers a direct setup call before the installed function is used.
+    [[#1126], [#1174]]
+
+
+Version 2.2.14
+--------------
+
+Released on September 29, 2026.
+
+### @fedify/fedify
+
+ -  Fixed an unhandled error when a POST request has multiple RFC 9421
+    signatures covering `Content-Digest` and an earlier signature fails.
+    Verification now reads the body once, allowing later valid signatures
+    to be accepted and invalid requests to receive `401 Unauthorized`.
+    [[#1108], [#1128]]
+ -  Fixed `getAuthenticatedDocumentLoader()` and `getNodeInfo()` logging
+    hostnames that fail to resolve as if they had been blocked for pointing
+    at a private address, which could send operators looking for an SSRF
+    attempt when a remote instance was simply gone.  These failures are now
+    logged as “DNS lookup failed for {url}”: at the debug level by
+    `getAuthenticatedDocumentLoader()`, and at the error level by
+    `getNodeInfo()`, as with its other network failures.
+    [[#1062], [#1065]]
+ -  Fixed `getAuthenticatedDocumentLoader()` following unbounded chains of
+    alternate document links, which could exhaust resources during remote key
+    and document resolution.  Alternate links now share the 20-hop limit and
+    loop detection with HTTP redirects, and preserve the caller's cancellation
+    signal.  \[[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed malformed activity URLs causing an unhandled error on Cloudflare
+    Workers instead of a `400 Bad Request` response.
+    [[#1115], [#1121]]
+ -  Fixed outbound delivery raising `UrlError` instead of `FetchError` when
+    resolving an inbox or redirect hostname fails or returns no usable IP
+    addresses.  Applications can now distinguish these network failures from
+    disallowed destinations; the original error is preserved in `cause`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+
+### @fedify/cli
+
+ -  Fixed `fedify lookup` suggesting authorized fetch when a DNS URL validation
+    error reaches its error handler.  The hint now suggests checking the
+    hostname and network connectivity, and distinguishes DNS failures from
+    private-address rejections. [[#1064]]
+ -  The `fedify lookup` command now reports HTTP, DNS, and parsing failures
+    instead of suggesting authorized fetch for every failure.  It only suggests
+    `-a`/`--authorized-fetch` for unsigned object requests that return HTTP 401,
+    403, or 404.  Failed lookups retain successful results from other URLs, and
+    request timeouts report the `-T`/`--timeout` guidance.
+    [[#1063], [#1116]]
+
+### @fedify/express
+
+ -  Fixed `integrateFederation()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/fastify
+
+ -  Fixed the plugin failing every request with a body on Node.js.  Building
+    the `Request` for Fedify threw
+    `RequestInit: duplex option is required when sending a body.`, so every
+    `POST` or `PUT` got a 500 response, including activities delivered to the
+    inbox.
+    [[#1059], [#1061]]
+ -  Fixed the plugin breaking the request bodies of routes that Fedify does
+    not handle.  The plugin started reading the body of every non-`GET`
+    request in its `onRequest` hook, before Fedify decided whether the route
+    was its own.  On Deno, which does not require the `duplex` option,
+    Fastify's own parsing of a large body could then hang.  The plugin now
+    reads the body only when Fedify handles the request.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/koa
+
+ -  Fixed `createMiddleware()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/lint
+
+ -  Fixed `outbox-listener-delivery-required` reporting a warning when an outbox
+    listener delegates delivery to a helper declared in the same file.  Called
+    helpers are now followed through function declarations, function bindings,
+    and object-literal methods, including recursive helper calls.  Helpers
+    imported from other files are not analyzed.  [[#1054], [#1103]]
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` rejecting `null` values with a PostgreSQL constraint
+    error.  Callers can now store JSON `null`.
+    [[#1042], [#1056]]
+ -  Fixed `PostgresMessageQueue.listen()` returning before `UNLISTEN` finished
+    after aborting.  Awaiting the listener now waits for subscription cleanup
+    before the SQL client can be closed.  Cleanup errors are logged instead of
+    becoming unhandled rejections.
+    [[#1081], [#1089]]
+
+### @fedify/testing
+
+ -  Fixed mock actor, object, and collection dispatcher setters returning the
+    federation instead of the setters object, which caused chained settings
+    to fail with a `TypeError`.  Settings can now be chained as with a real
+    federation.
+    [[#1098], [#1127]]
+
+### @fedify/vocab
+
+ -  Fixed parsing a `Note`, `Article`, `ChatMessage`, or `Question` throwing
+    `TypeError: Invalid URL` when the sender's JSON-LD context declared
+    `_misskey_quote`, `quoteUri`, or `quoteUrl` with `"@type": "@id"`, as
+    Misskey-compatible servers do.  Such terms expand to a node carrying `@id`
+    rather than `@value`, and only `@value` was read.  A quote URL that cannot
+    be parsed at all, such as an inlined quote object without an `id`, is now
+    ignored instead of failing the whole object, and ATProto `at://` quote
+    URLs are accepted.
+    [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed `suppressError: true` being ignored when vocabulary accessors parsed
+    embedded JSON-LD values.  Malformed values are now skipped by iterators or
+    returned as `null` by singular accessors; calls without suppression continue
+    to throw.
+    [[#937], [#1136]]
+
+### @fedify/vocab-runtime
+
+ -  Added `UrlError.reason` to distinguish DNS resolution failures (`"dns"`)
+    from disallowed URLs (`"disallowed"`) without inspecting error messages
+    or `cause`.  Existing constructor calls default to `"disallowed"`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+ -  Added the [FEP-7aa9] context to the preloaded JSON-LD contexts.  The default
+    document loader now resolves <https://w3id.org/fep/7aa9> locally, so
+    transient Codeberg Pages outages no longer prevent otherwise valid inbound
+    documents from being parsed or verified.
+    [[#1078], [#1079]]
+ -  Fixed `getDocumentLoader()` following unbounded chains of alternate document
+    links, which could exhaust resources during remote key and document
+    resolution.  Alternate links now share the 20-hop limit and loop detection
+    with HTTP redirects, and preserve the caller's cancellation signal.
+    [[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed `getDocumentLoader()` logging hostnames that fail to resolve as
+    “Disallowed private URL” errors, as if they had been blocked for pointing
+    at a private address.  These failures are now logged as “DNS lookup
+    failed for {url}” at the debug level, and the thrown `UrlError` is
+    unchanged.  [[#1062]]
+
+### @fedify/vocab-tools
+
+ -  Fixed generated decoders for properties whose range is `fedify:url`
+    reading only literal (`@value`) values, so an IRI-valued (`@id`) value
+    made them throw `TypeError: Invalid URL`.  They now read both forms,
+    accept ATProto `at://` URIs, and skip a value that cannot be parsed
+    instead of throwing.
+    [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed generated vocabulary accessors ignoring `suppressError: true` when
+    parsing embedded JSON-LD values.  Generated iterators now skip malformed
+    values, and singular accessors return `null`; calls without suppression
+    continue to throw.
+    [[#937], [#1136]]
+
+### @fedify/webfinger
+
+ -  Fixed `lookupWebFinger()` logging hostnames that fail to resolve as
+    “Invalid URL for WebFinger resource descriptor” errors.  These failures
+    are now logged as “DNS lookup failed for {url}” at the debug level.
+    `lookupWebFinger()` still returns `null` in this case.
+    [[#1062]]
+
+
+Version 2.2.13
+--------------
+
+Released on September 21, 2026.
+
+### @fedify/fedify
+
+ -  Fixed the inbox accepting activities from any actor at all.  Fedify
+    verified the signature on an incoming delivery, but took the signing key's
+    own word for whom it belonged to: the `owner` of a `CryptographicKey` and
+    the `controller` of a `Multikey` were believed as served, even though the
+    key document and the claim inside it come from the same host.  Anyone with
+    an ordinary HTTP server could therefore have an activity accepted as
+    coming from any actor in the world, whether or not that actor existed.
+    All three inbound authentication paths were affected—HTTP Signatures,
+    Linked Data Signatures, and Object Integrity Proofs—and the latter two
+    require no HTTP signature on the request at all.  A key's claimed owner is
+    now resolved and has to link back to the key before the key is usable, and
+    a key that names no owner of its own is attributed to the actor whose
+    document carried it.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed `getKeyOwner()`, and therefore `Context.getSignedKeyOwner()`,
+    accepting a key document dressed up as another origin's actor document.
+    A host that served a key could describe itself as any actor and list the
+    key as that actor's own, which let an attacker pass an authorized fetch
+    under a borrowed identity and read whatever access control had reserved
+    for it.  Only the origin that serves an actor id can now speak for it.
+    [[GHSA-q9f8-5hc7-898f]]
+ -  Public keys cached before this release are no longer read back, since the
+    owner recorded in them was never verified.  Applications using the
+    built-in key cache need no action; those passing a custom `KeyCache`
+    implementation to `verifyRequest()`, `verifyJsonLd()`, or `verifyObject()`
+    should discard its contents once on upgrade.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed an SSRF vulnerability in outbound activity delivery that allowed inbox
+    URLs and redirects to target private network addresses.  Delivery now checks
+    each destination unless `allowPrivateAddress` is explicitly enabled for
+    local testing.  \[[GHSA-f59r-8gcj-68f2]]
+ -  Fixed unbounded reads of authenticated documents, NodeInfo responses, and
+    inbox bodies that could exhaust memory.  JSON bodies are now limited to 16
+    MiB.  Oversized inbox requests receive `413 Content Too Large`.
+    [[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/redis
+
+ -  Fixed `RedisKvStore.set()` failing when the `ttl` option was not a whole
+    number of seconds.  The duration was handed to Redis `SETEX` unchanged, and
+    `SETEX` takes only whole seconds, so the write was rejected with
+    `ERR value is not an integer or out of range` instead of being stored with
+    a rounded expiry.  The TTL is now rounded up to the next whole second.  A
+    zero or negative duration, which `SETEX` also rejects, now stores the value
+    for one second, the shortest expiry that command can express.  The
+    one-second granularity is `SETEX`'s rather than Redis's; `SET` with `PX`
+    supports millisecond expiries.
+    [[#1028], [#1034] by Heewon Chae\]
+
+### @fedify/vocab-runtime
+
+ -  Fixed unbounded reads of remote JSON-LD and HTML documents that could
+    exhaust memory.  JSON responses are now limited to 16 MiB after
+    decompression; HTML discovery is limited to 1 MiB.  \[[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/webfinger
+
+ -  Fixed unbounded reads of WebFinger descriptors that could exhaust memory.
+    Responses are now limited to 16 MiB after decompression; oversized
+    responses return `null`.  \[[GHSA-mc44-6cfg-2v6w]]
+
+
 Version 2.2.12
 --------------
 
@@ -1883,6 +3395,274 @@ Released on April 28, 2026.
 [#706]: https://github.com/fedify-dev/fedify/issues/706
 [#715]: https://github.com/fedify-dev/fedify/pull/715
 [#722]: https://github.com/fedify-dev/fedify/pull/722
+
+
+Version 2.1.26
+--------------
+
+Released on September 30, 2026.
+
+### @fedify/fedify
+
+ -  Fixed `Context.routeActivity()` passing the caller's unverified document to
+    inbox queues and forwarding after verifying a fetched activity.  Queued
+    listeners and forwarding now use the verified activity's document.
+    [[GHSA-39gj-rchc-q5m3]]
+ -  Fixed custom collections named with symbols so they can be served and
+    parsed, including ordered collections and pages.  Applications using
+    symbol names no longer need to replace them with strings.
+    [[#1144], [#1173]]
+
+### @fedify/cfworkers
+
+ -  Fixed `WorkersKvStore` treating stored `null` values as missing keys when
+    reading or listing.  Applications can now store and retrieve `null`
+    without losing it.
+    [[#1175], [#1181]]
+
+### @fedify/denokv
+
+ -  Fixed `DenoKvStore` treating stored `null` values as missing keys when
+    reading, listing, or comparing values.  Applications can now store and
+    retrieve `null` without losing it.
+    [[#1175], [#1181]]
+
+
+Version 2.1.25
+--------------
+
+Released on September 29, 2026.
+
+### @fedify/fedify
+
+ -  Fixed an unhandled error when a POST request has multiple RFC 9421
+    signatures covering `Content-Digest` and an earlier signature fails.
+    Verification now reads the body once, allowing later valid signatures
+    to be accepted and invalid requests to receive `401 Unauthorized`.
+    [[#1108], [#1128]]
+ -  Fixed `getAuthenticatedDocumentLoader()` and `getNodeInfo()` logging
+    hostnames that fail to resolve as if they had been blocked for pointing
+    at a private address, which could send operators looking for an SSRF
+    attempt when a remote instance was simply gone.  These failures are now
+    logged as “DNS lookup failed for {url}”: at the debug level by
+    `getAuthenticatedDocumentLoader()`, and at the error level by
+    `getNodeInfo()`, as with its other network failures.
+    [[#1062], [#1065]]
+ -  Fixed `getAuthenticatedDocumentLoader()` following unbounded chains of
+    alternate document links, which could exhaust resources during remote key
+    and document resolution.  Alternate links now share the 20-hop limit and
+    loop detection with HTTP redirects, and preserve the caller's cancellation
+    signal.  \[[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed malformed activity URLs causing an unhandled error on Cloudflare
+    Workers instead of a `400 Bad Request` response.
+    [[#1115], [#1121]]
+ -  Fixed outbound delivery raising `UrlError` instead of `FetchError` when
+    resolving an inbox or redirect hostname fails or returns no usable IP
+    addresses.  Applications can now distinguish these network failures from
+    disallowed destinations; the original error is preserved in `cause`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+
+### @fedify/cli
+
+ -  Fixed `fedify lookup` suggesting authorized fetch when a DNS URL validation
+    error reaches its error handler.  The hint now suggests checking the
+    hostname and network connectivity, and distinguishes DNS failures from
+    private-address rejections. [[#1064]]
+ -  The `fedify lookup` command now reports HTTP, DNS, and parsing failures
+    instead of suggesting authorized fetch for every failure.  It only suggests
+    `-a`/`--authorized-fetch` for unsigned object requests that return HTTP 401,
+    403, or 404.  Failed lookups retain successful results from other URLs, and
+    request timeouts report the `-T`/`--timeout` guidance.
+    [[#1063], [#1116]]
+
+### @fedify/express
+
+ -  Fixed `integrateFederation()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/fastify
+
+ -  Fixed the plugin failing every request with a body on Node.js.  Building
+    the `Request` for Fedify threw
+    `RequestInit: duplex option is required when sending a body.`, so every
+    `POST` or `PUT` got a 500 response, including activities delivered to the
+    inbox.
+    [[#1059], [#1061]]
+ -  Fixed the plugin breaking the request bodies of routes that Fedify does
+    not handle.  The plugin started reading the body of every non-`GET`
+    request in its `onRequest` hook, before Fedify decided whether the route
+    was its own.  On Deno, which does not require the `duplex` option,
+    Fastify's own parsing of a large body could then hang.  The plugin now
+    reads the body only when Fedify handles the request.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/koa
+
+ -  Fixed `createMiddleware()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` rejecting `null` values with a PostgreSQL constraint
+    error.  Callers can now store JSON `null`.
+    [[#1042], [#1056]]
+ -  Fixed `PostgresMessageQueue.listen()` returning before `UNLISTEN` finished
+    after aborting.  Awaiting the listener now waits for subscription cleanup
+    before the SQL client can be closed.  Cleanup errors are logged instead of
+    becoming unhandled rejections.
+    [[#1081], [#1089]]
+
+### @fedify/testing
+
+ -  Fixed mock actor, object, and collection dispatcher setters returning the
+    federation instead of the setters object, which caused chained settings
+    to fail with a `TypeError`.  Settings can now be chained as with a real
+    federation.
+    [[#1098], [#1127]]
+
+### @fedify/vocab
+
+ -  Fixed parsing a `Note`, `Article`, `ChatMessage`, or `Question` throwing
+    `TypeError: Invalid URL` when the sender's JSON-LD context declared
+    `_misskey_quote`, `quoteUri`, or `quoteUrl` with `"@type": "@id"`, as
+    Misskey-compatible servers do.  Such terms expand to a node carrying `@id`
+    rather than `@value`, and only `@value` was read.  A quote URL that cannot
+    be parsed at all, such as an inlined quote object without an `id`, is now
+    ignored instead of failing the whole object, and ATProto `at://` quote
+    URLs are accepted.
+    [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed `suppressError: true` being ignored when vocabulary accessors parsed
+    embedded JSON-LD values.  Malformed values are now skipped by iterators or
+    returned as `null` by singular accessors; calls without suppression continue
+    to throw.
+    [[#937], [#1136]]
+
+### @fedify/vocab-runtime
+
+ -  Added `UrlError.reason` to distinguish DNS resolution failures (`"dns"`)
+    from disallowed URLs (`"disallowed"`) without inspecting error messages
+    or `cause`.  Existing constructor calls default to `"disallowed"`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+ -  Added the [FEP-7aa9] context to the preloaded JSON-LD contexts.  The default
+    document loader now resolves <https://w3id.org/fep/7aa9> locally, so
+    transient Codeberg Pages outages no longer prevent otherwise valid inbound
+    documents from being parsed or verified.
+    [[#1078], [#1079]]
+ -  Fixed `getDocumentLoader()` following unbounded chains of alternate document
+    links, which could exhaust resources during remote key and document
+    resolution.  Alternate links now share the 20-hop limit and loop detection
+    with HTTP redirects, and preserve the caller's cancellation signal.
+    [[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed `getDocumentLoader()` logging hostnames that fail to resolve as
+    “Disallowed private URL” errors, as if they had been blocked for pointing
+    at a private address.  These failures are now logged as “DNS lookup
+    failed for {url}” at the debug level, and the thrown `UrlError` is
+    unchanged.  [[#1062]]
+
+### @fedify/vocab-tools
+
+ -  Fixed generated decoders for properties whose range is `fedify:url`
+    reading only literal (`@value`) values, so an IRI-valued (`@id`) value
+    made them throw `TypeError: Invalid URL`.  They now read both forms,
+    accept ATProto `at://` URIs, and skip a value that cannot be parsed
+    instead of throwing.
+    [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed generated vocabulary accessors ignoring `suppressError: true` when
+    parsing embedded JSON-LD values.  Generated iterators now skip malformed
+    values, and singular accessors return `null`; calls without suppression
+    continue to throw.
+    [[#937], [#1136]]
+
+### @fedify/webfinger
+
+ -  Fixed `lookupWebFinger()` logging hostnames that fail to resolve as
+    “Invalid URL for WebFinger resource descriptor” errors.  These failures
+    are now logged as “DNS lookup failed for {url}” at the debug level.
+    `lookupWebFinger()` still returns `null` in this case.
+    [[#1062]]
+
+
+Version 2.1.24
+--------------
+
+Released on September 21, 2026.
+
+### @fedify/fedify
+
+ -  Fixed the inbox accepting activities from any actor at all.  Fedify
+    verified the signature on an incoming delivery, but took the signing key's
+    own word for whom it belonged to: the `owner` of a `CryptographicKey` and
+    the `controller` of a `Multikey` were believed as served, even though the
+    key document and the claim inside it come from the same host.  Anyone with
+    an ordinary HTTP server could therefore have an activity accepted as
+    coming from any actor in the world, whether or not that actor existed.
+    All three inbound authentication paths were affected—HTTP Signatures,
+    Linked Data Signatures, and Object Integrity Proofs—and the latter two
+    require no HTTP signature on the request at all.  A key's claimed owner is
+    now resolved and has to link back to the key before the key is usable, and
+    a key that names no owner of its own is attributed to the actor whose
+    document carried it.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed `getKeyOwner()`, and therefore `Context.getSignedKeyOwner()`,
+    accepting a key document dressed up as another origin's actor document.
+    A host that served a key could describe itself as any actor and list the
+    key as that actor's own, which let an attacker pass an authorized fetch
+    under a borrowed identity and read whatever access control had reserved
+    for it.  Only the origin that serves an actor id can now speak for it.
+    [[GHSA-q9f8-5hc7-898f]]
+ -  Public keys cached before this release are no longer read back, since the
+    owner recorded in them was never verified.  Applications using the
+    built-in key cache need no action; those passing a custom `KeyCache`
+    implementation to `verifyRequest()`, `verifyJsonLd()`, or `verifyObject()`
+    should discard its contents once on upgrade.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed an SSRF vulnerability in outbound activity delivery that allowed inbox
+    URLs and redirects to target private network addresses.  Delivery now checks
+    each destination unless `allowPrivateAddress` is explicitly enabled for
+    local testing.  \[[GHSA-f59r-8gcj-68f2]]
+ -  Fixed unbounded reads of authenticated documents, NodeInfo responses, and
+    inbox bodies that could exhaust memory.  JSON bodies are now limited to 16
+    MiB.  Oversized inbox requests receive `413 Content Too Large`.
+    [[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/redis
+
+ -  Fixed `RedisKvStore.set()` failing when the `ttl` option was not a whole
+    number of seconds.  The duration was handed to Redis `SETEX` unchanged, and
+    `SETEX` takes only whole seconds, so the write was rejected with
+    `ERR value is not an integer or out of range` instead of being stored with
+    a rounded expiry.  The TTL is now rounded up to the next whole second.  A
+    zero or negative duration, which `SETEX` also rejects, now stores the value
+    for one second, the shortest expiry that command can express.  The
+    one-second granularity is `SETEX`'s rather than Redis's; `SET` with `PX`
+    supports millisecond expiries.
+    [[#1028], [#1034] by Heewon Chae\]
+
+### @fedify/vocab-runtime
+
+ -  Fixed unbounded reads of remote JSON-LD and HTML documents that could
+    exhaust memory.  JSON responses are now limited to 16 MiB after
+    decompression; HTML discovery is limited to 1 MiB.  \[[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/webfinger
+
+ -  Fixed unbounded reads of WebFinger descriptors that could exhaust memory.
+    Responses are now limited to 16 MiB after decompression; oversized
+    responses return `null`.  \[[GHSA-mc44-6cfg-2v6w]]
 
 
 Version 2.1.23
@@ -2655,6 +4435,254 @@ Released on March 24, 2026.
 [#586]: https://github.com/fedify-dev/fedify/issues/586
 [#597]: https://github.com/fedify-dev/fedify/pull/597
 [#599]: https://github.com/fedify-dev/fedify/pull/599
+
+
+Version 2.0.30
+--------------
+
+Released on September 30, 2026.
+
+### @fedify/fedify
+
+ -  Fixed `Context.routeActivity()` passing the caller's unverified document to
+    inbox queues and forwarding after verifying a fetched activity.  Queued
+    listeners and forwarding now use the verified activity's document.
+    [[GHSA-39gj-rchc-q5m3]]
+ -  Fixed custom collections named with symbols so they can be served and
+    parsed, including ordered collections and pages.  Applications using
+    symbol names no longer need to replace them with strings.
+    [[#1144], [#1173]]
+
+### @fedify/cfworkers
+
+ -  Fixed `WorkersKvStore` treating stored `null` values as missing keys when
+    reading or listing.  Applications can now store and retrieve `null`
+    without losing it.  [[#1175], [#1181]]
+
+### @fedify/denokv
+
+ -  Fixed `DenoKvStore` treating stored `null` values as missing keys when
+    reading, listing, or comparing values.  Applications can now store and
+    retrieve `null` without losing it.  [[#1175], [#1181]]
+
+
+Version 2.0.29
+--------------
+
+Released on September 29, 2026.
+
+### @fedify/fedify
+
+ -  Fixed an unhandled error when a POST request has multiple RFC 9421
+    signatures covering `Content-Digest` and an earlier signature fails.
+    Verification now reads the body once, allowing later valid signatures
+    to be accepted and invalid requests to receive `401 Unauthorized`.
+    [[#1108], [#1128]]
+ -  Fixed `getAuthenticatedDocumentLoader()` and `getNodeInfo()` logging
+    hostnames that fail to resolve as if they had been blocked for pointing
+    at a private address, which could send operators looking for an SSRF
+    attempt when a remote instance was simply gone.  These failures are now
+    logged as “DNS lookup failed for {url}”: at the debug level by
+    `getAuthenticatedDocumentLoader()`, and at the error level by
+    `getNodeInfo()`, as with its other network failures.  [[#1062], [#1065]]
+ -  Fixed `getAuthenticatedDocumentLoader()` following unbounded chains of
+    alternate document links, which could exhaust resources during remote key
+    and document resolution.  Alternate links now share the 20-hop limit and
+    loop detection with HTTP redirects, and preserve the caller's cancellation
+    signal.  \[[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed malformed activity URLs causing an unhandled error on Cloudflare
+    Workers instead of a `400 Bad Request` response.  [[#1115], [#1121]]
+ -  Fixed outbound delivery raising `UrlError` instead of `FetchError` when
+    resolving an inbox or redirect hostname fails or returns no usable IP
+    addresses.  Applications can now distinguish these network failures from
+    disallowed destinations; the original error is preserved in `cause`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+
+### @fedify/cli
+
+ -  The `fedify lookup` command now reports HTTP, DNS, and parsing failures
+    instead of suggesting authorized fetch for every failure.  It only suggests
+    `-a`/`--authorized-fetch` for unsigned object requests that return HTTP 401,
+    403, or 404.  Failed lookups retain successful results from other URLs, and
+    request timeouts report the `-T`/`--timeout` guidance.  [[#1063], [#1116]]
+
+### @fedify/express
+
+ -  Fixed `integrateFederation()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/fastify
+
+ -  Fixed the plugin failing every request with a body on Node.js.  Building
+    the `Request` for Fedify threw
+    `RequestInit: duplex option is required when sending a body.`, so every
+    `POST` or `PUT` got a 500 response, including activities delivered to the
+    inbox.  [[#1059], [#1061]]
+ -  Fixed the plugin breaking the request bodies of routes that Fedify does
+    not handle.  The plugin started reading the body of every non-`GET`
+    request in its `onRequest` hook, before Fedify decided whether the route
+    was its own.  On Deno, which does not require the `duplex` option,
+    Fastify's own parsing of a large body could then hang.  The plugin now
+    reads the body only when Fedify handles the request.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/koa
+
+ -  Fixed `createMiddleware()` breaking the request bodies of routes that
+    Fedify does not handle.  The middleware started reading the body of every
+    non-`GET` request before Fedify decided whether the route was its own, so
+    a body parser mounted after it could receive a truncated body or wait
+    forever.  Small bodies usually got through, which is why the problem
+    tended to show up only with large ones, such as long posts submitted to
+    an application's own API.  The middleware now reads the body only when
+    Fedify handles the request.  If you limited the middleware to federation
+    paths to work around this, you can remove that workaround.
+    [[#1059], [#1061], [#1068]]
+
+### @fedify/postgres
+
+ -  Fixed `PostgresKvStore` rejecting `null` values with a PostgreSQL constraint
+    error.  Callers can now store JSON `null`.  [[#1042], [#1056]]
+ -  Fixed `PostgresMessageQueue.listen()` returning before `UNLISTEN` finished
+    after aborting.  Awaiting the listener now waits for subscription cleanup
+    before the SQL client can be closed.  Cleanup errors are logged instead of
+    becoming unhandled rejections.  [[#1081], [#1089]]
+
+### @fedify/testing
+
+ -  Fixed mock actor, object, and collection dispatcher setters returning the
+    federation instead of the setters object, which caused chained settings
+    to fail with a `TypeError`.  Settings can now be chained as with a real
+    federation.  [[#1098], [#1127]]
+
+### @fedify/vocab
+
+ -  Fixed parsing a `Note`, `Article`, `ChatMessage`, or `Question` throwing
+    `TypeError: Invalid URL` when the sender's JSON-LD context declared
+    `_misskey_quote`, `quoteUri`, or `quoteUrl` with `"@type": "@id"`, as
+    Misskey-compatible servers do.  Such terms expand to a node carrying `@id`
+    rather than `@value`, and only `@value` was read.  A quote URL that cannot
+    be parsed at all, such as an inlined quote object without an `id`, is now
+    ignored instead of failing the whole object, and ATProto `at://` quote
+    URLs are accepted.  [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed `suppressError: true` being ignored when vocabulary accessors parsed
+    embedded JSON-LD values.  Malformed values are now skipped by iterators or
+    returned as `null` by singular accessors; calls without suppression continue
+    to throw.  [[#937], [#1136]]
+
+### @fedify/vocab-runtime
+
+ -  Added `UrlError.reason` to distinguish DNS resolution failures (`"dns"`)
+    from disallowed URLs (`"disallowed"`) without inspecting error messages
+    or `cause`.  Existing constructor calls default to `"disallowed"`.
+    [[#1055], [#1060] by Jiwon Kwon\]
+ -  Added the [FEP-7aa9] context to the preloaded JSON-LD contexts.  The default
+    document loader now resolves <https://w3id.org/fep/7aa9> locally, so
+    transient Codeberg Pages outages no longer prevent otherwise valid inbound
+    documents from being parsed or verified.  [[#1078], [#1079]]
+ -  Fixed `getDocumentLoader()` following unbounded chains of alternate document
+    links, which could exhaust resources during remote key and document
+    resolution.  Alternate links now share the 20-hop limit and loop detection
+    with HTTP redirects, and preserve the caller's cancellation signal.
+    [[GHSA-97w4-f4rq-mgqm] by Adel Zaitri\]
+ -  Fixed `getDocumentLoader()` logging hostnames that fail to resolve as
+    “Disallowed private URL” errors, as if they had been blocked for pointing
+    at a private address.  These failures are now logged as “DNS lookup
+    failed for {url}” at the debug level, and the thrown `UrlError` is
+    unchanged.  [[#1062]]
+
+### @fedify/vocab-tools
+
+ -  Fixed generated decoders for properties whose range is `fedify:url`
+    reading only literal (`@value`) values, so an IRI-valued (`@id`) value
+    made them throw `TypeError: Invalid URL`.  They now read both forms,
+    accept ATProto `at://` URIs, and skip a value that cannot be parsed
+    instead of throwing.  [[#1015], [#1043] by Jang Hanarae\]
+ -  Fixed generated vocabulary accessors ignoring `suppressError: true` when
+    parsing embedded JSON-LD values.  Generated iterators now skip malformed
+    values, and singular accessors return `null`; calls without suppression
+    continue to throw.  [[#937], [#1136]]
+
+### @fedify/webfinger
+
+ -  Fixed `lookupWebFinger()` logging hostnames that fail to resolve as
+    “Invalid URL for WebFinger resource descriptor” errors.  These failures
+    are now logged as “DNS lookup failed for {url}” at the debug level.
+    `lookupWebFinger()` still returns `null` in this case.  [[#1062]]
+
+
+Version 2.0.28
+--------------
+
+Released on September 21, 2026.
+
+### @fedify/fedify
+
+ -  Fixed the inbox accepting activities from any actor at all.  Fedify
+    verified the signature on an incoming delivery, but took the signing key's
+    own word for whom it belonged to: the `owner` of a `CryptographicKey` and
+    the `controller` of a `Multikey` were believed as served, even though the
+    key document and the claim inside it come from the same host.  Anyone with
+    an ordinary HTTP server could therefore have an activity accepted as
+    coming from any actor in the world, whether or not that actor existed.
+    All three inbound authentication paths were affected—HTTP Signatures,
+    Linked Data Signatures, and Object Integrity Proofs—and the latter two
+    require no HTTP signature on the request at all.  A key's claimed owner is
+    now resolved and has to link back to the key before the key is usable, and
+    a key that names no owner of its own is attributed to the actor whose
+    document carried it.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed `getKeyOwner()`, and therefore `Context.getSignedKeyOwner()`,
+    accepting a key document dressed up as another origin's actor document.
+    A host that served a key could describe itself as any actor and list the
+    key as that actor's own, which let an attacker pass an authorized fetch
+    under a borrowed identity and read whatever access control had reserved
+    for it.  Only the origin that serves an actor id can now speak for it.
+    [[GHSA-q9f8-5hc7-898f]]
+ -  Public keys cached before this release are no longer read back, since the
+    owner recorded in them was never verified.  Applications using the
+    built-in key cache need no action; those passing a custom `KeyCache`
+    implementation to `verifyRequest()`, `verifyJsonLd()`, or `verifyObject()`
+    should discard its contents once on upgrade.  \[[GHSA-q9f8-5hc7-898f]]
+ -  Fixed an SSRF vulnerability in outbound activity delivery that allowed inbox
+    URLs and redirects to target private network addresses.  Delivery now checks
+    each destination unless `allowPrivateAddress` is explicitly enabled for
+    local testing.  \[[GHSA-f59r-8gcj-68f2]]
+ -  Fixed unbounded reads of authenticated documents, NodeInfo responses, and
+    inbox bodies that could exhaust memory.  JSON bodies are now limited to 16
+    MiB.  Oversized inbox requests receive `413 Content Too Large`.
+    [[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/redis
+
+ -  Fixed `RedisKvStore.set()` failing when the `ttl` option was not a whole
+    number of seconds.  The duration was handed to Redis `SETEX` unchanged, and
+    `SETEX` takes only whole seconds, so the write was rejected with
+    `ERR value is not an integer or out of range` instead of being stored with
+    a rounded expiry.  The TTL is now rounded up to the next whole second.  A
+    zero or negative duration, which `SETEX` also rejects, now stores the value
+    for one second, the shortest expiry that command can express.  The
+    one-second granularity is `SETEX`'s rather than Redis's; `SET` with `PX`
+    supports millisecond expiries.  [[#1028], [#1034] by Heewon Chae\]
+
+### @fedify/vocab-runtime
+
+ -  Fixed unbounded reads of remote JSON-LD and HTML documents that could
+    exhaust memory.  JSON responses are now limited to 16 MiB after
+    decompression; HTML discovery is limited to 1 MiB.  \[[GHSA-mc44-6cfg-2v6w]]
+
+### @fedify/webfinger
+
+ -  Fixed unbounded reads of WebFinger descriptors that could exhaust memory.
+    Responses are now limited to 16 MiB after decompression; oversized
+    responses return `null`.  \[[GHSA-mc44-6cfg-2v6w]]
 
 
 Version 2.0.27

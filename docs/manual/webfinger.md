@@ -213,6 +213,24 @@ The WebFinger links dispatcher receives two parameters:
 > documentation for details on customizing WebFinger through actor properties.
 
 
+Portable actors
+---------------
+
+*This API is available since Fedify 2.4.0.*
+
+The WebFinger endpoint also serves [FEP-ef61] portable actors, whose IDs are
+not tied to any server.  The domain of such an actor's address comes from
+the first gateway in its `gateways` rather than from its ID, and the `self`
+link is its compatible identifier on that gateway, e.g.,
+`https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice`.
+See the [*Portable actors and WebFinger*
+section](./actor.md#portable-actors-and-webfinger) of the *Actor dispatcher*
+chapter for details, and the [*Portable objects* chapter](./portable.md) for
+running portable actors in general.
+
+[FEP-ef61]: https://w3id.org/fep/ef61
+
+
 Looking up WebFinger
 --------------------
 
@@ -350,6 +368,10 @@ const result = await lookupWebFinger("acct:alice@example.com", {
   signal: AbortSignal.timeout(5000),
 });
 ~~~~
+
+Since Fedify 2.0.28, responses are limited to 16 MiB of decoded bytes,
+including after decompression.  Oversized descriptors return `null`.
+This also applies to `~Context.lookupWebFinger()`.
 
 The available options are:
 

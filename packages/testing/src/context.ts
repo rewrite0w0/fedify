@@ -8,9 +8,17 @@ import type {
 } from "@fedify/fedify/federation";
 import { RouterError } from "@fedify/fedify/federation";
 import {
+  type Actor,
   lookupObject as globalLookupObject,
+  type Object,
+  PUBLIC_COLLECTION,
   traverseCollection as globalTraverseCollection,
 } from "@fedify/vocab";
+import {
+  arePortableUrisEqual,
+  formatIri,
+  fromCompatibleEf61Id,
+} from "@fedify/vocab-runtime";
 import { mockDocumentLoader } from "./docloader.ts";
 
 // Create a no-op tracer provider.
@@ -77,12 +85,23 @@ function createContext<TContextData>(
     data,
     documentLoader,
     contextLoader,
+    verifyPortableObject,
     meterProvider,
     tracerProvider,
     clone,
     getNodeInfoUri,
     getActorUri,
+    getPortableActorUri,
     getObjectUri,
+    getPortableObjectUri,
+    getPortableInboxUri,
+    getPortableOutboxUri,
+    getPortableFollowingUri,
+    getPortableFollowersUri,
+    getPortableLikedUri,
+    getPortableFeaturedUri,
+    getPortableFeaturedTagsUri,
+    getPortableCollectionUri,
     getCollectionUri,
     getOutboxUri,
     getMediaUploaderUri,
@@ -116,12 +135,23 @@ function createContext<TContextData>(
     hostname: url.hostname,
     documentLoader: documentLoader ?? mockDocumentLoader,
     contextLoader: contextLoader ?? mockDocumentLoader,
+    ...(verifyPortableObject == null ? {} : { verifyPortableObject }),
     meterProvider: meterProvider ?? noopMeterProvider,
     tracerProvider: tracerProvider ?? noopTracerProvider,
     clone: clone ?? ((data) => createContext({ ...values, data })),
     getNodeInfoUri: getNodeInfoUri ?? throwRouterError,
     getActorUri: getActorUri ?? throwRouterError,
+    getPortableActorUri: getPortableActorUri ?? throwRouterError,
     getObjectUri: getObjectUri ?? throwRouterError,
+    getPortableObjectUri: getPortableObjectUri ?? throwRouterError,
+    getPortableInboxUri: getPortableInboxUri ?? throwRouterError,
+    getPortableOutboxUri: getPortableOutboxUri ?? throwRouterError,
+    getPortableFollowingUri: getPortableFollowingUri ?? throwRouterError,
+    getPortableFollowersUri: getPortableFollowersUri ?? throwRouterError,
+    getPortableLikedUri: getPortableLikedUri ?? throwRouterError,
+    getPortableFeaturedUri: getPortableFeaturedUri ?? throwRouterError,
+    getPortableFeaturedTagsUri: getPortableFeaturedTagsUri ?? throwRouterError,
+    getPortableCollectionUri: getPortableCollectionUri ?? throwRouterError,
     getCollectionUri: getCollectionUri ?? throwRouterError,
     getOutboxUri: getOutboxUri ?? throwRouterError,
     getMediaUploaderUri: getMediaUploaderUri ?? throwRouterError,
@@ -144,6 +174,8 @@ function createContext<TContextData>(
           mockDocumentLoader,
         contextLoader: options.contextLoader ?? contextLoader ??
           mockDocumentLoader,
+        verifyPortableObject: options.verifyPortableObject ??
+          verifyPortableObject,
       });
     }),
     traverseCollection: traverseCollection ?? ((collection, options = {}) => {
@@ -152,6 +184,8 @@ function createContext<TContextData>(
           mockDocumentLoader,
         contextLoader: options.contextLoader ?? contextLoader ??
           mockDocumentLoader,
+        verifyPortableObject: options.verifyPortableObject ??
+          verifyPortableObject,
       });
     }),
     lookupNodeInfo: lookupNodeInfo ?? ((_params) => {
@@ -197,14 +231,84 @@ function createRequestContext<TContextData>(
     clone: args.clone ?? ((data) => createRequestContext({ ...args, data })),
     request: args.request ?? new Request(args.url),
     url: args.url,
+    portableRequest: args.portableRequest,
     getActor: args.getActor ?? (() => Promise.resolve(null)),
     getObject: args.getObject ?? (() => Promise.resolve(null)),
     getSignedKey: args.getSignedKey ?? (() => Promise.resolve(null)),
     getSignedKeyOwner: args.getSignedKeyOwner ?? (() => Promise.resolve(null)),
+    isSignedByAudience: args.isSignedByAudience ??
+      ((object, options) =>
+        isSignedByAudience(
+          () =>
+            args.getSignedKeyOwner == null
+              ? Promise.resolve(null)
+              : args.getSignedKeyOwner(options ?? {}),
+          object,
+          options?.isMember,
+        )),
     sendActivity: args.sendActivity ?? ((_params) => {
       throw new Error("Not implemented");
     }),
   };
+}
+
+const PUBLIC_IDS: ReadonlySet<string> = new Set([
+  PUBLIC_COLLECTION.href,
+  "as:Public",
+  "Public",
+]);
+
+function getPortableIri(id: URL): string | null {
+  try {
+    if (id.protocol === "ap:" || id.protocol === "ap+ef61:") {
+      return formatIri(id);
+    }
+    const portable = fromCompatibleEf61Id(id);
+    return portable == null ? null : formatIri(portable);
+  } catch (error) {
+    // A malformed portable ID or compatible identifier identifies no portable
+    // object:
+    if (error instanceof TypeError) return null;
+    throw error;
+  }
+}
+
+function isSameActorId(a: URL, b: URL): boolean {
+  const portableA = getPortableIri(a);
+  const portableB = getPortableIri(b);
+  if (portableA != null || portableB != null) {
+    return portableA != null && portableB != null &&
+      arePortableUrisEqual(portableA, portableB);
+  }
+  return a.href === b.href;
+}
+
+/**
+ * The default implementation of `RequestContext.isSignedByAudience()` for
+ * testing, which checks the audience against `getSignedKeyOwner()`.
+ */
+async function isSignedByAudience(
+  getSignedKeyOwner: () => Promise<Actor | null>,
+  object: Object,
+  isMember?: (addressee: URL, actor: Actor) => boolean | Promise<boolean>,
+): Promise<boolean> {
+  const addressees = [
+    ...object.toIds,
+    ...object.ccIds,
+    ...object.btoIds,
+    ...object.bccIds,
+    ...object.audienceIds,
+  ];
+  if (addressees.some((id) => PUBLIC_IDS.has(id.href))) return true;
+  const actor = await getSignedKeyOwner();
+  const actorId = actor?.id;
+  if (actor == null || actorId == null) return false;
+  if (addressees.some((id) => isSameActorId(id, actorId))) return true;
+  if (isMember == null) return false;
+  for (const addressee of addressees) {
+    if (await isMember(addressee, actor)) return true;
+  }
+  return false;
 }
 
 /**
@@ -283,4 +387,5 @@ export {
   createInboxContext,
   createOutboxContext,
   createRequestContext,
+  isSignedByAudience,
 };

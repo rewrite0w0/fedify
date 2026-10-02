@@ -1,8 +1,11 @@
 import { mockDocumentLoader, test } from "@fedify/fixture";
-import { UrlError } from "@fedify/vocab-runtime";
+import { FetchError, UrlError } from "@fedify/vocab-runtime";
 import { assertEquals, assertRejects } from "@std/assert";
 import fetchMock from "fetch-mock";
+import dns from "node:dns/promises";
+import { deepStrictEqual, ok, rejects } from "node:assert/strict";
 import { verifyRequest } from "../sig/http.ts";
+import { configure, type LogRecord, reset } from "@logtape/logtape";
 import { rsaPrivateKey2 } from "../testing/keys.ts";
 import { getAuthenticatedDocumentLoader } from "./docloader.ts";
 
@@ -216,4 +219,628 @@ test("getAuthenticatedDocumentLoader() cancellation", {
   });
 
   fetchMock.hardReset();
+});
+
+test("getAuthenticatedDocumentLoader() bounds JSON after redirects", async () => {
+  fetchMock.mockGlobal();
+  let oversized = true;
+  try {
+    const url = "https://example.com/bounded";
+    fetchMock.get(url, {
+      status: 302,
+      headers: { Location: `${url}/document` },
+    });
+    fetchMock.get(`${url}/document`, () =>
+      new Response('{"name":"hello"}', {
+        headers: {
+          "Content-Type": "application/activity+json",
+          ...(oversized
+            ? { "Content-Length": String(16 * 1024 * 1024 + 1) }
+            : {}),
+        },
+      }));
+    const identity = {
+      privateKey: rsaPrivateKey2,
+      keyId: new URL("https://example.com/key2"),
+    };
+    const loader = getAuthenticatedDocumentLoader(identity, {
+      allowPrivateAddress: true,
+    });
+    await assertRejects(() => loader(url), FetchError);
+    oversized = false;
+    assertEquals((await loader(url)).document, { name: "hello" });
+  } finally {
+    fetchMock.hardReset();
+  }
+});
+
+test("authenticated document loader suppresses HTTP failure logs", async () => {
+  const records: LogRecord[] = [];
+  const url = "https://example.com/missing-authenticated-document";
+  const loader = getAuthenticatedDocumentLoader({
+    keyId: new URL("https://example.com/key2"),
+    privateKey: rsaPrivateKey2,
+  }, { allowPrivateAddress: true });
+  await reset();
+  await configure({
+    sinks: { capture: (record) => records.push(record) },
+    loggers: [{
+      category: ["fedify"],
+      lowestLevel: "debug",
+      sinks: ["capture"],
+    }],
+  });
+  fetchMock.mockGlobal();
+  fetchMock.get(url, { status: 404 });
+  try {
+    for (const suppressError of [true, false, undefined]) {
+      records.length = 0;
+      const error = await assertRejects(
+        () => loader(url, { suppressError }),
+        FetchError,
+      );
+      assertEquals(error.response?.status, 404);
+      const failures = records.filter((record) =>
+        record.rawMessage ===
+          "Failed to fetch document: {status} {url} {headers}"
+      );
+      assertEquals(failures.length, 1);
+      assertEquals(failures[0].level, suppressError ? "warning" : "error");
+      if (suppressError) {
+        assertEquals(records.filter((record) => record.level === "error"), []);
+      }
+    }
+  } finally {
+    fetchMock.hardReset();
+    await reset();
+  }
+});
+
+test("authenticated document loader suppresses private URL logs", async () => {
+  const records: LogRecord[] = [];
+  const loader = getAuthenticatedDocumentLoader({
+    keyId: new URL("https://example.com/key2"),
+    privateKey: rsaPrivateKey2,
+  });
+  await reset();
+  await configure({
+    sinks: {
+      capture: (record) => {
+        records.push(record);
+      },
+    },
+    loggers: [{
+      category: ["fedify"],
+      lowestLevel: "debug",
+      sinks: ["capture"],
+    }],
+  });
+  fetchMock.spyGlobal();
+  let requests = 0;
+  fetchMock.get("https://example.com/private-redirect", () => {
+    requests++;
+    return Response.redirect("http://127.0.0.1/private", 302);
+  });
+  try {
+    for (
+      const url of [
+        "http://127.0.0.1/private",
+        "https://example.com/private-redirect",
+      ]
+    ) {
+      for (const suppressError of [true, false, undefined]) {
+        records.length = 0;
+        requests = 0;
+        await assertRejects(() => loader(url, { suppressError }), UrlError);
+        const failures = records.filter((r) =>
+          r.rawMessage === "Disallowed private URL: {url}"
+        );
+        assertEquals(failures.length, 1);
+        assertEquals(failures[0].level, suppressError ? "warning" : "error");
+        assertEquals(requests, url.startsWith("http://127") ? 0 : 1);
+      }
+    }
+  } finally {
+    fetchMock.hardReset();
+    await reset();
+  }
+});
+
+test("getAuthenticatedDocumentLoader() logs DNS failures as such", {
+  // The validator skips DNS when Deno has no network permission.
+  ignore: "Deno" in globalThis &&
+    (await Deno.permissions.query({ name: "net" })).state !== "granted",
+}, async (t) => {
+  const loader = getAuthenticatedDocumentLoader({
+    keyId: new URL("https://example.com/key2"),
+    privateKey: rsaPrivateKey2,
+  });
+  for (const result of ["throws", "empty", "private"] as const) {
+    await t.step(result, async () => {
+      // Stubbing works only because vocab-runtime's url.ts uses the default
+      // node:dns/promises import; see the FIXME there.
+      const originalLookup = dns.lookup;
+      dns.lookup = (() =>
+        result === "throws"
+          ? Promise.reject(new Error("Resolver unavailable"))
+          : Promise.resolve(
+            result === "empty" ? [] : [{ address: "127.0.0.1", family: 4 }],
+          )) as typeof dns.lookup;
+      const records: LogRecord[] = [];
+      await configure({
+        sinks: {
+          buffer: (record) =>
+            records.push(record),
+        },
+        loggers: [
+          { category: "fedify", sinks: ["buffer"], lowestLevel: "debug" },
+          { category: ["logtape", "meta"], sinks: [] },
+        ],
+        reset: true,
+      });
+      try {
+        const url = "https://dns-failure.invalid/object";
+        const error = await assertRejects(() => loader(url), UrlError);
+        assertEquals(error.reason, result === "private" ? "disallowed" : "dns");
+        assertEquals(
+          records.map((r) => [r.level, r.rawMessage, r.properties.url]),
+          [
+            result === "private"
+              ? ["error", "Disallowed private URL: {url}", url]
+              : ["debug", "DNS lookup failed for {url}", url],
+          ],
+        );
+        assertEquals(records[0].properties.error, error);
+      } finally {
+        await reset();
+        dns.lookup = originalLookup;
+      }
+    });
+  }
+});
+
+test("getAuthenticatedDocumentLoader() bounds alternate document chains", async (t) => {
+  const base = "https://example.com/alternate-chain/";
+  const loader = getAuthenticatedDocumentLoader({
+    keyId: new URL("https://example.com/key2"),
+    privateKey: rsaPrivateKey2,
+  }, { allowPrivateAddress: true });
+  for (const mode of ["header", "html", "mixed"] as const) {
+    for (const hops of [20, 21]) {
+      await t.step(`${mode}: ${hops} hops`, async () => {
+        fetchMock.mockGlobal();
+        let requests = 0;
+        fetchMock.get(`begin:${base}`, ({ url }) => {
+          requests++;
+          const index = Number(new URL(url).pathname.split("/").at(-1));
+          // Keep the unpatched regression bounded too.
+          if (index === hops || requests > 30) {
+            return Response.json({ done: true });
+          }
+          const next = `${base}${index + 1}`;
+          if (mode === "mixed" && index % 2 === 1) {
+            return Response.redirect(next, 302);
+          }
+          return alternate(next, mode === "html");
+        });
+        try {
+          if (hops === 20) {
+            deepStrictEqual((await loader(`${base}0`)).document, {
+              done: true,
+            });
+          } else {
+            await rejects(loader(`${base}0`), (error: unknown) => {
+              ok(error instanceof FetchError);
+              ok(error.message.includes("Too many redirections (21)"));
+              return true;
+            });
+          }
+          deepStrictEqual(requests, 21);
+        } finally {
+          fetchMock.hardReset();
+        }
+      });
+    }
+  }
+
+  for (
+    const mode of [
+      "header",
+      "html",
+      "alternate-redirect",
+      "redirect-alternate",
+      "redirect-intermediate",
+    ]
+  ) {
+    await t.step(`${mode}: cycle`, async () => {
+      fetchMock.mockGlobal();
+      let requests = 0;
+      fetchMock.get(`begin:${base}`, ({ url }) => {
+        requests++;
+        if (requests > 30) return Response.json({ stopped: true });
+        const index = Number(new URL(url).pathname.split("/").at(-1));
+        const next = `${base}${
+          mode === "redirect-intermediate"
+            ? (index === 0 ? 1 : index === 1 ? 2 : 1)
+            : 1 - index
+        }`;
+        if (
+          (mode === "alternate-redirect" && index === 1) ||
+          ((mode === "redirect-alternate" ||
+            mode === "redirect-intermediate") && index === 0)
+        ) {
+          return Response.redirect(next, 302);
+        }
+        return alternate(next, mode === "html");
+      });
+      try {
+        await rejects(loader(`${base}0`), (error: unknown) => {
+          ok(error instanceof FetchError);
+          ok(error.message.includes("Redirect loop detected:"));
+          return true;
+        });
+        deepStrictEqual(requests, mode === "redirect-intermediate" ? 3 : 2);
+      } finally {
+        fetchMock.hardReset();
+      }
+    });
+  }
+
+  await t.step(
+    "alternate followed by 20 redirects shares the limit",
+    async () => {
+      fetchMock.mockGlobal();
+      let requests = 0;
+      fetchMock.get(`begin:${base}`, ({ url }) => {
+        requests++;
+        const index = Number(new URL(url).pathname.split("/").at(-1));
+        if (index === 21) return Response.json({ done: true });
+        return index === 0
+          ? alternate(`${base}1`, false)
+          : Response.redirect(`${base}${index + 1}`, 302);
+      });
+      try {
+        await rejects(loader(`${base}0`), (error: unknown) => {
+          ok(error instanceof FetchError);
+          ok(error.message.includes("Too many redirections (21)"));
+          return true;
+        });
+        deepStrictEqual(requests, 21);
+      } finally {
+        fetchMock.hardReset();
+      }
+    },
+  );
+
+  await t.step(
+    "relative alternate after redirect and isolated calls",
+    async () => {
+      fetchMock.mockGlobal();
+      fetchMock.get(`${base}start`, Response.redirect(`${base}html`, 302));
+      fetchMock.get(`${base}html`, alternate("./document", true));
+      fetchMock.get(`${base}document`, Response.json({ done: true }));
+      try {
+        for (let i = 0; i < 2; i++) {
+          const results = await Promise.all([
+            loader(`${base}start`),
+            loader(`${base}start`),
+          ]);
+          for (const result of results) {
+            deepStrictEqual(result.document, { done: true });
+            deepStrictEqual(result.documentUrl, `${base}document`);
+          }
+        }
+      } finally {
+        fetchMock.hardReset();
+      }
+    },
+  );
+
+  function alternate(next: string, html: boolean): Response {
+    return html
+      ? new Response(
+        `<link rel="alternate" type="application/activity+json" href="${next}">`,
+        {
+          headers: { "Content-Type": "text/html" },
+        },
+      )
+      : new Response("not JSON", {
+        headers: {
+          "Content-Type": "text/plain",
+          Link: `<${next}>; rel="alternate"; type="application/activity+json"`,
+        },
+      });
+  }
+});
+
+test("getAuthenticatedDocumentLoader() preserves cancellation across alternates", async (t) => {
+  const base = "https://example.com/alternate-abort/";
+  const loader = getAuthenticatedDocumentLoader({
+    keyId: new URL("https://example.com/key2"),
+    privateKey: rsaPrivateKey2,
+  }, { allowPrivateAddress: true });
+  for (const html of [false, true]) {
+    await t.step(html ? "HTML" : "Link header", async () => {
+      fetchMock.mockGlobal();
+      const controller = new AbortController();
+      const reason = new Error("Alternate document loading cancelled");
+      let requests = 0;
+      fetchMock.get(`begin:${base}`, ({ url }) => {
+        requests++;
+        const index = Number(new URL(url).pathname.split("/").at(-1));
+        if (index === 2) return Response.json({ done: true });
+        if (index === 1) controller.abort(reason);
+        const next = `${base}${index + 1}`;
+        return new Response(
+          html
+            ? `<link rel="alternate" type="application/activity+json" href="${next}">`
+            : "not JSON",
+          {
+            headers: html ? { "Content-Type": "text/html" } : {
+              "Content-Type": "text/plain",
+              Link:
+                `<${next}>; rel="alternate"; type="application/activity+json"`,
+            },
+          },
+        );
+      });
+      try {
+        await rejects(
+          loader(`${base}0`, { signal: controller.signal }),
+          (error: unknown) => {
+            ok(error === reason);
+            return true;
+          },
+        );
+        deepStrictEqual(requests, 2);
+      } finally {
+        fetchMock.hardReset();
+      }
+    });
+  }
+});
+
+test("getAuthenticatedDocumentLoader() tracks fallback redirects after alternates", async () => {
+  fetchMock.mockGlobal();
+  let requests = 0;
+  let knocks = 0;
+  const first = "https://example.com/fallback-alternate/a";
+  const second = "https://example.com/fallback-alternate/b";
+  fetchMock.get(first, () => {
+    requests++;
+    if (requests > 30) return Response.json({ stopped: true });
+    return new Response("", {
+      headers: {
+        "Content-Type": "text/plain",
+        Link: `<${second}>; rel="alternate"; type="application/activity+json"`,
+      },
+    });
+  });
+  fetchMock.get(second, () => {
+    requests++;
+    return ++knocks % 2 === 1
+      ? new Response("", { status: 401 })
+      : Response.redirect(first, 302);
+  });
+  try {
+    const loader = getAuthenticatedDocumentLoader({
+      keyId: new URL("https://example.com/key2"),
+      privateKey: rsaPrivateKey2,
+    }, { allowPrivateAddress: true });
+    await assertRejects(
+      () => loader(first),
+      FetchError,
+      "Redirect loop detected:",
+    );
+    assertEquals(requests, 3);
+  } finally {
+    fetchMock.hardReset();
+  }
+});
+
+test("getAuthenticatedDocumentLoader() resolves relative alternates without response URLs", async () => {
+  const originalFetch = globalThis.fetch;
+  const base = "https://example.com/empty-response-url/";
+  const urls: string[] = [];
+  globalThis.fetch = (input) => {
+    const url = input instanceof Request ? input.url : String(input);
+    urls.push(url);
+    if (url === `${base}start`) {
+      return Promise.resolve(Response.redirect(`${base}nested/page`, 302));
+    }
+    if (url === `${base}nested/page`) {
+      return Promise.resolve(
+        new Response(
+          '<link rel="alternate" type="application/activity+json" href="document">',
+          { headers: { "Content-Type": "text/html" } },
+        ),
+      );
+    }
+    assertEquals(url, `${base}nested/document`);
+    return Promise.resolve(Response.json({ done: true }));
+  };
+  try {
+    const loader = getAuthenticatedDocumentLoader({
+      keyId: new URL("https://example.com/key2"),
+      privateKey: rsaPrivateKey2,
+    }, { allowPrivateAddress: true });
+    assertEquals(await loader(`${base}start`), {
+      contextUrl: null,
+      document: { done: true },
+      documentUrl: `${base}nested/document`,
+    });
+    assertEquals(urls, [
+      `${base}start`,
+      `${base}nested/page`,
+      `${base}nested/document`,
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getAuthenticatedDocumentLoader() validates alternate addresses", async () => {
+  fetchMock.mockGlobal();
+  let privateRequests = 0;
+  const url = "https://8.8.8.8/alternate";
+  fetchMock.get(
+    url,
+    new Response("", {
+      headers: {
+        "Content-Type": "text/plain",
+        Link:
+          '<http://127.0.0.1/private>; rel="alternate"; type="application/activity+json"',
+      },
+    }),
+  );
+  fetchMock.get("http://127.0.0.1/private", () => {
+    privateRequests++;
+    return Response.json({ private: true });
+  });
+  try {
+    const loader = getAuthenticatedDocumentLoader({
+      keyId: new URL("https://example.com/key2"),
+      privateKey: rsaPrivateKey2,
+    });
+    await assertRejects(() => loader(url), UrlError);
+    assertEquals(privateRequests, 0);
+  } finally {
+    fetchMock.hardReset();
+  }
+});
+
+test("getAuthenticatedDocumentLoader() rejects cancellation before fetching", async () => {
+  fetchMock.mockGlobal();
+  let requests = 0;
+  const url = "https://example.com/pre-aborted-alternate";
+  fetchMock.get(url, () => {
+    requests++;
+    return Response.json({ done: true });
+  });
+  try {
+    const loader = getAuthenticatedDocumentLoader({
+      keyId: new URL("https://example.com/key2"),
+      privateKey: rsaPrivateKey2,
+    }, { allowPrivateAddress: true });
+    const controller = new AbortController();
+    controller.abort();
+    await rejects(loader(url, { signal: controller.signal }), {
+      name: "AbortError",
+    });
+    deepStrictEqual(requests, 0);
+  } finally {
+    fetchMock.hardReset();
+  }
+});
+
+function assertTimeoutFetchError(error: unknown, url: string): true {
+  ok(error instanceof FetchError, String(error));
+  deepStrictEqual(error.url.href, url);
+  deepStrictEqual(error.response, undefined);
+  ok(error.cause instanceof DOMException);
+  deepStrictEqual(error.cause.name, "TimeoutError");
+  return true;
+}
+
+test("getAuthenticatedDocumentLoader() times out", async (t) => {
+  const identity = {
+    keyId: new URL("https://example.com/key2"),
+    privateKey: rsaPrivateKey2,
+  };
+  const delay = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  await t.step("a request without a response", async () => {
+    fetchMock.mockGlobal();
+    const url = "https://example.com/hang";
+    fetchMock.get(url, () => new Promise<never>(() => {}));
+    try {
+      const loader = getAuthenticatedDocumentLoader(identity, {
+        allowPrivateAddress: true,
+        timeout: 100,
+      });
+      await rejects(loader(url), (e) => assertTimeoutFetchError(e, url));
+    } finally {
+      fetchMock.hardReset();
+    }
+  });
+
+  await t.step("double-knocking shares the timeout", async () => {
+    fetchMock.mockGlobal();
+    const url = "https://example.com/double-knock";
+    let requests = 0;
+    // Each knock takes 200 ms, so the timeout of 300 ms is reached during
+    // the second knock only if both share it.  The margins of about 100 ms
+    // on both sides leave room for signing the requests on a busy runner:
+    fetchMock.get(url, async () => {
+      requests++;
+      await delay(200);
+      return new Response(null, { status: 401 });
+    });
+    try {
+      const loader = getAuthenticatedDocumentLoader(identity, {
+        allowPrivateAddress: true,
+        timeout: 300,
+      });
+      await rejects(loader(url), (e) => assertTimeoutFetchError(e, url));
+      deepStrictEqual(requests, 2);
+      await delay(250);
+      deepStrictEqual(requests, 2);
+    } finally {
+      fetchMock.hardReset();
+    }
+  });
+
+  for (const step of ["determineSpec", "rememberSpec"] as const) {
+    await t.step(`a slow ${step}()`, async () => {
+      fetchMock.mockGlobal();
+      const url = `https://example.com/slow-${step}`;
+      let requests = 0;
+      fetchMock.get(url, () => {
+        requests++;
+        return Response.json({ parsed: true });
+      });
+      try {
+        const loader = getAuthenticatedDocumentLoader(identity, {
+          allowPrivateAddress: true,
+          timeout: 50,
+          specDeterminer: {
+            async determineSpec() {
+              if (step === "determineSpec") await delay(150);
+              return "rfc9421" as const;
+            },
+            async rememberSpec() {
+              if (step === "rememberSpec") await delay(150);
+            },
+          },
+        });
+        await rejects(loader(url), (e) => assertTimeoutFetchError(e, url));
+        await delay(200);
+        // Nothing goes on after the call timed out:
+        deepStrictEqual(requests, step === "determineSpec" ? 0 : 1);
+      } finally {
+        fetchMock.hardReset();
+      }
+    });
+  }
+
+  await t.step("the caller's signal still aborts", async () => {
+    fetchMock.mockGlobal();
+    const url = "https://example.com/hang";
+    fetchMock.get(url, () => new Promise<never>(() => {}));
+    try {
+      const loader = getAuthenticatedDocumentLoader(identity, {
+        allowPrivateAddress: true,
+      });
+      const controller = new AbortController();
+      const reason = new Error("Canceled by the caller");
+      setTimeout(() => controller.abort(reason), 50);
+      await rejects(
+        loader(url, { signal: controller.signal }),
+        (e) => e === reason,
+      );
+    } finally {
+      fetchMock.hardReset();
+    }
+  });
 });

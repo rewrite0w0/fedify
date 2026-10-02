@@ -1,3 +1,4 @@
+import type { InboxRequestFinishedHandler } from "./inbox-report.ts";
 import {
   assertPath,
   type Path,
@@ -17,6 +18,13 @@ import { getLogger } from "@logtape/logtape";
 import type { Tracer } from "@opentelemetry/api";
 import { SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import metadata from "../../deno.json" with { type: "json" };
+import { fromCompatibleEf61Id, isGatewayUrl } from "@fedify/vocab-runtime";
+import { isCompatibleEf61Iri } from "@fedify/vocab-runtime/internal/portable-dereference";
+import {
+  getCanonicalPortableId,
+  getPortableDid,
+  isPortableId,
+} from "../sig/portable-key-id.ts";
 import { ActivityListenerSet } from "./activity-listener.ts";
 import type {
   ActorAliasMapper,
@@ -30,6 +38,7 @@ import type {
   CustomCollectionCounter,
   CustomCollectionCursor,
   CustomCollectionDispatcher,
+  HashlinkMediaDispatcher,
   InboxErrorHandler,
   InboxListener,
   MediaUploaderCallback,
@@ -39,6 +48,8 @@ import type {
   OutboxListener,
   OutboxListenerErrorHandler,
   OutboxPermanentFailureHandler,
+  PortableActorIdMapper,
+  PortableCollectionOwnerMapper,
   SharedInboxKeyDispatcher,
   UnverifiedActivityHandler,
   WebFingerLinksDispatcher,
@@ -168,12 +179,15 @@ export class FederationBuilderImpl<TContextData>
   >;
   inboxListeners?: ActivityListenerSet<InboxContext<TContextData>>;
   outboxListeners?: ActivityListenerSet<OutboxContext<TContextData>>;
+  inboxRequestFinishedHandler?: InboxRequestFinishedHandler<TContextData>;
+
   inboxErrorHandler?: InboxErrorHandler<TContextData>;
   outboxListenerErrorHandler?: OutboxListenerErrorHandler<TContextData>;
   outboxAuthorizePredicate?: AuthorizePredicate<TContextData>;
   mediaUploaderPath?: string;
   mediaUploaderCallback?: MediaUploaderCallback<TContextData>;
   mediaUploaderAuthorizePredicate?: AuthorizePredicate<TContextData>;
+  hashlinkMediaDispatcher?: HashlinkMediaDispatcher<TContextData>;
   sharedInboxKeyDispatcher?: SharedInboxKeyDispatcher<TContextData>;
   unverifiedActivityHandler?: UnverifiedActivityHandler<TContextData>;
   outboxPermanentFailureHandler?: OutboxPermanentFailureHandler<TContextData>;
@@ -199,6 +213,7 @@ export class FederationBuilderImpl<TContextData>
    * Symbol registry for unique identification of unnamed symbols.
    */
   #symbolRegistry = new Map<symbol, string>();
+  #collectionNames = new Map<string, string | symbol>();
 
   constructor() {
     this.router = new Router();
@@ -242,6 +257,8 @@ export class FederationBuilderImpl<TContextData>
     f.objectTypeIds = { ...this.objectTypeIds };
     f.collectionCallbacks = { ...this.collectionCallbacks };
     f.collectionTypeIds = { ...this.collectionTypeIds };
+    f.#symbolRegistry = new Map(this.#symbolRegistry);
+    f.#collectionNames = new Map(this.#collectionNames);
     f.inboxPath = this.inboxPath;
     f.outboxPath = this.outboxPath;
     f.inboxCallbacks = this.inboxCallbacks == null
@@ -267,12 +284,14 @@ export class FederationBuilderImpl<TContextData>
       : { ...this.featuredTagsCallbacks };
     f.inboxListeners = this.inboxListeners?.clone();
     f.outboxListeners = this.outboxListeners?.clone();
+    f.inboxRequestFinishedHandler = this.inboxRequestFinishedHandler;
     f.inboxErrorHandler = this.inboxErrorHandler;
     f.outboxListenerErrorHandler = this.outboxListenerErrorHandler;
     f.outboxAuthorizePredicate = this.outboxAuthorizePredicate;
     f.mediaUploaderPath = this.mediaUploaderPath;
     f.mediaUploaderCallback = this.mediaUploaderCallback;
     f.mediaUploaderAuthorizePredicate = this.mediaUploaderAuthorizePredicate;
+    f.hashlinkMediaDispatcher = this.hashlinkMediaDispatcher;
     f.sharedInboxKeyDispatcher = this.sharedInboxKeyDispatcher;
     f.unverifiedActivityHandler = this.unverifiedActivityHandler;
     f.outboxPermanentFailureHandler = this.outboxPermanentFailureHandler;
@@ -331,12 +350,18 @@ export class FederationBuilderImpl<TContextData>
         );
         if (actor == null) return null;
         const logger = getLogger(["fedify", "federation", "actor"]);
+        // An FEP-ef61 portable actor's URIs are not this server's URIs, so
+        // they are not compared with the ones Context builds, even when its
+        // ID is a compatible identifier on this server:
+        const portable = actor.id != null && isPortableId(actor.id);
         if (actor.id == null) {
           logger.warn(
             "Actor dispatcher returned an actor without an id property.  " +
               "Set the property with Context.getActorUri(identifier).",
           );
-        } else if (actor.id.href != context.getActorUri(identifier).href) {
+        } else if (
+          !portable && actor.id.href != context.getActorUri(identifier).href
+        ) {
           logger.warn(
             "Actor dispatcher returned an actor with an id property that " +
               "does not match the actor URI.  Set the property with " +
@@ -344,6 +369,15 @@ export class FederationBuilderImpl<TContextData>
           );
         }
         if (actor instanceof Tombstone) return actor;
+        if (portable && actor.id != null) {
+          warnPortableActorGateways(actor.id, actor.gateways);
+        }
+        if (actor.id != null && isCompatibleEf61Iri(actor.id)) {
+          warnCompatibleActorId(actor.id, actor.gateway);
+        }
+        if (portable) {
+          this.#warnPortableCollectionIds(context, identifier, actor);
+        }
         if (
           this.followingCallbacks != null &&
           this.followingCallbacks.dispatcher != null
@@ -355,6 +389,7 @@ export class FederationBuilderImpl<TContextData>
                 "with Context.getFollowingUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.followingId.href != context.getFollowingUri(identifier).href
           ) {
             logger.warn(
@@ -376,6 +411,7 @@ export class FederationBuilderImpl<TContextData>
                 "with Context.getFollowersUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.followersId.href != context.getFollowersUri(identifier).href
           ) {
             logger.warn(
@@ -397,6 +433,7 @@ export class FederationBuilderImpl<TContextData>
                 "with Context.getOutboxUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.outboxId.href != context.getOutboxUri(identifier).href
           ) {
             logger.warn(
@@ -417,6 +454,7 @@ export class FederationBuilderImpl<TContextData>
                 "with Context.getLikedUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.likedId.href != context.getLikedUri(identifier).href
           ) {
             logger.warn(
@@ -437,6 +475,7 @@ export class FederationBuilderImpl<TContextData>
                 "with Context.getFeaturedUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.featuredId.href != context.getFeaturedUri(identifier).href
           ) {
             logger.warn(
@@ -457,6 +496,7 @@ export class FederationBuilderImpl<TContextData>
                 "with Context.getFeaturedTagsUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.featuredTagsId.href !=
               context.getFeaturedTagsUri(identifier).href
           ) {
@@ -476,6 +516,7 @@ export class FederationBuilderImpl<TContextData>
                 "Context.getInboxUri(identifier).",
             );
           } else if (
+            !portable &&
             actor.inboxId.href != context.getInboxUri(identifier).href
           ) {
             logger.warn(
@@ -491,6 +532,7 @@ export class FederationBuilderImpl<TContextData>
                 "Context.getInboxUri().",
             );
           } else if (
+            !portable &&
             actor.endpoints.sharedInbox.href != context.getInboxUri().href
           ) {
             logger.warn(
@@ -575,6 +617,10 @@ export class FederationBuilderImpl<TContextData>
       },
       mapAlias(mapper: ActorAliasMapper<TContextData>) {
         callbacks.aliasMapper = mapper;
+        return setters;
+      },
+      mapPortableActorId(mapper: PortableActorIdMapper<TContextData>) {
+        callbacks.portableActorIdMapper = mapper;
         return setters;
       },
       mapActorAlias: (path: Path, identifier: string) => {
@@ -675,9 +721,9 @@ export class FederationBuilderImpl<TContextData>
     const variables = Router.variables(path);
     this.router.add(path, routeName);
     const callbacks: ObjectCallbacks<TContextData, TParam> = {
-      dispatcher: (ctx, values) => {
+      dispatcher: async (ctx, values) => {
         const tracer = this._getTracer();
-        return tracer.startActiveSpan(
+        const object = await tracer.startActiveSpan(
           "activitypub.dispatch_object",
           {
             kind: SpanKind.SERVER,
@@ -718,6 +764,10 @@ export class FederationBuilderImpl<TContextData>
             }
           },
         );
+        if (object instanceof Tombstone) {
+          warnMismatchedTombstoneId(ctx, cls, values, object);
+        }
+        return object;
       },
       parameters: variables as unknown as Set<TParam>,
     };
@@ -941,6 +991,15 @@ export class FederationBuilderImpl<TContextData>
       },
     };
     return setters;
+  }
+
+  setHashlinkMediaDispatcher(
+    dispatcher: HashlinkMediaDispatcher<TContextData>,
+  ): void {
+    if (this.hashlinkMediaDispatcher != null) {
+      throw new RouterError("Hashlink media dispatcher already set.");
+    }
+    this.hashlinkMediaDispatcher = dispatcher;
   }
 
   setFollowingDispatcher(
@@ -1286,6 +1345,12 @@ export class FederationBuilderImpl<TContextData>
         this.inboxErrorHandler = handler;
         return setters;
       },
+      onRequestFinished: (
+        handler: InboxRequestFinishedHandler<TContextData>,
+      ): InboxListenerSetters<TContextData> => {
+        this.inboxRequestFinishedHandler = handler;
+        return setters;
+      },
       onUnverifiedActivity: (
         handler: UnverifiedActivityHandler<TContextData>,
       ): InboxListenerSetters<TContextData> => {
@@ -1414,6 +1479,7 @@ export class FederationBuilderImpl<TContextData>
         "Path for collection dispatcher must have at least one variable.",
       );
     }
+    this.#collectionNames.set(routeName, name);
 
     this.router.add(path, routeName);
 
@@ -1471,6 +1537,12 @@ export class FederationBuilderImpl<TContextData>
         callbacks.authorizePredicate = predicate;
         return setters;
       },
+      mapPortableOwner(
+        mapper: PortableCollectionOwnerMapper<TContextData, TParam>,
+      ) {
+        callbacks.portableOwnerMapper = mapper;
+        return setters;
+      },
     };
     return setters;
   }
@@ -1495,10 +1567,115 @@ export class FederationBuilderImpl<TContextData>
     return path;
   }
 
+  /** Resolves a custom collection route to its original name. */
+  getCollectionName(routeName: string): string | symbol {
+    return this.#collectionNames.get(routeName) ??
+      routeName.replace(/^(collection|orderedCollection):/, "");
+  }
+
   setOutboxPermanentFailureHandler(
     handler: OutboxPermanentFailureHandler<TContextData>,
   ): void {
     this.outboxPermanentFailureHandler = handler;
+  }
+
+  /**
+   * Warns if a portable actor's collection properties that are portable IDs
+   * or compatible identifiers do not refer to the collections that
+   * the registered collection dispatchers serve through the FEP-ef61 gateway
+   * endpoint for the actor's DID.  Properties with ordinary HTTP(S) URLs are
+   * not compared, since a portable actor may keep ordinary collections.
+   */
+  #warnPortableCollectionIds(
+    context: Context<TContextData>,
+    identifier: string,
+    actor: Actor,
+  ): void {
+    const did = actor.id == null ? null : getPortableDid(actor.id);
+    if (did == null) return;
+    const logger = getLogger(["fedify", "federation", "actor"]);
+    const check = (
+      registered: boolean,
+      property: string,
+      value: URL | null,
+      helper: string,
+      build: () => URL,
+    ) => {
+      if (!registered || value == null || !isPortableId(value)) return;
+      const actual = getCanonicalPortableId(value);
+      if (actual == null) {
+        logger.warn(
+          "The actor's {property} property, {value}, is a malformed FEP-ef61 " +
+            "portable ID or compatible identifier.",
+          { property, value: value.href },
+        );
+        return;
+      }
+      let expected: URL;
+      try {
+        expected = build();
+      } catch (error) {
+        if (error instanceof TypeError || error instanceof RouterError) return;
+        throw error;
+      }
+      if (actual === getCanonicalPortableId(expected)) return;
+      logger.warn(
+        "The portable actor's {property} property, {value}, does not match " +
+          "the portable ID of the collection that the gateway endpoint " +
+          "serves, {expected}.  Set the property with " +
+          "Context.{helper}(identifier, did).",
+        { property, value: value.href, expected: expected.href, helper },
+      );
+    };
+    check(
+      this.outboxCallbacks?.dispatcher != null,
+      "outbox",
+      actor.outboxId,
+      "getPortableOutboxUri",
+      () => context.getPortableOutboxUri(identifier, did),
+    );
+    check(
+      this.inboxCallbacks?.dispatcher != null || this.router.has("inbox"),
+      "inbox",
+      actor.inboxId,
+      "getPortableInboxUri",
+      () => context.getPortableInboxUri(identifier, did),
+    );
+    check(
+      this.followingCallbacks?.dispatcher != null,
+      "following",
+      actor.followingId,
+      "getPortableFollowingUri",
+      () => context.getPortableFollowingUri(identifier, did),
+    );
+    check(
+      this.followersCallbacks?.dispatcher != null,
+      "followers",
+      actor.followersId,
+      "getPortableFollowersUri",
+      () => context.getPortableFollowersUri(identifier, did),
+    );
+    check(
+      this.likedCallbacks?.dispatcher != null,
+      "liked",
+      actor.likedId,
+      "getPortableLikedUri",
+      () => context.getPortableLikedUri(identifier, did),
+    );
+    check(
+      this.featuredCallbacks?.dispatcher != null,
+      "featured",
+      actor.featuredId,
+      "getPortableFeaturedUri",
+      () => context.getPortableFeaturedUri(identifier, did),
+    );
+    check(
+      this.featuredTagsCallbacks?.dispatcher != null,
+      "featuredTags",
+      actor.featuredTagsId,
+      "getPortableFeaturedTagsUri",
+      () => context.getPortableFeaturedTagsUri(identifier, did),
+    );
   }
 
   /**
@@ -1536,11 +1713,101 @@ interface ActorCallbacks<TContextData> {
   keyPairsDispatcher?: ActorKeyPairsDispatcher<TContextData>;
   handleMapper?: ActorHandleMapper<TContextData>;
   aliasMapper?: ActorAliasMapper<TContextData>;
+  portableActorIdMapper?: PortableActorIdMapper<TContextData>;
   authorizePredicate?: AuthorizePredicate<TContextData>;
+}
+
+function warnMismatchedTombstoneId<TContextData>(
+  context: RequestContext<TContextData>,
+  cls: ConstructorWithTypeId<Object>,
+  values: Record<string, string>,
+  tombstone: Tombstone,
+): void {
+  const logger = getLogger(["fedify", "federation", "object"]);
+  if (tombstone.id == null) {
+    logger.warn(
+      "Object dispatcher for {class} returned a tombstone without an id " +
+        "property.  Set the property with Context.getObjectUri().",
+      { class: cls.name, values },
+    );
+    return;
+  }
+  // An FEP-ef61 portable object's URIs are not this server's URIs, so they
+  // are not compared with the ones Context builds, even when its ID is
+  // a compatible identifier on this server:
+  if (isPortableId(tombstone.id)) return;
+  const expected = context.getObjectUri(cls, values);
+  if (tombstone.id.href !== expected.href) {
+    logger.warn(
+      "Object dispatcher for {class} returned a tombstone with an id " +
+        "property {tombstoneId} that does not match the object URI " +
+        "{objectUri}.  Set the property with Context.getObjectUri().",
+      {
+        class: cls.name,
+        values,
+        tombstoneId: tombstone.id.href,
+        objectUri: expected.href,
+      },
+    );
+  }
 }
 
 interface ObjectCallbacks<TContextData, TParam extends string> {
   dispatcher: ObjectDispatcher<TContextData, Object, string>;
   parameters: Set<TParam>;
   authorizePredicate?: ObjectAuthorizePredicate<TContextData, TParam>;
+}
+
+/**
+ * Warns about an FEP-ef61 portable actor whose `gateways` is empty or has
+ * an item that is not an HTTP(S) origin, which FEP-ef61 does not allow.
+ * Every item is checked, since the list and its URLs can be mutated after
+ * the actor is constructed.
+ */
+function warnPortableActorGateways(
+  actorId: URL,
+  gateways: readonly URL[],
+): void {
+  if (gateways.length > 0 && gateways.every(isGatewayUrl)) return;
+  getLogger(["fedify", "federation", "actor"]).warn(
+    "Actor dispatcher returned an FEP-ef61 portable actor, {actorId}, whose " +
+      "gateways property is empty or has an item that is not an HTTP(S) " +
+      "origin.  FEP-ef61 requires a portable actor to have at least one " +
+      "gateway, and every gateway to be an HTTP(S) URI with an empty path, " +
+      "query, and fragment.  Set the gateways property.",
+    { actorId: actorId.href, gateways: gateways.map((g) => g.href) },
+  );
+}
+
+/**
+ * Warns about an FEP-ef61 portable actor identified by a compatible identifier
+ * that is malformed, or is not on the actor's first gateway, where FEP-ef61
+ * requires publishers to construct compatible identifiers.  A missing or
+ * invalid first gateway is reported by {@link warnPortableActorGateways}
+ * instead.
+ */
+function warnCompatibleActorId(actorId: URL, gateway: URL | null): void {
+  const logger = getLogger(["fedify", "federation", "actor"]);
+  try {
+    fromCompatibleEf61Id(actorId);
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    logger.warn(
+      "Actor dispatcher returned an actor whose id property, {actorId}, is " +
+        "a malformed FEP-ef61 compatible identifier: {error}",
+      { actorId: actorId.href, error },
+    );
+    return;
+  }
+  if (gateway == null || !isGatewayUrl(gateway)) return;
+  if (actorId.origin !== gateway.origin) {
+    logger.warn(
+      "Actor dispatcher returned an actor whose id property, {actorId}, is " +
+        "an FEP-ef61 compatible identifier on another gateway than its first " +
+        "gateway, {gateway}.  FEP-ef61 requires publishers to construct " +
+        "compatible identifiers with the first gateway in the actor's " +
+        "gateways.",
+      { actorId: actorId.href, gateway: gateway.origin },
+    );
+  }
 }

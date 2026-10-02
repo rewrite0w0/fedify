@@ -12,6 +12,7 @@ import type {
   OutboxContext,
   RequestContext,
 } from "../federation/context.ts";
+import { isInAudience } from "../federation/audience.ts";
 import type { Federation } from "../federation/federation.ts";
 
 export function createContext<TContextData>(
@@ -28,12 +29,23 @@ export function createContext<TContextData>(
     data,
     documentLoader,
     contextLoader,
+    verifyPortableObject,
     meterProvider,
     tracerProvider,
     clone,
     getNodeInfoUri,
     getActorUri,
+    getPortableActorUri,
     getObjectUri,
+    getPortableObjectUri,
+    getPortableInboxUri,
+    getPortableOutboxUri,
+    getPortableFollowingUri,
+    getPortableFollowersUri,
+    getPortableLikedUri,
+    getPortableFeaturedUri,
+    getPortableFeaturedTagsUri,
+    getPortableCollectionUri,
     getCollectionUri,
     getOutboxUri,
     getMediaUploaderUri,
@@ -67,12 +79,23 @@ export function createContext<TContextData>(
     hostname: url.hostname,
     documentLoader: documentLoader ?? mockDocumentLoader,
     contextLoader: contextLoader ?? mockDocumentLoader,
+    ...(verifyPortableObject == null ? {} : { verifyPortableObject }),
     meterProvider: meterProvider ?? metrics.getMeterProvider(),
     tracerProvider: tracerProvider ?? trace.getTracerProvider(),
     clone: clone ?? ((data) => createContext({ ...values, data })),
     getNodeInfoUri: getNodeInfoUri ?? throwRouterError,
     getActorUri: getActorUri ?? throwRouterError,
+    getPortableActorUri: getPortableActorUri ?? throwRouterError,
     getObjectUri: getObjectUri ?? throwRouterError,
+    getPortableObjectUri: getPortableObjectUri ?? throwRouterError,
+    getPortableInboxUri: getPortableInboxUri ?? throwRouterError,
+    getPortableOutboxUri: getPortableOutboxUri ?? throwRouterError,
+    getPortableFollowingUri: getPortableFollowingUri ?? throwRouterError,
+    getPortableFollowersUri: getPortableFollowersUri ?? throwRouterError,
+    getPortableLikedUri: getPortableLikedUri ?? throwRouterError,
+    getPortableFeaturedUri: getPortableFeaturedUri ?? throwRouterError,
+    getPortableFeaturedTagsUri: getPortableFeaturedTagsUri ?? throwRouterError,
+    getPortableCollectionUri: getPortableCollectionUri ?? throwRouterError,
     getCollectionUri: getCollectionUri ?? throwRouterError,
     getOutboxUri: getOutboxUri ?? throwRouterError,
     getMediaUploaderUri: getMediaUploaderUri ?? throwRouterError,
@@ -95,6 +118,8 @@ export function createContext<TContextData>(
           mockDocumentLoader,
         contextLoader: options.contextLoader ?? contextLoader ??
           mockDocumentLoader,
+        verifyPortableObject: options.verifyPortableObject ??
+          verifyPortableObject,
       });
     }),
     traverseCollection: traverseCollection ?? ((collection, options = {}) => {
@@ -103,6 +128,8 @@ export function createContext<TContextData>(
           mockDocumentLoader,
         contextLoader: options.contextLoader ?? contextLoader ??
           mockDocumentLoader,
+        verifyPortableObject: options.verifyPortableObject ??
+          verifyPortableObject,
       });
     }),
     lookupNodeInfo: lookupNodeInfo ?? ((_params) => {
@@ -138,10 +165,21 @@ export function createRequestContext<TContextData>(
     clone: args.clone ?? ((data) => createRequestContext({ ...args, data })),
     request: args.request ?? new Request(args.url),
     url: args.url,
+    portableRequest: args.portableRequest,
     getActor: args.getActor ?? (() => Promise.resolve(null)),
     getObject: args.getObject ?? (() => Promise.resolve(null)),
     getSignedKey: args.getSignedKey ?? (() => Promise.resolve(null)),
     getSignedKeyOwner: args.getSignedKeyOwner ?? (() => Promise.resolve(null)),
+    isSignedByAudience: args.isSignedByAudience ??
+      (async (object, options) =>
+        await isInAudience(object, null) ||
+        await isInAudience(
+          object,
+          args.getSignedKeyOwner == null
+            ? null
+            : await args.getSignedKeyOwner(options ?? {}),
+          options,
+        )),
     sendActivity: args.sendActivity ?? ((_params) => {
       throw new Error("Not implemented");
     }),

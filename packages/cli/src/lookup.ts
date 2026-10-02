@@ -15,13 +15,15 @@ import {
 import {
   type DocumentLoader,
   expandIPv6Address,
+  FetchError,
+  formatIri,
   isValidPublicIPv4Address,
   isValidPublicIPv6Address,
   UrlError,
 } from "@fedify/vocab-runtime";
 import type { ResourceDescriptor } from "@fedify/webfinger";
 import { getLogger } from "@logtape/logtape";
-import { type InferValue, message, optionNames } from "@optique/core";
+import { type InferValue, message, optionNames, text } from "@optique/core";
 import { url as messageUrl } from "@optique/core/message";
 import { printError } from "@optique/run";
 import { createWriteStream, type WriteStream } from "node:fs";
@@ -29,6 +31,12 @@ import { isIP } from "node:net";
 import process from "node:process";
 import ora from "ora";
 import { getContextLoader, getDocumentLoader } from "./docloader.ts";
+import {
+  createLookupDiagnostics,
+  describeLookupFailure,
+  type LookupFailure,
+  lookupWithDiagnostics,
+} from "./diagnostics.ts";
 import { renderImages } from "./imagerenderer.ts";
 import {
   FEDIBIRD_QUOTE_IRI,
@@ -41,6 +49,7 @@ import {
 } from "./lookup/command.ts";
 import { configureLogging } from "./log.ts";
 import type { GlobalOptions } from "./options.ts";
+import { getIriKey, getPortableLookupProblem } from "./portable.ts";
 import { spawnTemporaryServer, type TemporaryServer } from "./tempserver.ts";
 import { colorEnabled, colors, describeError, formatObject } from "./utils.ts";
 
@@ -55,21 +64,35 @@ const logger = getLogger(["fedify", "cli", "lookup"]);
 
 export class TimeoutError extends Error {
   override name = "TimeoutError";
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "TimeoutError";
   }
 }
+
+/**
+ * The timeout that the built-in document loaders use when `-T`/`--timeout`
+ * is not given, in seconds.
+ */
+const DEFAULT_TIMEOUT_SECONDS = 10;
+
+/**
+ * The maximum delay in milliseconds that timers accept.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 /**
  * Error thrown when a recursive lookup target cannot be fetched.
  */
 export class RecursiveLookupError extends Error {
   target: string;
-  constructor(target: string) {
+  /** Why the target could not be fetched, if known. */
+  failure?: LookupFailure;
+  constructor(target: string, failure?: LookupFailure) {
     super(`Failed to recursively fetch object: ${target}`);
     this.name = "RecursiveLookupError";
     this.target = target;
+    this.failure = failure;
   }
 }
 
@@ -220,45 +243,54 @@ export async function collectAsyncItems<T>(
   }
 }
 
-const signalTimers = new WeakMap<AbortSignal, ReturnType<typeof setTimeout>>();
-
-export function createTimeoutSignal(
+/**
+ * Converts the `-T`/`--timeout` option in seconds into the `timeout` option
+ * of the built-in document loaders in milliseconds.  Zero means timing out
+ * immediately, and too long timeouts are clamped to what timers accept.
+ * @param timeoutSeconds The timeout in seconds, if given.
+ * @returns The timeout in milliseconds, or `undefined` for the default.
+ */
+export function toDocumentLoaderTimeout(
   timeoutSeconds?: number,
-): AbortSignal | undefined {
+): number | undefined {
   if (timeoutSeconds == null) return undefined;
-  const controller = new AbortController();
-  const timerId = setTimeout(() => {
-    controller.abort(
-      new TimeoutError(`Request timed out after ${timeoutSeconds} seconds`),
-    );
-  }, timeoutSeconds * 1000);
-
-  signalTimers.set(controller.signal, timerId);
-
-  return controller.signal;
+  return Math.min(
+    MAX_TIMEOUT_MS,
+    Math.max(1, Math.ceil(timeoutSeconds * 1000)),
+  );
 }
 
-export function clearTimeoutSignal(signal?: AbortSignal): void {
-  if (!signal) return;
-  const timerId = signalTimers.get(signal);
-  if (timerId !== undefined) {
-    clearTimeout(timerId);
-    signalTimers.delete(signal);
-  }
+/**
+ * Checks whether the given error was thrown by a built-in document loader
+ * that timed out.
+ * @param error The error to check.
+ * @returns `true` if the document loader timed out.
+ */
+export function isDocumentLoaderTimeoutError(error: unknown): boolean {
+  return error instanceof FetchError && error.response == null &&
+    error.cause instanceof Error && error.cause.name === "TimeoutError";
 }
 
-function wrapDocumentLoaderWithTimeout(
+/**
+ * Wraps a built-in document loader so that its timeouts are thrown as
+ * {@link TimeoutError}s, which the lookup command reports specially.
+ */
+export function wrapDocumentLoaderWithTimeout(
   loader: DocumentLoader,
   timeoutSeconds?: number,
 ): DocumentLoader {
-  if (timeoutSeconds == null) return loader;
-
-  return (url: string, options?) => {
-    const signal = createTimeoutSignal(timeoutSeconds);
-    return loader(url, { ...options, signal }).finally(() =>
-      clearTimeoutSignal(signal)
-    );
-  };
+  return (url, options) =>
+    loader(url, options).catch((error) => {
+      if (isDocumentLoaderTimeoutError(error)) {
+        throw new TimeoutError(
+          `Request timed out after ${
+            timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS
+          } seconds`,
+          { cause: error },
+        );
+      }
+      throw error;
+    });
 }
 
 function handleTimeoutError(
@@ -267,7 +299,11 @@ function handleTimeoutError(
   url?: string,
 ): void {
   const urlText = url ? ` for: ${colors.red(url)}` : "";
-  spinner.fail(`Request timed out after ${timeoutSeconds} seconds${urlText}.`);
+  spinner.fail(
+    `Request timed out after ${
+      timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS
+    } seconds${urlText}.`,
+  );
   printError(
     message`Try increasing the timeout with ${
       optionNames(["-T", "--timeout"])
@@ -279,7 +315,7 @@ function isPrivateAddressError(error: unknown): boolean {
   const errorMessage = describeError(error);
   const lowerMessage = errorMessage.toLowerCase();
   if (error instanceof UrlError) {
-    return (
+    return error.reason === "disallowed" && (
       lowerMessage.includes("invalid or private address") ||
       lowerMessage.includes("localhost is not allowed")
     );
@@ -383,7 +419,12 @@ function printRecursivePrivateContextHint(privateContextUrl: URL): void {
 export function getLookupFailureHint(
   error: unknown,
   options: { recursive?: boolean } = {},
-): "private-address" | "recursive-private-address" | "authorized-fetch" {
+):
+  | "dns"
+  | "private-address"
+  | "recursive-private-address"
+  | "authorized-fetch" {
+  if (error instanceof UrlError && error.reason === "dns") return "dns";
   if (isPrivateAddressError(error)) {
     return options.recursive ? "recursive-private-address" : "private-address";
   }
@@ -412,6 +453,11 @@ function printLookupFailureHint(
   const hint = getLookupFailureHint(error, options);
   if (!shouldPrintLookupFailureHint(authLoader, hint)) return;
   switch (hint) {
+    case "dns":
+      printError(
+        message`DNS lookup failed.  Check the hostname and network connectivity.`,
+      );
+      return;
     case "private-address":
       printError(
         message`The URL appears to be private or localhost.  Try with ${
@@ -474,14 +520,14 @@ export async function collectRecursiveObjects(
   const results: APObject[] = [];
   let current = initialObject;
   if (current.id != null) {
-    visited.add(current.id.href);
+    visited.add(getVisitedKey(current.id));
   }
 
   for (let depth = 0; depth < recurseDepth; depth++) {
     const targetId = getRecursiveTargetId(current, recurseProperty);
     if (targetId == null) break;
-    const target = targetId.href;
-    if (visited.has(target)) break;
+    const target = formatTarget(targetId);
+    if (visited.has(getVisitedKey(targetId))) break;
 
     let next: APObject | null;
     try {
@@ -509,9 +555,9 @@ export async function collectRecursiveObjects(
       throw new RecursiveLookupError(target);
     }
     results.push(next);
-    visited.add(target);
+    visited.add(getVisitedKey(targetId));
     if (next.id != null) {
-      visited.add(next.id.href);
+      visited.add(getVisitedKey(next.id));
     }
     current = next;
   }
@@ -519,24 +565,60 @@ export async function collectRecursiveObjects(
   return results;
 }
 
+/**
+ * Gets the key for recognizing an already visited object, which identifies
+ * FEP-ef61 portable objects by their canonical IDs.
+ * @param iri The object's ID, or the raw string given by the user.
+ * @returns The key.
+ */
+export function getVisitedKey(iri: string | URL): string {
+  return getIriKey(iri) ?? (typeof iri === "string" ? iri : iri.href);
+}
+
+/**
+ * Formats a recursion target, printing FEP-ef61 portable IDs in their
+ * canonical form rather than their percent-encoded `URL` form.
+ */
+function formatTarget(target: URL): string {
+  try {
+    return formatIri(target);
+  } catch {
+    return target.href;
+  }
+}
+
 export async function runLookup(
   command: LookupCommand,
   deps: Partial<{
     lookupObject: typeof lookupObject;
     traverseCollection: typeof traverseCollection;
+    getDocumentLoader: typeof getDocumentLoader;
     exit: (code: number) => never;
   }> = {},
 ) {
   const effectiveDeps: {
     lookupObject: typeof lookupObject;
     traverseCollection: typeof traverseCollection;
+    getDocumentLoader: typeof getDocumentLoader;
     exit: (code: number) => never;
   } = {
     lookupObject,
     traverseCollection,
+    getDocumentLoader,
     exit: (code: number) => process.exit(code),
     ...deps,
   };
+
+  const lookupDiagnosed = (
+    identifier: string | URL,
+    options: Parameters<typeof lookupWithDiagnostics>[1],
+  ) => lookupWithDiagnostics(identifier, options, effectiveDeps.lookupObject);
+
+  // The gateways given with --gateway, used for the objects given on
+  // the command line (and for linked objects without location hints):
+  const gatewayOptions = command.gateways.length > 0
+    ? { gateways: command.gateways }
+    : {};
 
   if (command.urls.length < 1) {
     printError(message`At least one URL or actor handle must be provided.`);
@@ -566,17 +648,19 @@ export async function runLookup(
   // so that local servers can be looked up without -p/--allow-private-address.
   // URLs discovered during traversal or recursion follow the option to
   // mitigate SSRF against private addresses.
-  const initialBaseDocumentLoader = await getDocumentLoader({
+  const initialBaseDocumentLoader = await effectiveDeps.getDocumentLoader({
     userAgent: command.userAgent,
     allowPrivateAddress: true,
+    timeout: toDocumentLoaderTimeout(command.timeout),
   });
   const initialDocumentLoader = wrapDocumentLoaderWithTimeout(
     initialBaseDocumentLoader,
     command.timeout,
   );
-  const baseDocumentLoader = await getDocumentLoader({
+  const baseDocumentLoader = await effectiveDeps.getDocumentLoader({
     userAgent: command.userAgent,
     allowPrivateAddress: command.allowPrivateAddress,
+    timeout: toDocumentLoaderTimeout(command.timeout),
   });
   const documentLoader = wrapDocumentLoaderWithTimeout(
     baseDocumentLoader,
@@ -585,6 +669,7 @@ export async function runLookup(
   const baseContextLoader = await getContextLoader({
     userAgent: command.userAgent,
     allowPrivateAddress: command.allowPrivateAddress,
+    timeout: toDocumentLoaderTimeout(command.timeout),
   });
   const contextLoader = wrapDocumentLoaderWithTimeout(
     baseContextLoader,
@@ -684,6 +769,7 @@ export async function runLookup(
       {
         allowPrivateAddress: command.allowPrivateAddress,
         userAgent: command.userAgent,
+        timeout: toDocumentLoaderTimeout(command.timeout),
         specDeterminer: {
           determineSpec() {
             return firstKnock;
@@ -702,6 +788,7 @@ export async function runLookup(
       {
         allowPrivateAddress: true,
         userAgent: command.userAgent,
+        timeout: toDocumentLoaderTimeout(command.timeout),
         specDeterminer: {
           determineSpec() {
             return firstKnock;
@@ -739,6 +826,7 @@ export async function runLookup(
     const recursiveBaseContextLoader = await getContextLoader({
       userAgent: command.userAgent,
       allowPrivateAddress: false,
+      timeout: toDocumentLoaderTimeout(command.timeout),
     });
     const recursiveContextLoader = wrapDocumentLoaderWithTimeout(
       recursiveBaseContextLoader,
@@ -755,39 +843,35 @@ export async function runLookup(
           urlIndex + 1
         }/${command.urls.length}...`;
       }
-      let current: APObject | null = null;
-      try {
-        current = await effectiveDeps.lookupObject(url, {
-          documentLoader: initialLookupDocumentLoader,
-          contextLoader,
-          userAgent: command.userAgent,
-        });
-      } catch (error) {
-        if (error instanceof TimeoutError) {
+      const result = await lookupDiagnosed(url, {
+        documentLoader: initialLookupDocumentLoader,
+        contextLoader,
+        verifierDocumentLoader: recursiveLookupDocumentLoader,
+        userAgent: command.userAgent,
+        ...gatewayOptions,
+      });
+      const current = result.object;
+      if (current == null) {
+        if (
+          result.thrownError instanceof TimeoutError ||
+          result.failure?.error instanceof TimeoutError
+        ) {
           handleTimeoutError(spinner, command.timeout, url);
         } else {
           spinner.fail(`Failed to fetch object: ${colors.red(url)}.`);
-          printLookupFailureHint(authLoader, error);
-        }
-        await finalizeAndExit(1);
-        return;
-      }
-      if (current == null) {
-        spinner.fail(`Failed to fetch object: ${colors.red(url)}.`);
-        if (authLoader == null) {
-          printError(
-            message`It may be a private object.  Try with ${
-              optionNames(["-a", "--authorized-fetch"])
-            }.`,
+          const diagnostic = describeLookupFailure(
+            result.failure,
+            authLoader != null,
           );
+          printError(message`${text(diagnostic.message)}`);
         }
         await finalizeAndExit(1);
         return;
       }
 
-      visited.add(url);
+      visited.add(getVisitedKey(url));
       if (current.id != null) {
-        visited.add(current.id.href);
+        visited.add(getVisitedKey(current.id));
       }
 
       if (!command.reverse) {
@@ -817,12 +901,27 @@ export async function runLookup(
           current,
           command.recurse,
           recurseDepth,
-          (target) =>
-            effectiveDeps.lookupObject(target, {
+          async (target) => {
+            const result = await lookupDiagnosed(target, {
               documentLoader: recursiveLookupDocumentLoader,
               contextLoader: recursiveContextLoader,
+              verifierDocumentLoader: recursiveLookupDocumentLoader,
               userAgent: command.userAgent,
-            }),
+              // --gateway is used for linked objects only if they have no
+              // location hints of their own:
+              ...(getPortableLookupProblem(target) === "no-gateway"
+                ? gatewayOptions
+                : {}),
+            });
+            if (result.object != null) return result.object;
+            if (
+              result.thrownError != null &&
+              !(result.failure?.error instanceof TimeoutError)
+            ) {
+              throw result.thrownError;
+            }
+            throw new RecursiveLookupError(target, result.failure);
+          },
           { suppressErrors: command.suppressErrors, visited },
         );
       } catch (error) {
@@ -856,15 +955,31 @@ export async function runLookup(
         );
         if (error instanceof TimeoutError) {
           handleTimeoutError(spinner, command.timeout);
+        } else if (
+          error instanceof RecursiveLookupError &&
+          error.failure?.error instanceof TimeoutError
+        ) {
+          handleTimeoutError(spinner, command.timeout, error.target);
         } else if (error instanceof RecursiveLookupError) {
           spinner.fail(
             `Failed to recursively fetch object: ${colors.red(error.target)}.`,
           );
+          const privateContextUrl = error.failure?.source === "context"
+            ? getPrivateContextUrl(error.failure.error)
+            : null;
           if (
             !command.allowPrivateAddress &&
             isPrivateAddressTarget(error.target)
           ) {
             printRecursivePrivateAddressHint();
+          } else if (privateContextUrl != null) {
+            printRecursivePrivateContextHint(privateContextUrl);
+          } else if (error.failure != null) {
+            const diagnostic = describeLookupFailure(
+              error.failure,
+              authLoader != null,
+            );
+            printError(message`${text(diagnostic.message)}`);
           } else if (authLoader == null) {
             printError(
               message`It may be a private object.  Try with ${
@@ -978,31 +1093,27 @@ export async function runLookup(
         }/${command.urls.length}...`;
       }
 
-      let collection: APObject | null = null;
-      try {
-        collection = await effectiveDeps.lookupObject(url, {
-          documentLoader: initialAuthLoader ?? initialDocumentLoader,
-          contextLoader,
-          userAgent: command.userAgent,
-        });
-      } catch (error) {
-        if (error instanceof TimeoutError) {
+      const result = await lookupDiagnosed(url, {
+        documentLoader: initialAuthLoader ?? initialDocumentLoader,
+        contextLoader,
+        verifierDocumentLoader: authLoader ?? documentLoader,
+        userAgent: command.userAgent,
+        ...gatewayOptions,
+      });
+      const collection = result.object;
+      if (collection == null) {
+        if (
+          result.thrownError instanceof TimeoutError ||
+          result.failure?.error instanceof TimeoutError
+        ) {
           handleTimeoutError(spinner, command.timeout, url);
         } else {
           spinner.fail(`Failed to fetch object: ${colors.red(url)}.`);
-          printLookupFailureHint(authLoader, error);
-        }
-        await finalizeAndExit(1);
-        return;
-      }
-      if (collection == null) {
-        spinner.fail(`Failed to fetch object: ${colors.red(url)}.`);
-        if (authLoader == null) {
-          printError(
-            message`It may be a private object.  Try with ${
-              optionNames(["-a", "--authorized-fetch"])
-            }.`,
+          const diagnostic = describeLookupFailure(
+            result.failure,
+            authLoader != null,
           );
+          printError(message`${text(diagnostic.message)}`);
         }
         await finalizeAndExit(1);
         return;
@@ -1017,6 +1128,11 @@ export async function runLookup(
       }
       spinner.succeed(`Fetched collection: ${colors.green(url)}.`);
 
+      const diagnostics = createLookupDiagnostics(
+        authLoader ?? documentLoader,
+        contextLoader,
+        authLoader ?? documentLoader,
+      );
       try {
         if (command.reverse) {
           const {
@@ -1024,9 +1140,11 @@ export async function runLookup(
             error: traversalError,
           } = await collectAsyncItems(
             effectiveDeps.traverseCollection(collection, {
-              documentLoader: authLoader ?? documentLoader,
-              contextLoader,
+              documentLoader: diagnostics.documentLoader,
+              contextLoader: diagnostics.contextLoader,
+              verifyPortableObject: diagnostics.verifyPortableObject,
               suppressError: command.suppressErrors,
+              ...gatewayOptions,
             }),
           );
           for (let index = traversedItems.length - 1; index >= 0; index--) {
@@ -1047,7 +1165,16 @@ export async function runLookup(
                 url,
                 error,
               });
-              spinner.fail(`Failed to write output for: ${colors.red(url)}.`);
+              if (error instanceof TimeoutError) {
+                handleTimeoutError(spinner, command.timeout, url);
+              } else {
+                spinner.fail(`Failed to write output for: ${colors.red(url)}.`);
+                const diagnostic = describeLookupFailure(
+                  { error, source: "other" },
+                  authLoader != null,
+                );
+                printError(message`${text(diagnostic.message)}`);
+              }
               await finalizeAndExit(1);
               return;
             }
@@ -1059,9 +1186,11 @@ export async function runLookup(
         } else {
           for await (
             const item of effectiveDeps.traverseCollection(collection, {
-              documentLoader: authLoader ?? documentLoader,
-              contextLoader,
+              documentLoader: diagnostics.documentLoader,
+              contextLoader: diagnostics.contextLoader,
+              verifyPortableObject: diagnostics.verifyPortableObject,
               suppressError: command.suppressErrors,
+              ...gatewayOptions,
             })
           ) {
             try {
@@ -1080,11 +1209,21 @@ export async function runLookup(
                 url,
                 error,
               });
-              spinner.fail(`Failed to write output for: ${colors.red(url)}.`);
+              if (error instanceof TimeoutError) {
+                handleTimeoutError(spinner, command.timeout, url);
+              } else {
+                spinner.fail(`Failed to write output for: ${colors.red(url)}.`);
+                const diagnostic = describeLookupFailure(
+                  { error, source: "other" },
+                  authLoader != null,
+                );
+                printError(message`${text(diagnostic.message)}`);
+              }
               await finalizeAndExit(1);
               return;
             }
             totalItems++;
+            diagnostics.clearFailures();
           }
         }
       } catch (error) {
@@ -1092,21 +1231,35 @@ export async function runLookup(
           url,
           error,
         });
-        if (error instanceof TimeoutError) {
+        const failure = diagnostics.getContextFailure() ??
+          diagnostics.getObjectFailure() ??
+          diagnostics.getPortableFailure() ?? {
+          error,
+          source: "other" as const,
+        };
+        if (
+          error instanceof TimeoutError || failure.error instanceof TimeoutError
+        ) {
           handleTimeoutError(spinner, command.timeout, url);
         } else {
           spinner.fail(
             `Failed to complete the traversal for: ${colors.red(url)}.`,
           );
-          const hint = getLookupFailureHint(error);
-          if (shouldSuggestSuppressErrorsForLookupFailure(authLoader, hint)) {
-            printError(
-              message`Use the ${
-                optionNames(["-S", "--suppress-errors"])
-              } option to suppress partial errors.`,
-            );
+          if (isPrivateAddressError(failure.error)) {
+            printLookupFailureHint(authLoader, failure.error);
           } else {
-            printLookupFailureHint(authLoader, error);
+            const diagnostic = describeLookupFailure(
+              failure,
+              authLoader != null,
+            );
+            printError(message`${text(diagnostic.message)}`);
+            if (
+              !diagnostic.suggestsAuthorizedFetch && !command.suppressErrors
+            ) {
+              printError(
+                message`Use the -S/--suppress-errors option to suppress partial errors.`,
+              );
+            }
           }
         }
         await finalizeAndExit(1);
@@ -1119,45 +1272,38 @@ export async function runLookup(
     return;
   }
 
-  const promises: Promise<APObject | null>[] = [];
-
-  for (const url of command.urls) {
-    promises.push(
-      effectiveDeps.lookupObject(url, {
+  const objects = await Promise.all(
+    command.urls.map((url) =>
+      lookupDiagnosed(url, {
         documentLoader: initialAuthLoader ?? initialDocumentLoader,
         contextLoader,
+        verifierDocumentLoader: authLoader ?? documentLoader,
         userAgent: command.userAgent,
-      }).catch((error) => {
-        if (error instanceof TimeoutError) {
-          handleTimeoutError(spinner, command.timeout, url);
-        }
-        throw error;
-      }),
-    );
-  }
-
-  let objects: (APObject | null)[] = [];
-  try {
-    objects = await Promise.all(promises);
-  } catch (_error) {
-    await finalizeAndExit(1);
-    return;
-  }
+        ...gatewayOptions,
+      })
+    ),
+  );
 
   spinner.stop();
   let success = true;
   let printedCount = 0;
   const successfulObjects: APObject[] = [];
-  for (const [i, obj] of objects.entries()) {
+  for (const [i, result] of objects.entries()) {
+    const obj = result.object;
     const url = command.urls[i];
     if (obj == null) {
-      spinner.fail(`Failed to fetch ${colors.red(url)}`);
-      if (authLoader == null) {
-        printError(
-          message`It may be a private object.  Try with ${
-            optionNames(["-a", "--authorized-fetch"])
-          }.`,
+      if (
+        result.thrownError instanceof TimeoutError ||
+        result.failure?.error instanceof TimeoutError
+      ) {
+        handleTimeoutError(spinner, command.timeout, url);
+      } else {
+        spinner.fail(`Failed to fetch ${colors.red(url)}`);
+        const diagnostic = describeLookupFailure(
+          result.failure,
+          authLoader != null,
         );
+        printError(message`${text(diagnostic.message)}`);
       }
       success = false;
     } else {

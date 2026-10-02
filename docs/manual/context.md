@@ -98,8 +98,11 @@ shows the methods:
 
  -  `~Context.getNodeInfoUri()`
  -  `~Context.getActorUri()`
+ -  `~Context.getPortableActorUri()`
  -  `~Context.getObjectUri()`
+ -  `~Context.getPortableObjectUri()`
  -  `~Context.getInboxUri()`
+ -  `~Context.getPortableInboxUri()`
  -  `~Context.getOutboxUri()`
  -  `~Context.getMediaUploaderUri()`
  -  `~Context.getFollowingUri()`
@@ -135,6 +138,134 @@ federation.setActorDispatcher("/users/{identifier}", async (ctx, identifier) => 
 On the other way around, you can use the `~Context.parseUri()` method to
 determine the type of the URI and extract the identifier or other values from
 the URI.
+
+### Portable IDs
+
+*This API is available since Fedify 2.4.0.*
+
+An [FEP-ef61] portable actor or object has an ID whose authority is a [DID]
+instead of a host name, e.g., `ap+ef61://did:key:z6Mk.../users/alice`, so that
+it is not tied to a server.  The following methods build such portable IDs
+from the same paths as their counterparts above:
+
+`~Context.getPortableActorUri()`
+:   The portable ID of an actor, with the path of `~Context.getActorUri()`.
+
+`~Context.getPortableObjectUri()`
+:   The portable ID of an object, with the path of `~Context.getObjectUri()`.
+
+`~Context.getPortableInboxUri()`
+:   The portable ID of an actor's inbox, with the path of
+    `~Context.getInboxUri()`.
+
+`~Context.getPortableOutboxUri()`
+:   The portable ID of an actor's outbox, with the path of
+    `~Context.getOutboxUri()`.
+
+`~Context.getPortableFollowingUri()`
+:   The portable ID of an actor's following collection, with the path of
+    `~Context.getFollowingUri()`.
+
+`~Context.getPortableFollowersUri()`
+:   The portable ID of an actor's followers collection, with the path of
+    `~Context.getFollowersUri()`.
+
+`~Context.getPortableLikedUri()`
+:   The portable ID of an actor's liked collection, with the path of
+    `~Context.getLikedUri()`.
+
+`~Context.getPortableFeaturedUri()`
+:   The portable ID of an actor's featured collection, with the path of
+    `~Context.getFeaturedUri()`.
+
+`~Context.getPortableFeaturedTagsUri()`
+:   The portable ID of an actor's featured tags collection, with the path of
+    `~Context.getFeaturedTagsUri()`.
+
+`~Context.getPortableCollectionUri()`
+:   The portable ID of a custom collection, with the path of
+    `~Context.getCollectionUri()`.
+
+They take the DID that controls the actor or object as their last argument.
+Portable objects are authenticated by Object Integrity Proofs, so the DID is
+usually a `did:key` DID made from the Ed25519 public key that signs them.
+The `exportDidKey()` function from `@fedify/vocab-runtime` makes one; store it
+along with the actor rather than taking it from a request:
+
+~~~~ typescript twoslash
+import { type Context, signObject } from "@fedify/fedify";
+import { Person } from "@fedify/vocab";
+import { exportDidKey, formatIri } from "@fedify/vocab-runtime";
+const ctx = null as unknown as Context<void>;
+const { publicKey, privateKey } = await crypto.subtle.generateKey(
+  "Ed25519",
+  true,
+  ["sign", "verify"],
+) as CryptoKeyPair;
+// ---cut-before---
+const did = await exportDidKey(publicKey);  // did:key:z6Mk...
+const id = ctx.getPortableActorUri("alice", did);
+console.log(formatIri(id));  // ap+ef61://did:key:z6Mk.../users/alice
+
+// The proof has to be made with a key of the same DID:
+const keyId = new URL(`${did}#${did.slice("did:key:".length)}`);
+const actor = await signObject(
+  new Person({
+    id,
+    inbox: ctx.getPortableInboxUri("alice", did),
+    outbox: ctx.getPortableOutboxUri("alice", did),
+    followers: ctx.getPortableFollowersUri("alice", did),
+    gateways: [new URL("https://example.com")],
+  }),
+  privateKey,
+  keyId,  // did:key:z6Mk...#z6Mk...
+);
+~~~~
+
+A few things to note about them:
+
+ -  The DID has to be a bare DID, without a path, query, or fragment.
+    A `did:key` DID has to be encoded in base58-btc, i.e., start with
+    `did:key:z`, as FEP-ef61 requires, so that the same key does not yield
+    two different IDs; `exportDidKey()` always makes such DIDs.  The gateway
+    endpoint responds with `400 Bad Request` to requests whose path has
+    a `did:key` DID in another encoding.  Other DID
+    methods are only checked for their syntax, which does not mean that
+    Fedify can verify proofs made by them.
+ -  While an actor dispatcher, an object dispatcher, or a collection
+    dispatcher is handling a request through the FEP-ef61 gateway endpoint,
+    i.e.,
+    `~RequestContext.portableRequest` is set, the DID can be omitted, and
+    the one in the request path is used.  It is anyone's to choose, though,
+    so it is not evidence that this server hosts anything for the DID.
+    Elsewhere, the DID is required.
+ -  The returned `URL` keeps the DID percent-encoded, e.g.,
+    `ap+ef61://did%3Akey%3Az6Mk.../users/alice`, as the `URL` class cannot
+    represent the canonical form.  Generated vocabulary classes serialize
+    it in the canonical form, and `formatIri()` from `@fedify/vocab-runtime`
+    returns the canonical string.
+ -  They build portable IDs only.  To get the *compatible identifier* of
+    a portable ID on a gateway, an HTTP(S) URL for software that does not
+    support portable IDs, use `toCompatibleEf61Id()` from
+    `@fedify/vocab-runtime`.
+ -  They build IDs without [location
+    hints](./vocab.md#location-hints).  To refer to a portable actor from
+    another object, e.g., in its `attributedTo`, add the actor's gateways to
+    its ID with `withGatewayHints()` from `@fedify/vocab-runtime`.
+ -  The other way around, `~Context.parseUri()` recognizes portable IDs and
+    compatible identifiers when the `portable` option is enabled; see the
+    [*Portable IDs* section](./context-advanced.md#portable-ids) of
+    *Advanced context helpers*.
+
+Portable actors and objects with such IDs can be served by the same
+dispatchers through the gateway endpoint; see the [*Portable actors and
+WebFinger* section](./actor.md#portable-actors-and-webfinger), the [*Serving
+portable objects* section](./object.md#serving-portable-objects), the
+[*Portable collections* section](./collections.md#portable-collections), and
+the [*Portable inboxes* section](./inbox.md#portable-inboxes).
+
+[FEP-ef61]: https://w3id.org/fep/ef61
+[DID]: https://www.w3.org/TR/did-core/
 
 
 Enqueuing an outgoing activity
@@ -259,6 +390,35 @@ const ctx = federation.createContext(request, undefined);
 const note = await ctx.getObject(Note, { identifier, id });  // [!code highlight]
 ~~~~
 
+Like `RequestContext.getActor()`, `RequestContext.getObject()` returns `null`
+for an object that the object dispatcher represents as deleted by returning
+a `Tombstone`.  If you need to distinguish a deleted object from a missing one,
+pass `{ tombstone: "passthrough" }`:
+
+~~~~ typescript twoslash
+import { type Federation } from "@fedify/fedify";
+import { Note, Tombstone } from "@fedify/vocab";
+const federation = null as unknown as Federation<void>;
+const request = new Request("");
+const identifier: string = "";
+const id: string = "";
+// ---cut-before---
+const ctx = federation.createContext(request, undefined);
+const note = await ctx.getObject(Note, { identifier, id }, {
+  tombstone: "passthrough",
+});
+if (note instanceof Tombstone) {
+  console.log(`The note was deleted at ${note.deleted}`);
+}
+~~~~
+
+A tombstone is returned even without the option if it is an instance of
+the requested class, i.e., if you get an object of the `Object` or `Tombstone`
+class itself, since it is a valid object of that class.  For example, if the
+object dispatcher for `Object` returns either notes or tombstones,
+`ctx.getObject(Object, values)` returns tombstones as well; check the result
+with `instanceof Tombstone` in that case.
+
 
 Getting a `DocumentLoader`
 --------------------------
@@ -343,6 +503,68 @@ type, but they are used for different purposes:
 Sometimes a document loader needs to be authenticated to load a remote document
 which requires authorization, but a context loader mostly needs to be highly
 cached and doesn't require authorization.
+
+### Response size limits
+
+Since Fedify 2.0.28, the built-in document loaders limit each remote JSON body
+to 16 MiB of decoded bytes.  This includes actor and object documents,
+HTTP-signature keys, and JSON-LD contexts, whether fetched with or without
+HTTP authentication.  HTML alternate-link discovery is limited to 1 MiB.
+The limits apply while reading the stream, including after decompression,
+before JSON parsing or caching.  An oversized document raises `FetchError`.
+
+Inbox request bodies are also limited to 16 MiB and receive HTTP 413 when
+too large, before JSON parsing or signature verification.
+
+Custom document loaders are responsible for enforcing their own response
+size limits.
+
+### Timeouts
+
+*This API is available since Fedify 2.4.0.*
+
+The built-in document loaders time out each call after 10 seconds by default.
+The time limit covers the whole call: URL validation, every redirect and
+alternate document link it follows, double-knocking retries of
+the authenticated document loader, and reading the response body.  So a remote
+server that responds slowly or never cannot hold a request of yours, e.g.,
+an incoming activity whose signature key Fedify fetches, for longer than that.
+
+A call that times out throws a `FetchError` without a `~FetchError.response`,
+whose `cause` is a `DOMException` named `"TimeoutError"`:
+
+~~~~ typescript twoslash
+import { type Context } from "@fedify/fedify";
+import { FetchError } from "@fedify/vocab-runtime";
+const ctx = null as unknown as Context<void>;
+// ---cut-before---
+try {
+  await ctx.documentLoader("https://example.com/slow-object");
+} catch (error) {
+  if (
+    error instanceof FetchError &&
+    error.cause instanceof DOMException &&
+    error.cause.name === "TimeoutError"
+  ) {
+    console.error("Timed out:", error.url.href);
+  }
+}
+~~~~
+
+Such a failure is treated like other network failures.  For example, if
+fetching the key of an HTTP Signature times out, `verifyRequestDetailed()`
+reports it as a `keyFetchError`, and the failure is cached like other failures
+to fetch a key.  Note that a cached failure keeps only the error's name and
+message, not its `cause`.
+
+An `AbortSignal` passed as the `signal` option still cancels a call; the loader
+then throws the signal's reason instead of a `FetchError`.
+
+You can change the time limit with the [`documentLoaderTimeout`
+option](./federation.md#documentloadertimeout) of `createFederation()`, or
+the `timeout` option (in milliseconds) of `getDocumentLoader()` and
+`getAuthenticatedDocumentLoader()`.  Setting it to `null` turns the timeout
+off.  Custom document loaders are responsible for their own timeouts.
 
 
 Looking up remote objects
@@ -485,6 +707,68 @@ const note = await ctx.lookupObject(
 > implications and have implemented additional validation measures.
 
 [FEP-fe34]: https://w3id.org/fep/fe34
+
+### Portable objects
+
+*This API is available since Fedify 2.4.0.*
+
+The `~Context.lookupObject()` method also looks up [FEP-ef61] portable objects,
+whose IDs are `ap:` or `ap+ef61:` URIs with a [DID] instead of a host, e.g.,
+`ap://did:key:z6Mk.../actor`.  A portable object is not served from its ID,
+but from *gateways*, so the method fetches it through gateways in the same way
+as [dereferencing accessors](./vocab.md#dereferencing-portable-references):
+
+ -  A portable ID is fetched through the gateways in its `@gateway` location
+    hints, e.g.,
+    `ap://did:key:z6Mk.../actor?@gateway=https%3A%2F%2Fexample.com`.
+ -  For a bare portable ID, pass gateway origins explicitly, e.g.,
+    `ctx.lookupObject(id, { gateways: ["https://server.example"] })`.
+    They are tried in order and replace `@gateway` hints, even if the list is
+    empty.  Each gateway must be an
+    HTTP(S) origin without a path, query, or fragment; an invalid one throws
+    a `TypeError`.  A custom document loader can still handle a bare ID when
+    the list is empty.
+ -  A compatible identifier, e.g.,
+    `https://example.com/.well-known/apgateway/did:key:z6Mk.../actor`, is
+    fetched through the gateway it names.
+ -  When a fediverse handle of a [portable
+    actor](./actor.md#portable-actors-and-webfinger) is looked up, the `self`
+    link of the WebFinger response can be either of them.  A portable ID is
+    fetched through the WebFinger server first, as it is the actor's first
+    gateway, and then through the location hints unless explicit gateways
+    were given.  For compatible IDs and WebFinger, that inferred gateway is
+    tried before the explicit list.
+
+In every case, the fetched object is returned only if its `@id` identifies the
+requested portable object and it has a valid [Object Integrity
+Proof](./send.md#object-integrity-proofs) made by the DID in its ID, since
+a portable object belongs to its DID, not to the server that serves it.
+`Context.lookupObject()` applies `~Context.verifyPortableObject`, i.e.,
+`verifyPortableObject()`, by default, which also accepts a collection without
+a proof if a gateway that its owner lists serves it (see [*Portable
+collections*](./vocab.md#portable-collections)); pass the
+`verifyPortableObject` option to use another policy, e.g.,
+`verifyPortableObjectProof()` to accept only objects with proofs.  The returned
+object uses the same policy by default when its accessors dereference its
+properties (see [*Default verifiers*](./vocab.md#default-verifiers)).  If
+a gateway returns an object that fails these checks, the next candidate is
+tried; `crossOrigin: "throw"` makes the method throw an error instead, and
+`crossOrigin: "trust"` does not skip the checks.  To limit the number of
+servers a single lookup reaches, the method asks at most five gateways,
+including those passed explicitly.
+
+The same checks apply to a document looked up by an ordinary HTTP(S) URL if it
+turns out to be a portable object: if it is served from a compatible
+identifier after redirects, or its `@id` is a portable ID, it is returned only
+if it passes them, instead of being trusted because of where it came from.
+
+> [!NOTE]
+> The `lookupObject()` function from `@fedify/vocab` does not look up portable
+> objects unless you pass the `verifyPortableObject` option, e.g.,
+> `verifyPortableObject` from `@fedify/fedify`.  Without it, compatible
+> identifiers are fetched as ordinary HTTP(S) URLs, and an object with
+> a portable ID served there is refused as a cross-origin object, even with
+> `crossOrigin: "trust"`.
 
 
 WebFinger lookups

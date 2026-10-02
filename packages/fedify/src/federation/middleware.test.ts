@@ -14,7 +14,7 @@ import {
   Offer,
   Person,
 } from "@fedify/vocab";
-import { FetchError, getDocumentLoader } from "@fedify/vocab-runtime";
+import { FetchError, getDocumentLoader, UrlError } from "@fedify/vocab-runtime";
 import { configure, type LogRecord, reset } from "@logtape/logtape";
 import { metrics, SpanStatusCode } from "@opentelemetry/api";
 import {
@@ -35,7 +35,14 @@ import {
 } from "@std/assert";
 import fetchMock from "fetch-mock";
 import serialize from "json-canon";
-import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert/strict";
+import {
+  deepStrictEqual,
+  ok,
+  rejects,
+  strictEqual,
+  throws,
+} from "node:assert/strict";
+import dns from "node:dns/promises";
 import createFixture from "../../../fixture/src/fixtures/example.com/create.json" with {
   type: "json",
 };
@@ -71,7 +78,7 @@ import {
 import { getAuthenticatedDocumentLoader } from "../utils/docloader.ts";
 import { handleBenchmarkTrigger } from "./bench.ts";
 import { CircuitBreaker } from "./circuit-breaker.ts";
-import type { Context, GetActorOptions } from "./context.ts";
+import type { Context, GetActorOptions, GetObjectOptions } from "./context.ts";
 import {
   type KvKey,
   type KvStore,
@@ -1726,6 +1733,132 @@ test({
 
     fetchMock.hardReset();
   },
+});
+
+test("Federation.fetch() [rfc9421] multiple POST signatures", async (t) => {
+  for (
+    const [name, validSecond, maxHttpSignatures] of [
+      ["valid second signature", true, undefined],
+      ["both signatures invalid", false, undefined],
+      ["valid second signature beyond maxHttpSignatures", true, 1],
+    ] as const
+  ) {
+    await t.step(
+      name,
+      async () => {
+        const inbox: string[] = [];
+        const federation = createFederation<void>({
+          kv: new MemoryKvStore(),
+          documentLoaderFactory: () => mockDocumentLoader,
+          contextLoaderFactory: () => mockDocumentLoader,
+          maxHttpSignatures,
+        });
+        federation.setActorDispatcher(
+          "/users/{identifier}",
+          (ctx, identifier) =>
+            new vocab.Person({ id: ctx.getActorUri(identifier) }),
+        );
+        federation.setInboxListeners("/users/{identifier}/inbox", "/inbox")
+          .on(vocab.Create, (_ctx, activity) => {
+            inbox.push(activity.id!.href);
+          });
+        const signed = await signRequest(
+          new Request("https://example.com/inbox", {
+            method: "POST",
+            headers: { "Content-Type": "application/activity+json" },
+            body: JSON.stringify(createFixture),
+          }),
+          rsaPrivateKey2,
+          rsaPublicKey2.id!,
+          { spec: "rfc9421" },
+        );
+        const input = signed.headers.get("Signature-Input")!;
+        const signature = signed.headers.get("Signature")!;
+        signed.headers.set(
+          "Signature-Input",
+          `${input}, ${input.replace(/^sig1=/, "sig2=")}`,
+        );
+        signed.headers.set(
+          "Signature",
+          `sig1=:AAAAAA==:, ${
+            validSecond
+              ? signature.replace(/^sig1=/, "sig2=")
+              : "sig2=:AAAAAA==:"
+          }`,
+        );
+        const response = await federation.fetch(signed, {
+          contextData: undefined,
+        });
+        const accepted = validSecond && maxHttpSignatures == null;
+        assertEquals(response.status, accepted ? 202 : 401);
+        assertEquals(inbox, accepted ? [createFixture.id] : []);
+      },
+    );
+  }
+});
+
+test("FederationOptions.maxHttpSignatures", async (t) => {
+  const kv = new MemoryKvStore();
+
+  await t.step("defaults to three", () => {
+    const federation = createFederation<void>({ kv });
+    assertInstanceOf(federation, FederationImpl);
+    assertEquals(federation.maxHttpSignatures, 3);
+  });
+
+  await t.step("rejects invalid values", () => {
+    for (
+      const maxHttpSignatures of [
+        0,
+        -1,
+        1.5,
+        NaN,
+        2 ** 53,
+        null as unknown as number,
+      ]
+    ) {
+      assertThrows(
+        () => createFederation<void>({ kv, maxHttpSignatures }),
+        RangeError,
+      );
+    }
+    const federation = createFederation<void>({
+      kv,
+      maxHttpSignatures: Infinity,
+    });
+    assertInstanceOf(federation, FederationImpl);
+    assertEquals(federation.maxHttpSignatures, Infinity);
+  });
+
+  await t.step("applies to RequestContext.getSignedKey()", async () => {
+    let request = new Request("https://example.com/", {
+      headers: { "Accept": "application/ld+json" },
+    });
+    for (
+      const [label, keyId] of [
+        ["sig1", new URL("https://example.com/missing-key")],
+        ["sig2", rsaPublicKey2.id!],
+      ] as const
+    ) {
+      request = await signRequest(request, rsaPrivateKey2, keyId, {
+        spec: "rfc9421",
+        rfc9421: { label },
+      });
+    }
+    for (const maxHttpSignatures of [undefined, 1]) {
+      const federation = createFederation<void>({
+        kv,
+        documentLoaderFactory: () => mockDocumentLoader,
+        contextLoaderFactory: () => mockDocumentLoader,
+        maxHttpSignatures,
+      });
+      const ctx = federation.createContext(request, undefined);
+      assertEquals(
+        await ctx.getSignedKey(),
+        maxHttpSignatures == null ? rsaPublicKey2 : null,
+      );
+    }
+  });
 });
 
 test("Federation.fetch()", async (t) => {
@@ -3478,7 +3611,7 @@ test("Federation.setOutboxListeners()", async (t) => {
       const records: LogRecord[] = [];
       await reset();
       fetchMock.spyGlobal();
-      fetchMock.post("https://remote.example/inbox", {
+      fetchMock.post("https://example.com/inbox", {
         status: 202,
         body: "Accepted",
       });
@@ -3516,7 +3649,7 @@ test("Federation.setOutboxListeners()", async (t) => {
               { identifier: ctx.identifier },
               new vocab.Person({
                 id: new URL("https://remote.example/users/alice"),
-                inbox: new URL("https://remote.example/inbox"),
+                inbox: new URL("https://example.com/inbox"),
               }),
               activity,
             );
@@ -3648,7 +3781,7 @@ test("Federation.setOutboxListeners()", async (t) => {
         let ldsVerified = false;
         await reset();
         fetchMock.spyGlobal();
-        fetchMock.post("https://remote.example/inbox", async (cl) => {
+        fetchMock.post("https://example.com/inbox", async (cl) => {
           const verifyOptions = {
             documentLoader: mockDocumentLoader,
             contextLoader: mockDocumentLoader,
@@ -3693,7 +3826,7 @@ test("Federation.setOutboxListeners()", async (t) => {
                 [{ privateKey: rsaPrivateKey2, keyId: rsaPublicKey2.id! }],
                 {
                   id: new URL("https://remote.example/users/alice"),
-                  inboxId: new URL("https://remote.example/inbox"),
+                  inboxId: new URL("https://example.com/inbox"),
                 },
                 { skipIfUnsigned: true },
               );
@@ -5152,6 +5285,8 @@ test("FederationImpl.processQueuedTask()", async (t) => {
       },
     };
     const federation = new FederationImpl<void>({
+      // This step delivers to a mocked, unresolvable .example inbox.
+      allowPrivateAddress: true,
       kv,
       queue,
     });
@@ -5231,6 +5366,8 @@ test("FederationImpl.processQueuedTask()", async (t) => {
       },
     };
     const federation = new FederationImpl<void>({
+      // This step delivers to a mocked, unresolvable .example inbox.
+      allowPrivateAddress: true,
       kv,
       queue,
     });
@@ -5300,6 +5437,8 @@ test("FederationImpl.processQueuedTask()", async (t) => {
         },
       };
       const federation = new FederationImpl<void>({
+        // This step delivers to a mocked, unresolvable .example inbox.
+        allowPrivateAddress: true,
         kv,
         meterProvider,
         queue,
@@ -5358,6 +5497,8 @@ test("FederationImpl.processQueuedTask()", async (t) => {
         },
       };
       const federation = new FederationImpl<void>({
+        // This step delivers to a mocked, unresolvable .example inbox.
+        allowPrivateAddress: true,
         kv,
         meterProvider,
         queue,
@@ -6703,6 +6844,64 @@ test("FederationImpl.processQueuedTask()", async (t) => {
   );
 
   await t.step(
+    "malformed FEP-ef61 gateways are permanent queued inbox parse errors",
+    async () => {
+      const queuedMessages: Message[] = [];
+      const queue: MessageQueue = {
+        enqueue(message, _options) {
+          queuedMessages.push(message);
+          return Promise.resolve();
+        },
+        listen(_handler, _options) {
+          return Promise.resolve();
+        },
+      };
+      const kv = new MemoryKvStore();
+      let errorCount = 0;
+      const federation = new FederationImpl<void>({
+        kv,
+        queue,
+      });
+      federation.setInboxListeners("/users/{identifier}/inbox", "/inbox")
+        .on(Create, () => {
+          throw new Error("listener should not run");
+        })
+        .onError(() => {
+          errorCount++;
+        });
+      await federation.processQueuedTask(
+        undefined,
+        {
+          type: "inbox",
+          id: crypto.randomUUID(),
+          baseUrl: "https://example.com",
+          activity: {
+            "@context": [
+              "https://www.w3.org/ns/activitystreams",
+              "https://w3id.org/fep/ef61",
+            ],
+            id: "https://remote.example/activities/invalid-gateway",
+            type: "Create",
+            actor: "https://remote.example/users/alice",
+            // A gateway must not have a path:
+            object: {
+              id: "https://remote.example/users/bob",
+              type: "Person",
+              gateways: ["https://gw.example/path"],
+            },
+          },
+          started: new Date().toISOString(),
+          attempt: 0,
+          identifier: null,
+          traceContext: {},
+        } satisfies InboxMessage,
+      );
+      assertEquals(errorCount, 1);
+      assertEquals(queuedMessages, []);
+    },
+  );
+
+  await t.step(
     "legacy raw LDS inbox messages with network-path context ids retry",
     async () => {
       const queue: MessageQueue = {
@@ -7652,6 +7851,188 @@ test("FederationImpl.processQueuedTask()", async (t) => {
   );
 });
 
+test({
+  name:
+    "FederationImpl.processQueuedTask() accounts for destination validation failures",
+  // The validator skips DNS when Deno has no network permission.
+  ignore: "Deno" in globalThis &&
+    (await Deno.permissions.query({ name: "net" })).state !== "granted",
+  async fn(t) {
+    for (const result of ["throws", "empty", "private"] as const) {
+      for (const failureThreshold of [1, 5]) {
+        for (const redirected of [false, true]) {
+          await t.step(
+            `${result}, threshold: ${failureThreshold}, redirected: ${redirected}`,
+            async () => {
+              const destination = "https://delivery.invalid/inbox";
+              const publicInbox = "https://8.8.8.8/inbox";
+              const queuedMessages: Message[] = [];
+              const delays: (Temporal.Duration | undefined)[] = [];
+              const errors: Error[] = [];
+              const activities: (vocab.Activity | null)[] = [];
+              const attempts: number[] = [];
+              const delay = Temporal.Duration.from({ seconds: 5 });
+              const kv = new MemoryKvStore();
+              await markCircuitBreakerLegacySweepDone(kv);
+              const [meterProvider, recorder] = createTestMeterProvider();
+              const recoveryDelay = Temporal.Duration.from({ minutes: 30 });
+              const federation = new FederationImpl<void>({
+                kv,
+                meterProvider,
+                circuitBreaker: { failureThreshold, recoveryDelay },
+                queue: {
+                  enqueue(message, options) {
+                    queuedMessages.push(message);
+                    delays.push(options?.delay);
+                    return Promise.resolve();
+                  },
+                  listen() {
+                    return Promise.resolve();
+                  },
+                },
+                documentLoaderFactory: () => mockDocumentLoader,
+                contextLoaderFactory: () => mockDocumentLoader,
+                onOutboxError(error, activity) {
+                  errors.push(error);
+                  activities.push(activity);
+                },
+                outboxRetryPolicy(options) {
+                  attempts.push(options.attempts);
+                  return delay;
+                },
+              });
+              const message: OutboxMessage = {
+                type: "outbox",
+                id: crypto.randomUUID(),
+                baseUrl: "https://example.com",
+                keys: [],
+                activity: {
+                  "@context": "https://www.w3.org/ns/activitystreams",
+                  type: "Create",
+                  id: "https://example.com/activities/dns-failure",
+                  actor: "https://example.com/users/alice",
+                  object: { type: "Note", content: "test" },
+                },
+                activityType: "https://www.w3.org/ns/activitystreams#Create",
+                inbox: redirected ? publicInbox : destination,
+                sharedInbox: false,
+                started: new Date().toISOString(),
+                attempt: 0,
+                headers: {},
+                traceContext: {},
+              };
+              const originalLookup = dns.lookup;
+              const resolverError = new Error("Resolver unavailable");
+              const lookups: string[] = [];
+              dns.lookup = ((hostname: string) => {
+                lookups.push(hostname);
+                assertEquals(hostname, "delivery.invalid");
+                if (result === "throws") return Promise.reject(resolverError);
+                return Promise.resolve(
+                  result === "empty"
+                    ? []
+                    : [{ address: "127.0.0.1", family: 4 }],
+                );
+              }) as typeof dns.lookup;
+              try {
+                fetchMock.mockGlobal().catch(202);
+                if (redirected) {
+                  fetchMock.route(publicInbox, {
+                    status: 307,
+                    headers: { Location: destination },
+                  });
+                }
+                await federation.processQueuedTask(undefined, message);
+                assertEquals(errors.length, 1);
+                const error = errors[0];
+                if (result === "private") {
+                  assertInstanceOf(error, UrlError);
+                  assertEquals(error.reason, "disallowed");
+                } else {
+                  assertInstanceOf(error, FetchError);
+                  assertEquals(error.url.href, destination);
+                  assertInstanceOf(error.cause, UrlError);
+                  assertEquals(error.cause.reason, "dns");
+                  assertStrictEquals(
+                    error.cause.cause,
+                    result === "throws" ? resolverError : undefined,
+                  );
+                }
+                assertEquals(activities.length, 1);
+                assertInstanceOf(activities[0], Create);
+                assertEquals(
+                  activities[0].id?.href,
+                  "https://example.com/activities/dns-failure",
+                );
+                assertEquals(attempts, [0]);
+                const host = new URL(message.inbox).host;
+                const state = await kv.get<
+                  { state: string; failures: string[] }
+                >([
+                  "_fedify",
+                  "circuit",
+                  host,
+                ]);
+                if (result === "private") {
+                  assertEquals(state, undefined);
+                } else {
+                  assertExists(state);
+                  assertEquals(state.failures.length, 1);
+                  assertEquals(
+                    state.state,
+                    failureThreshold === 1 ? "open" : "closed",
+                  );
+                }
+                if (result !== "private" && failureThreshold === 1) {
+                  assertEquals(queuedMessages.length, 1);
+                  const held = queuedMessages[0] as OutboxMessage;
+                  assertEquals(held.attempt, 0);
+                  assertEquals(held.circuitHeld, true);
+                  assertExists(held.circuitHeldSince);
+                  assertEquals(delays, [recoveryDelay]);
+                } else {
+                  assertEquals(queuedMessages, [{ ...message, attempt: 1 }]);
+                  assertEquals(delays, [delay]);
+                }
+                const expectedCount = result === "private" && !redirected
+                  ? 0
+                  : 1;
+                const sent = recorder.getMeasurements(
+                  "activitypub.delivery.sent",
+                );
+                assertEquals(sent.length, expectedCount);
+                if (expectedCount === 1) {
+                  assertEquals(sent[0].value, 1);
+                  assertEquals(
+                    sent[0].attributes["activitypub.delivery.success"],
+                    false,
+                  );
+                  assertEquals(
+                    sent[0].attributes["activitypub.remote.host"],
+                    host,
+                  );
+                }
+                assertEquals(lookups, ["delivery.invalid"]);
+                assertEquals(
+                  fetchMock.callHistory.calls(destination).length,
+                  0,
+                );
+                assertEquals(
+                  fetchMock.callHistory.calls().length,
+                  redirected ? 1 : 0,
+                );
+              } finally {
+                dns.lookup = originalLookup;
+                fetchMock.hardReset();
+              }
+            },
+          );
+        }
+      }
+    }
+  },
+});
+
 test("FederationImpl.processQueuedTask() permanent failure", async (t) => {
   fetchMock.spyGlobal();
 
@@ -7704,6 +8085,8 @@ test("FederationImpl.processQueuedTask() permanent failure", async (t) => {
     const federation = new FederationImpl<void>({
       kv,
       queue,
+      // These delivery-error tests use mocked, unresolvable .example inboxes.
+      allowPrivateAddress: true,
       ...(options.permanentFailureStatusCodes
         ? { permanentFailureStatusCodes: options.permanentFailureStatusCodes }
         : {}),
@@ -8086,6 +8469,8 @@ test("FederationImpl.processQueuedTask() circuit breaker", async (t) => {
     const federation = new FederationImpl<void>({
       kv,
       queue,
+      // These tests deliver to mocked, unresolvable .example inboxes.
+      allowPrivateAddress: true,
       circuitBreaker: options,
       ...federationOptions,
     });
@@ -9489,6 +9874,8 @@ test("FederationImpl.processQueuedTask() queue task metrics", async (t) => {
         kv,
         meterProvider,
         queue,
+        // This test delivers to a mocked, unresolvable .example inbox.
+        allowPrivateAddress: true,
       });
       federation.setInboxListeners("/users/{identifier}/inbox", "/inbox");
 
@@ -10869,6 +11256,98 @@ test({
   },
 });
 
+for (const queued of [false, true]) {
+  test(`ContextImpl.routeActivity() routes the fetched document (queued: ${queued})`, async () => {
+    const id = new URL("https://example.com/verified-create");
+    const genuine = new Create({
+      id,
+      actor: new URL("https://example.com/person"),
+      object: new vocab.Note({ content: "Genuine content" }),
+      to: new URL("https://example.com/recipient"),
+    });
+    const genuineJson = await genuine.toJsonLd({
+      contextLoader: mockDocumentLoader,
+    });
+    const forged = new Create({
+      id,
+      actor: new URL("https://victim.example/actor"),
+      object: new vocab.Note({ content: "Forged content" }),
+      to: new URL("https://attacker.example/recipient"),
+    });
+    const messages: Message[] = [];
+    const queue: MessageQueue = {
+      enqueue(message) {
+        messages.push(message as Message);
+        return Promise.resolve();
+      },
+      async listen() {},
+    };
+    const federation = createFederation<void>({
+      kv: new MemoryKvStore(),
+      documentLoaderFactory: () => async (url, options) =>
+        url === id.href
+          ? { document: genuineJson, documentUrl: id.href, contextUrl: null }
+          : await mockDocumentLoader(url, options),
+      contextLoaderFactory: () => mockDocumentLoader,
+      queue: { inbox: queued ? queue : undefined, outbox: queue },
+      manuallyStartQueue: true,
+    });
+    const received: unknown[] = [];
+    const contextDocuments: unknown[] = [];
+    federation.setInboxListeners("/users/{identifier}/inbox", "/inbox")
+      .on(Create, async (ctx, activity) => {
+        received.push(
+          await activity.toJsonLd({
+            contextLoader: mockDocumentLoader,
+          }),
+        );
+        assertInstanceOf(ctx, InboxContextImpl);
+        contextDocuments.push(ctx.activity);
+        await ctx.forwardActivity(
+          { privateKey: ed25519PrivateKey, keyId: ed25519Multikey.id! },
+          {
+            id: new URL("https://example.com/recipient"),
+            inboxId: new URL("https://example.com/inbox"),
+          },
+        );
+      });
+    const ctx = federation.createContext(new URL("https://local.example/"));
+    async function processInbox() {
+      const inboxMessages = messages.filter((message) =>
+        message.type === "inbox"
+      );
+      for (const message of inboxMessages) {
+        await federation.processQueuedTask(undefined, message);
+      }
+    }
+
+    assert(await ctx.routeActivity(null, forged));
+    if (queued) {
+      assertEquals(received, []);
+      assertEquals(messages.length, 1);
+      assert(messages[0].type === "inbox");
+      assertEquals(messages[0].activity, genuineJson);
+      await processInbox();
+    }
+    assertEquals(received, [genuineJson]);
+    assertEquals(contextDocuments, [genuineJson]);
+    const forwarded = messages.filter((message) => message.type === "outbox");
+    assertEquals(forwarded.length, 1);
+    assertEquals(forwarded[0].activity, genuineJson);
+
+    // The forged input has already caused the genuine document to be
+    // processed, so routing the genuine activity later is a safe duplicate.
+    assert(await ctx.routeActivity(null, genuine));
+    if (queued) await processInbox();
+    assertEquals(received, [genuineJson]);
+    assertEquals(contextDocuments, [genuineJson]);
+    assertEquals(
+      messages.filter((message) => message.type === "outbox").length,
+      1,
+    );
+  });
+}
+
 test("ContextImpl.routeActivity() marks queued signed activities as non-LDS", async () => {
   let queuedMessage: InboxMessage | null = null;
   const queue: MessageQueue = {
@@ -10967,6 +11446,71 @@ test("ContextImpl.getCollectionUri()", () => {
   assertThrows(() => ctx.getCollectionUri(notReg, values));
   assertThrows(() => ctx.getCollectionUri(Symbol(notReg), values));
   assertThrows(() => ctx.getCollectionUri(Symbol.for(notReg), values));
+});
+
+test("symbol-named custom collections are served and parsed", async () => {
+  const federation = createFederation<void>({ kv: new MemoryKvStore() });
+  const names = [Symbol("bookmarks"), Symbol("bookmarks")];
+  const paths = ["bookmarks", "ordered-bookmarks"];
+  const calls: Array<[number, string | null]> = [];
+
+  federation.setCollectionDispatcher(
+    names[0],
+    vocab.Object,
+    "/users/{identifier}/bookmarks",
+    (_ctx, _values, cursor) => {
+      calls.push([0, cursor]);
+      return { items: [] };
+    },
+  );
+  federation.setOrderedCollectionDispatcher(
+    names[1],
+    vocab.Object,
+    "/users/{identifier}/ordered-bookmarks",
+    (_ctx, _values, cursor) => {
+      calls.push([1, cursor]);
+      return { items: [] };
+    },
+  );
+
+  const ctx = federation.createContext(new URL("https://example.com/"));
+  for (const [index, name] of names.entries()) {
+    const uri = ctx.getCollectionUri(name, { identifier: "alice" });
+    assertEquals(uri.pathname, `/users/alice/${paths[index]}`);
+    const parsed = ctx.parseUri(uri);
+    assertEquals(
+      parsed?.type,
+      index === 0 ? "collection" : "orderedCollection",
+    );
+    if (parsed?.type !== "collection" && parsed?.type !== "orderedCollection") {
+      throw new Error("Expected a custom collection URI");
+    }
+    assertStrictEquals(parsed.name, name);
+    assertStrictEquals(parsed.class, vocab.Object);
+    assertEquals(parsed.typeId, vocab.Object.typeId);
+    assertEquals(parsed.values, { identifier: "alice" });
+
+    for (const cursor of [null, "next"]) {
+      const pageUri = new URL(uri);
+      if (cursor != null) pageUri.searchParams.set("cursor", cursor);
+      const response = await federation.fetch(
+        new Request(pageUri, {
+          headers: { accept: "application/activity+json" },
+        }),
+        { contextData: undefined },
+      );
+      assertEquals(response.status, 200);
+      const body = await response.json();
+      assert(body !== null && typeof body === "object" && "type" in body);
+      assertEquals(
+        body.type,
+        `${index === 0 ? "Collection" : "OrderedCollection"}${
+          cursor == null ? "" : "Page"
+        }`,
+      );
+    }
+  }
+  assertEquals(calls, [[0, null], [0, "next"], [1, null], [1, "next"]]);
 });
 
 test("InboxContextImpl.forwardActivity()", async (t) => {
@@ -11532,7 +12076,8 @@ test("createFederation() applies publicKeyTtl to cached public keys", async () =
       return await federation.fetch(request, { contextData: undefined });
     };
 
-    const publicKeyKey: KvKey = ["_fedify", "publicKey", keyId];
+    // "2" is the key cache generation; see GHSA-q9f8-5hc7-898f.
+    const publicKeyKey: KvKey = ["_fedify", "publicKey", "2", keyId];
 
     // Verifying the first signed delivery fetches the key and caches it with
     // the TTL the application configured rather than the 30-day default.
@@ -11542,11 +12087,19 @@ test("createFederation() applies publicKeyTtl to cached public keys", async () =
     assert(await kv.get(publicKeyKey) != null);
     assertEquals(kv.lastTtl(publicKeyKey)?.total("day"), 7);
 
-    // While the cache is warm the key is not refetched.
-    keyFetches = 0;
+    // While the cache is warm the key is not refetched.  Delivery still
+    // dereferences the sender's actor document to confirm key ownership
+    // (GHSA-q9f8-5hc7-898f), and that document is served from this very URL,
+    // so count writes to the key cache rather than fetches.
+    const keyCacheWrites = () =>
+      kv.writes.filter((w) =>
+        w.key.length === publicKeyKey.length &&
+        w.key.every((part, i) => part === publicKeyKey[i])
+      ).length;
+    const warmWrites = keyCacheWrites();
     assertEquals((await deliver()).status, 202);
     assertEquals(inbox.length, 2);
-    assertEquals(keyFetches, 0);
+    assertEquals(keyCacheWrites(), warmWrites);
 
     // After the TTL elapses the cache misses, the key is refetched and cached
     // again, and signature verification keeps working through that path.
@@ -11893,4 +12446,543 @@ test("ContextImpl.enqueueTaskMany()", async (t) => {
       strictEqual(queue.enqueued.length, 0);
     },
   );
+});
+
+test("ContextImpl.sendActivity() honors the private-address policy", async (t) => {
+  for (const allowPrivateAddress of [false, true]) {
+    await t.step(`allowPrivateAddress: ${allowPrivateAddress}`, async () => {
+      const inbox = "http://127.0.0.1/inbox";
+      fetchMock.mockGlobal().post(inbox, 202);
+      try {
+        const federation = createFederation<void>({
+          kv: new MemoryKvStore(),
+          allowPrivateAddress,
+        });
+        const ctx = federation.createContext(new URL("https://example.com/"));
+        const send = () =>
+          ctx.sendActivity(
+            { privateKey: ed25519PrivateKey, keyId: ed25519Multikey.id! },
+            new Person({
+              id: new URL("https://example.com/recipient"),
+              inbox: new URL(inbox),
+            }),
+            new Create({
+              id: new URL("https://example.com/activity"),
+              actor: new URL("https://example.com/person"),
+            }),
+            { immediate: true },
+          );
+        if (allowPrivateAddress) {
+          await send();
+          assertEquals(fetchMock.callHistory.calls(inbox).length, 1);
+        } else {
+          await assertRejects(send, UrlError);
+          assertEquals(fetchMock.callHistory.calls(inbox).length, 0);
+        }
+      } finally {
+        fetchMock.hardReset();
+      }
+    });
+  }
+});
+
+test("Federation.fetch() bounds inbox bodies before dispatch", async () => {
+  let dispatched = false;
+  const json = JSON.stringify({
+    "@context": "https://www.w3.org/ns/activitystreams",
+    id: "https://example.com/activities/bounded",
+    type: "Create",
+    actor: "https://example.com/actor",
+  });
+  const size = 16 * 1024 * 1024;
+  const federation = createFederation<void>({
+    kv: new MemoryKvStore(),
+    skipSignatureVerification: true,
+    contextLoaderFactory: () => mockDocumentLoader,
+  });
+  federation.setActorDispatcher("/actors/{identifier}", () =>
+    new Person({
+      id: new URL("https://example.com/actor"),
+    }));
+  federation.setInboxListeners("/actors/{identifier}/inbox", "/inbox")
+    .on(Create, () => {
+      dispatched = true;
+    });
+  for (const contentLength of [undefined, "1", String(size + 1)]) {
+    const response = await federation.fetch(
+      new Request("https://example.com/inbox", {
+        method: "POST",
+        headers: contentLength == null
+          ? {}
+          : { "Content-Length": contentLength },
+        body: json.padEnd(size + 1),
+      }),
+      { contextData: undefined },
+    );
+    assertEquals(response.status, 413);
+    assertFalse(dispatched);
+  }
+  let canceled = false;
+  let pulls = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls++;
+      controller.enqueue(new Uint8Array(64 * 1024));
+    },
+    cancel() {
+      canceled = true;
+    },
+  }, { highWaterMark: 0 });
+  const request = new Request("https://example.com/inbox", {
+    method: "POST",
+    body,
+    duplex: "half",
+  } as RequestInit);
+  const rejected = await federation.fetch(request, { contextData: undefined });
+  assertEquals(rejected.status, 413);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(canceled);
+  assert(pulls <= 260);
+  assertFalse(dispatched);
+  const accepted = await federation.fetch(
+    new Request("https://example.com/inbox", {
+      method: "POST",
+      body: json,
+    }),
+    { contextData: undefined },
+  );
+  assertEquals(accepted.status, 202);
+  assert(dispatched);
+});
+
+function getRawMessage(record: LogRecord): string {
+  return typeof record.rawMessage === "string"
+    ? record.rawMessage
+    : record.rawMessage.join("");
+}
+
+test("Federation.fetch() serves tombstones of objects", async (t) => {
+  const deleted = Temporal.Instant.from("2024-01-15T00:00:00Z");
+  const federation = createFederation<void>({
+    kv: new MemoryKvStore(),
+    documentLoaderFactory: () => mockDocumentLoader,
+    contextLoaderFactory: () => mockDocumentLoader,
+  });
+  federation.setObjectDispatcher(
+    vocab.Note,
+    "/users/{identifier}/notes/{id}",
+    (ctx, values) => {
+      if (values.id === "missing") return null;
+      if (values.id === "deleted") {
+        return new vocab.Tombstone({
+          id: ctx.getObjectUri(vocab.Note, values),
+          formerType: vocab.Note,
+          deleted,
+        });
+      }
+      return new vocab.Note({
+        id: ctx.getObjectUri(vocab.Note, values),
+        content: "Hello",
+      });
+    },
+  );
+  federation.setObjectDispatcher(
+    vocab.Tombstone,
+    "/tombstones/{id}",
+    (ctx, values) =>
+      new vocab.Tombstone({ id: ctx.getObjectUri(vocab.Tombstone, values) }),
+  );
+  federation.setObjectDispatcher(
+    vocab.Object,
+    "/objects/{id}",
+    (ctx, values) =>
+      values.id === "deleted"
+        ? new vocab.Tombstone({ id: ctx.getObjectUri(vocab.Object, values) })
+        : new vocab.Note({ id: ctx.getObjectUri(vocab.Object, values) }),
+  );
+
+  function fetch(path: string, method = "GET"): Promise<Response> {
+    return federation.fetch(
+      new Request(`https://example.com${path}`, {
+        method,
+        headers: { Accept: "application/activity+json" },
+      }),
+      { contextData: undefined },
+    );
+  }
+
+  await t.step("GET responds with 410 Gone and the tombstone", async () => {
+    const response = await fetch("/users/john/notes/deleted");
+    assertEquals(response.status, 410);
+    assertEquals(
+      response.headers.get("Content-Type"),
+      "application/activity+json",
+    );
+    const body = await response.json() as Record<string, unknown>;
+    assertEquals(body.id, "https://example.com/users/john/notes/deleted");
+    assertEquals(body.type, "Tombstone");
+    assertEquals(body.formerType, "as:Note");
+    assertEquals(body.deleted, "2024-01-15T00:00:00Z");
+  });
+
+  await t.step("HEAD responds with 410 Gone without a body", async () => {
+    const response = await fetch("/users/john/notes/deleted", "HEAD");
+    assertEquals(response.status, 410);
+    assertEquals(response.body, null);
+  });
+
+  await t.step("objects and null are served as before", async () => {
+    const response = await fetch("/users/john/notes/123");
+    assertEquals(response.status, 200);
+    const body = await response.json() as Record<string, unknown>;
+    assertEquals(body.type, "Note");
+    const notFound = await fetch("/users/john/notes/missing");
+    assertEquals(notFound.status, 404);
+  });
+
+  await t.step(
+    "Tombstone and Object dispatchers respond with 410",
+    async () => {
+      assertEquals((await fetch("/tombstones/1")).status, 410);
+      assertEquals((await fetch("/objects/deleted")).status, 410);
+      assertEquals((await fetch("/objects/live")).status, 200);
+    },
+  );
+
+  await t.step("RequestContext.getObject()", async () => {
+    const ctx = federation.createContext(
+      new Request("https://example.com/"),
+      undefined,
+    );
+    const values = { identifier: "john", id: "deleted" };
+
+    const defaultPromise = ctx.getObject(vocab.Note, values);
+    type DefaultType = Assert<
+      IsEqual<Awaited<typeof defaultPromise>, vocab.Note | null>
+    >;
+    const defaultTypeCheck: DefaultType = true;
+    void defaultTypeCheck;
+    assertEquals(await defaultPromise, null);
+
+    const suppressPromise = ctx.getObject(vocab.Note, values, {
+      tombstone: "suppress",
+    });
+    type SuppressType = Assert<
+      IsEqual<Awaited<typeof suppressPromise>, vocab.Note | null>
+    >;
+    const suppressTypeCheck: SuppressType = true;
+    void suppressTypeCheck;
+    assertEquals(await suppressPromise, null);
+
+    const emptyOptionsPromise = ctx.getObject(vocab.Note, values, {});
+    type EmptyOptionsType = Assert<
+      IsEqual<Awaited<typeof emptyOptionsPromise>, vocab.Note | null>
+    >;
+    const emptyOptionsTypeCheck: EmptyOptionsType = true;
+    void emptyOptionsTypeCheck;
+    assertEquals(await emptyOptionsPromise, null);
+
+    const passthroughPromise = ctx.getObject(vocab.Note, values, {
+      tombstone: "passthrough",
+    });
+    type PassthroughType = Assert<
+      IsEqual<
+        Awaited<typeof passthroughPromise>,
+        vocab.Note | vocab.Tombstone | null
+      >
+    >;
+    const passthroughTypeCheck: PassthroughType = true;
+    void passthroughTypeCheck;
+    const tombstone = await passthroughPromise;
+    assertInstanceOf(tombstone, vocab.Tombstone);
+    assertEquals(
+      tombstone.id,
+      new URL("https://example.com/users/john/notes/deleted"),
+    );
+    assertEquals(tombstone.deleted, deleted);
+
+    const broadOptions: GetObjectOptions = { tombstone: "passthrough" };
+    const broadPromise = ctx.getObject(vocab.Note, values, broadOptions);
+    type BroadType = Assert<
+      IsEqual<
+        Awaited<typeof broadPromise>,
+        vocab.Note | vocab.Tombstone | null
+      >
+    >;
+    const broadTypeCheck: BroadType = true;
+    void broadTypeCheck;
+    assertInstanceOf(await broadPromise, vocab.Tombstone);
+
+    assertInstanceOf(
+      await ctx.getObject(vocab.Note, { identifier: "john", id: "123" }),
+      vocab.Note,
+    );
+    assertEquals(
+      await ctx.getObject(vocab.Note, { identifier: "john", id: "missing" }, {
+        tombstone: "passthrough",
+      }),
+      null,
+    );
+
+    // A tombstone is not suppressed if it is an instance of the requested
+    // class:
+    assertInstanceOf(
+      await ctx.getObject(vocab.Tombstone, { id: "1" }),
+      vocab.Tombstone,
+    );
+    assertInstanceOf(
+      await ctx.getObject(vocab.Object, { id: "deleted" }, {
+        tombstone: "suppress",
+      }),
+      vocab.Tombstone,
+    );
+  });
+
+  await t.step(
+    "authorization predicates can get the tombstone",
+    async () => {
+      await withLogtapeLock(async () => {
+        const records: LogRecord[] = [];
+        await reset();
+        try {
+          await configure({
+            sinks: {
+              buffer(record: LogRecord): void {
+                records.push(record);
+              },
+            },
+            filters: {},
+            loggers: [
+              { category: ["fedify", "federation"], sinks: ["buffer"] },
+              { category: ["logtape", "meta"], sinks: [] },
+            ],
+          });
+          const federation = createFederation<void>({
+            kv: new MemoryKvStore(),
+            documentLoaderFactory: () => mockDocumentLoader,
+            contextLoaderFactory: () => mockDocumentLoader,
+          });
+          let dispatched = 0;
+          federation.setObjectDispatcher(
+            vocab.Note,
+            "/notes/{id}",
+            (ctx, values) => {
+              dispatched++;
+              return new vocab.Tombstone({
+                id: ctx.getObjectUri(vocab.Note, values),
+              });
+            },
+          ).authorize(async (ctx, values) => {
+            const object = await ctx.getObject(vocab.Note, values, {
+              tombstone: "passthrough",
+            });
+            return object instanceof vocab.Tombstone;
+          });
+          const response = await federation.fetch(
+            new Request("https://example.com/notes/1", {
+              headers: { Accept: "application/activity+json" },
+            }),
+            { contextData: undefined },
+          );
+          assertEquals(response.status, 410);
+          assertEquals(dispatched, 2);
+          assert(
+            records.some((record) =>
+              getRawMessage(record).startsWith("RequestContext.getObject(") &&
+              getRawMessage(record).includes("may cause an infinite loop")
+            ),
+          );
+        } finally {
+          await reset();
+        }
+      });
+    },
+  );
+
+  await t.step("warns about the id of a tombstone", async () => {
+    await withLogtapeLock(async () => {
+      const records: LogRecord[] = [];
+      await reset();
+      try {
+        await configure({
+          sinks: {
+            buffer(record: LogRecord): void {
+              records.push(record);
+            },
+          },
+          filters: {},
+          loggers: [
+            {
+              category: ["fedify", "federation", "object"],
+              sinks: ["buffer"],
+            },
+            { category: ["logtape", "meta"], sinks: [] },
+          ],
+        });
+        const federation = createFederation<void>({
+          kv: new MemoryKvStore(),
+          documentLoaderFactory: () => mockDocumentLoader,
+          contextLoaderFactory: () => mockDocumentLoader,
+        });
+        const ids: Record<string, URL | null> = {
+          "matching": new URL("https://example.com/notes/matching"),
+          "missing": null,
+          "mismatched": new URL("https://example.com/other/mismatched"),
+          "ap": new URL("ap://did%3Akey%3Az6MkTest/notes/ap"),
+          "ap-ef61": new URL("ap+ef61://did%3Akey%3Az6MkTest/notes/ap-ef61"),
+        };
+        federation.setObjectDispatcher(
+          vocab.Note,
+          "/notes/{id}",
+          (_ctx, { id }) =>
+            id === "live"
+              ? new vocab.Note({
+                id: new URL("https://example.com/other/live"),
+              })
+              : new vocab.Tombstone({ id: ids[id] }),
+        );
+        const warnings = async (id: string) => {
+          records.length = 0;
+          const response = await federation.fetch(
+            new Request(`https://example.com/notes/${id}`, {
+              headers: { Accept: "application/activity+json" },
+            }),
+            { contextData: undefined },
+          );
+          assertEquals(response.status, id === "live" ? 200 : 410);
+          return records.filter((r) => r.level === "warning");
+        };
+        assertEquals(await warnings("matching"), []);
+        const missing = await warnings("missing");
+        assertEquals(missing.length, 1);
+        assert(getRawMessage(missing[0]).includes("without an id property"));
+        const mismatched = await warnings("mismatched");
+        assertEquals(mismatched.length, 1);
+        assert(getRawMessage(mismatched[0]).includes("does not match"));
+        assertEquals(
+          mismatched[0].properties.tombstoneId,
+          "https://example.com/other/mismatched",
+        );
+        assertEquals(
+          mismatched[0].properties.objectUri,
+          "https://example.com/notes/mismatched",
+        );
+        assertEquals(await warnings("ap"), []);
+        assertEquals(await warnings("ap-ef61"), []);
+        // Live objects are not checked, as before:
+        assertEquals(await warnings("live"), []);
+      } finally {
+        await reset();
+      }
+    });
+  });
+});
+
+test("createFederation() applies documentLoaderTimeout to built-in loaders", async (t) => {
+  fetchMock.mockGlobal();
+  let requests = 0;
+  fetchMock.get("begin:https://slow.example/", () => {
+    requests++;
+    return new Promise<never>(() => {});
+  });
+  const isTimeout = (error: unknown) => {
+    ok(error instanceof FetchError, String(error));
+    strictEqual(error.response, undefined);
+    ok(error.cause instanceof DOMException);
+    strictEqual(error.cause.name, "TimeoutError");
+    ok(error.message.endsWith("Timed out after 100 ms"), error.message);
+    return true;
+  };
+  try {
+    await t.step("built-in loaders", async () => {
+      const federation = createFederation<void>({
+        kv: new MemoryKvStore(),
+        // Skips DNS lookups, which the mocked host would fail:
+        allowPrivateAddress: true,
+        documentLoaderTimeout: { milliseconds: 100 },
+      });
+      const ctx = federation.createContext(
+        new URL("https://example.com/"),
+        undefined,
+      );
+      await rejects(
+        ctx.documentLoader("https://slow.example/object"),
+        isTimeout,
+      );
+      await rejects(
+        ctx.contextLoader("https://slow.example/context"),
+        isTimeout,
+      );
+      const authLoader = ctx.getDocumentLoader({
+        keyId: new URL("https://example.com/key2"),
+        privateKey: rsaPrivateKey2,
+      });
+      await rejects(authLoader("https://slow.example/private"), isTimeout);
+      strictEqual(requests, 3);
+    });
+
+    await t.step("per-call override and null", async () => {
+      const federation = createFederation<void>({
+        kv: new MemoryKvStore(),
+        allowPrivateAddress: true,
+        documentLoaderTimeout: null,
+      }) as FederationImpl<void>;
+      await rejects(
+        federation.documentLoaderFactory({ timeout: 100 })(
+          "https://slow.example/object",
+        ),
+        isTimeout,
+      );
+      await rejects(
+        federation.authenticatedDocumentLoaderFactory(
+          {
+            keyId: new URL("https://example.com/key2"),
+            privateKey: rsaPrivateKey2,
+          },
+          { timeout: 100 },
+        )("https://slow.example/private"),
+        isTimeout,
+      );
+      // Without a timeout, only the caller's signal ends the call:
+      const controller = new AbortController();
+      const reason = new Error("Canceled by the caller");
+      setTimeout(() => controller.abort(reason), 150);
+      await rejects(
+        federation.documentLoaderFactory()("https://slow.example/object", {
+          signal: controller.signal,
+        }),
+        // Depending on the fetch implementation, the rejection is either
+        // the signal's reason or a generic AbortError:
+        (error) =>
+          error === reason ||
+          error instanceof Error && error.name === "AbortError",
+      );
+    });
+  } finally {
+    fetchMock.hardReset();
+  }
+});
+
+test("createFederation() validates documentLoaderTimeout", () => {
+  for (
+    const documentLoaderTimeout of [
+      { milliseconds: 0 },
+      { seconds: -1 },
+      { days: 25 },
+      { months: 1 },
+    ]
+  ) {
+    throws(
+      () =>
+        createFederation<void>({
+          kv: new MemoryKvStore(),
+          documentLoaderTimeout,
+        }),
+      RangeError,
+    );
+  }
+  createFederation<void>({
+    kv: new MemoryKvStore(),
+    documentLoaderTimeout: Temporal.Duration.from({ seconds: 30 }),
+  });
 });

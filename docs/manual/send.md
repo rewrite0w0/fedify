@@ -192,6 +192,7 @@ export interface Recipient {
   readonly endpoints?: {
     sharedInbox: URL | null;
   } | null;
+  readonly gateways?: readonly URL[];
 }
 ~~~~
 
@@ -804,6 +805,65 @@ the recipients parameter.
 > they are ignored when comparing the URIs.
 
 
+Delivering to portable actors
+-----------------------------
+
+*This API is available since Fedify 2.4.0.*
+
+An [FEP-ef61] portable actor has an `ap:` or `ap+ef61:` URI as its inbox, e.g.,
+`ap://did:key:z6Mk.../actor/inbox`, which no server can receive a `POST`
+request at.  Instead, the servers listed in the actor's `gateways` property
+accept deliveries to the inbox at its compatible identifier, e.g.,
+`https://gateway.example/.well-known/apgateway/did:key:z6Mk.../actor/inbox`,
+and forward them to each other.
+
+`~Context.sendActivity()` and `~InboxContext.forwardActivity()` deliver to such
+an inbox automatically.  Fedify takes the gateways from the recipient's
+`gateways`, in order, or, if it has no valid gateway, from the `@gateway`
+location hints of the inbox URI, and tries at most five of them one after
+another until one accepts the activity.  In particular, a gateway that responds
+with `404 Not Found`, which FEP-ef61 uses for a server that does not accept
+deliveries on behalf of the actor, is not tried again for the activity.
+If no gateway accepts the activity, the whole round of gateways is retried
+according to the [retry policy](./federation.md#outboxretrypolicy), so that
+the round counts as one attempt.  A recipient with no gateway to deliver
+through is skipped with a warning.
+
+Fedify delivers to the gateways that the recipient object names, just as it
+delivers to any inbox URL that a recipient object names.  So make sure that
+recipient objects of portable actors come from their verified actor documents,
+e.g., through `~Context.lookupObject()`.  If you implement
+a [followers collection dispatcher](./collections.md#followers) that returns
+`Recipient` objects instead of actors, include the `~Recipient.gateways` of
+portable followers along with their `~Recipient.inboxId`.
+
+A few options behave differently for portable actors:
+
+`~SendActivityOptions.preferSharedInbox`
+:   Ignored for a recipient whose inbox is an `ap:` or `ap+ef61:` URI, since
+    FEP-ef61 has no shared inbox and gateways synchronize only the actor's
+    own inbox.
+
+`~SendActivityOptions.excludeBaseUris`
+:   Compared with the origins of the recipient's gateways, so that the
+    activity is not delivered directly to the excluded gateways.  The other
+    gateways may still forward it to them.  A recipient whose gateways are
+    all excluded is skipped.
+
+`~SendActivityOptions.orderingKey`
+:   Keeps deliveries to a portable inbox in order by the actor's DID rather
+    than by the origin of a gateway, so that the order holds whichever gateway
+    an activity goes through.
+
+The gateways are fixed when the activity is sent, so queued deliveries do not
+follow later changes of the recipient's `gateways`.  Queue workers of older
+Fedify versions deliver such queued activities only to the first gateway;
+upgrade the workers before the servers that enqueue deliveries if you run
+them separately.
+
+[FEP-ef61]: https://w3id.org/fep/ef61
+
+
 Error handling
 --------------
 
@@ -1082,7 +1142,9 @@ Fedify automatically includes the integrity proof of activities by signing
 them with the sender's private key if the [actor keys dispatcher is
 set](./actor.md#public-keys-of-an-actor) and the actor has any Ed25519 key pair.
 If there are multiple key pairs, Fedify creates the number of integrity proofs
-equal to the number of Ed25519 key pairs.
+equal to the number of Ed25519 key pairs.  An activity containing [FEP-ef61]
+portable objects is the exception: it gets at most one proof, as described in
+[*Choosing the proof key*](#choosing-the-proof-key).
 
 When verifying incoming Object Integrity Proofs, Fedify can resolve Ed25519
 `did:key` verification methods locally.  A proof whose `verificationMethod`
@@ -1104,9 +1166,17 @@ For received portable objects, use `verifyPortableObjectProof()`.  It keeps
 `verifyProof()` focused on cryptographic verification while also enforcing the
 [FEP-ef61] policy: a portable actor, activity, or object must have proofs, every
 proof must use a DID URL, and that DID must match the authority of the portable
-object ID.  The detailed result distinguishes documents outside the policy,
-missing or invalid proofs, unsupported verification methods, DID mismatches,
-and successful verification:
+object ID.  A portable actor must also have a non-empty `gateways` list whose
+items are all HTTP(S) URIs with an empty path, query, and fragment; this is
+checked before the proofs, so the `invalidGateways` reason does not mean that
+the proofs are valid.  When a portable actor omits the JSON-LD mapping for
+`gateways`, as tootik v0.25.4 does, Fedify accepts the otherwise unmapped
+ActivityStreams term only if every proof uses `eddsa-jcs-2022`.  These proofs
+authenticate the original JSON, including the gateway list.
+
+The detailed result distinguishes documents outside the policy, missing or
+invalid proofs, actors without valid gateways, unsupported verification
+methods, DID mismatches, and successful verification:
 
 ~~~~ typescript
 import { verifyPortableObjectProof } from "@fedify/fedify";
@@ -1135,9 +1205,224 @@ async function verifyPortableResponse(response: Response): Promise<void> {
 A portable collection that has proofs is verified in the same way.  A portable
 collection without a proof produces the `unsecuredCollection` result so the
 caller can apply the separate gateway trust policy allowed by [FEP-ef61].
+`verifyPortableObject()` combines both: it verifies proofs like
+`verifyPortableObjectProof()`, and applies the gateway trust policy to
+unsecured collections, given where the collection was retrieved from.
+Property accessors pass that information automatically when you use it as
+their `verifyPortableObject` option; see the [*Portable collections*
+section](./vocab.md#portable-collections) of the vocabulary manual.
 `verifyPortableObjectProof()` examines only the top-level JSON-LD node.  An
 embedded portable object needs its own verification; success for an outer
 activity does not authenticate portable objects nested inside it.
+
+[FEP-8b32]: https://w3id.org/fep/8b32
+[FEP-fe34]: https://w3id.org/fep/fe34
+
+### Compound portable objects
+
+For compound documents containing [FEP-ef61] portable objects, Fedify inboxes
+use a bounded, map-local interoperability profile.  Neither [FEP-8b32] nor
+Verifiable Credential Data Integrity currently specifies this compound-document
+algorithm.
+
+The profile treats each JSON map with a direct literal `proof` property as a
+separate secured document.  Verification removes only that map's `proof` and
+leaves proofs on descendant maps in place.  Replacing a valid child proof
+therefore invalidates an outer proof that covered the original secured child.
+Fedify requires a direct proof.  It does not treat proof aliases, sets, chains,
+or remote references as alternatives.
+
+Every embedded portable map, i.e., a map whose `id` or `@id` is an `ap:` or
+`ap+ef61:` URI or an FEP-ef61 compatible identifier, needs one direct inline
+proof and its own explicit `@context`.  The exception is a key embedded in
+the `publicKey` or `assertionMethod` of a portable actor, such as a gateway
+key, whose ID is the actor's compatible identifier plus a fragment; the
+actor's proof covers it.  Fedify verifies each map against an immutable copy of
+the received JSON and applies the FEP-ef61 portable-ID and controlling-DID
+policy to that map.  It does not copy a parent's context into a child, try
+several proof-removal rules, or fetch an unpinned context from the live
+network.  Inputs that exceed the traversal limits are rejected.  Fedify does not
+return authentication results for only part of a compound document.
+
+This profile authenticates JSON snapshots.  A child proof may be valid when
+verified in isolation even if the parent's active context causes the embedded
+JSON-LD to expand differently.  Proof success does not establish that the
+isolated and embedded expansions are equivalent.
+
+This profile is Fedify's interim interpretation, and may change in Fedify 3.0.
+See the [*Map-local compound proofs*
+section](./portable.md#map-local-compound-proofs) of the *Portable objects*
+chapter.
+
+#### Producing a compound document
+
+`signObject()` captures the secured JSON document that the proof it creates
+covers, and keeps it on the object it returns.  Assigning that object to a
+typed parent and serializing the parent embeds the captured document verbatim,
+so the child keeps its own `@context` and its own proof context even when they
+differ from the parent's:
+
+~~~~ typescript twoslash
+import { signObject } from "@fedify/fedify";
+import { Create, Note } from "@fedify/vocab";
+import { parseIri } from "@fedify/vocab-runtime";
+const noteId = parseIri("ap://did:key:z6Mkabc/objects/1");
+const activityId = parseIri("ap://did:key:z6Mkabc/activities/1");
+const actorId = parseIri("ap://did:key:z6Mkabc/actor");
+const key = null as unknown as CryptoKey;
+const keyId = new URL("did:key:z6Mkabc#z6Mkabc");
+const portableContext = [
+  "https://www.w3.org/ns/activitystreams",
+  "https://w3id.org/security/data-integrity/v1",
+  "https://w3id.org/fep/ef61",
+];
+// ---cut-before---
+const note = await signObject(
+  new Note({ id: noteId, attribution: actorId, content: "Hello" }),
+  key,
+  keyId,
+  { context: portableContext },
+);
+const create = await signObject(
+  new Create({ id: activityId, actor: actorId, object: note }),
+  key,
+  keyId,
+  { context: portableContext },
+);
+const compound = await create.toJsonLd({
+  format: "compact",
+  context: portableContext,
+});
+~~~~
+
+Extracting `compound`'s `object` gives back exactly the bytes `note`'s proof
+covers, and the outer proof covers that same secured child.
+
+Serialize the parent with the same `context` it was signed with.  A proof
+covers one serialization, and a document emitted under a different context is
+a document the proof was never computed over.  This matters most when the
+activity goes out through
+[`sendActivity()`](#sending-an-activity), which
+serializes with the type's default context: omit the `context` option on the
+outer `signObject()` call in that case, so the proof covers the bytes Fedify
+actually sends.  The child keeps its own context either way, which is what
+makes a mismatch on the parent easy to misread as a working document.
+
+The captured document is a snapshot.  It is independent of anything done to
+the returned object afterwards, and `clone()` never carries it, because a
+clone may differ from the document the proof covers.  Sign the clone again
+when it has to be embedded as a secured child.
+
+#### Choosing the proof key
+
+Outside the compound profile, `sendActivity()` signs an activity once for each
+Ed25519 key it is given, which yields a proof set when there are several keys.
+Fedify inboxes reject a proof set in a document that contains a portable
+object, so an activity whose JSON contains a map identified by an `ap:` or
+`ap+ef61:` URI or an FEP-ef61 compatible identifier, whether the activity
+itself or anything embedded in it, gets at most one proof:
+
+ -  An activity that already carries a proof is sent as is.  Fedify does not
+    add another proof to it, not even with the keys from the [actor key pairs
+    dispatcher](./actor.md#public-keys-of-an-actor).
+ -  A portable activity, i.e., one whose ID is an `ap:` or `ap+ef61:` URI or
+    a compatible identifier, is signed only by the key whose ID is a DID URL
+    for the activity's own DID, such as `did:key:z6Mk…#z6Mk…` for
+    `ap://did:key:z6Mk…/activities/1` or
+    `https://example.com/.well-known/apgateway/did:key:z6Mk…/activities/1`,
+    even if it is the only Ed25519 key.  This is the only proof [FEP-ef61]
+    accepts for it.
+ -  With a single Ed25519 key, a non-portable activity is signed by that key.
+
+When no key or more than one key qualifies, or when a non-portable activity
+embeds portable objects and several Ed25519 keys are available,
+`sendActivity()` rejects with a `TypeError` instead of guessing.  Nothing is
+delivered or queued in that case.  To choose the key yourself, pass explicit
+sender keys that contain exactly one Ed25519 key, or sign the activity with
+`signObject()` before sending it.  RSA keys in the same list keep signing the
+HTTP request and the Linked Data Signature as usual:
+
+~~~~ typescript twoslash
+import type { Context } from "@fedify/fedify";
+import type { Create, Recipient } from "@fedify/vocab";
+const ctx = null as unknown as Context<void>;
+const rsaPrivateKey = null as unknown as CryptoKey;
+const ed25519PrivateKey = null as unknown as CryptoKey;
+const recipient = null as unknown as Recipient;
+const activity = null as unknown as Create;
+// ---cut-before---
+await ctx.sendActivity(
+  [
+    {
+      keyId: new URL("https://example.com/users/alice#main-key"),
+      privateKey: rsaPrivateKey,
+    },
+    {
+      keyId: new URL("did:key:z6Mkabc#z6Mkabc"),
+      privateKey: ed25519PrivateKey,
+    },
+  ],
+  recipient,
+  activity,
+);
+~~~~
+
+Regardless of the activity, keys whose IDs are FEP-ef61 compatible
+identifiers, such as the [gateway keys of portable
+actors](./actor.md#gateway-keys-of-portable-actors), never make proofs or
+Linked Data Signatures; they only sign HTTP requests.  An activity whose actor
+is a portable actor, i.e., one whose ID is an `ap:` or `ap+ef61:` URI or
+a compatible identifier, never gets a Linked Data Signature either, and it has
+to have a portable ID or a compatible identifier of the actor's DID; otherwise
+`sendActivity()` rejects with a `TypeError`.  The two forms may be mixed, as
+receivers compare the DIDs, not the forms or the gateways.  A malformed
+compatible identifier, e.g., one with `@gateway` location hints, is rejected
+too.
+
+The Multikey IDs Fedify derives for the actor key pairs dispatcher are
+fragments of the actor URI, such as `…/actor#multikey-1`, or, for portable
+actors, gateway key IDs, not DID URLs.  An unsigned portable activity sent by
+actor identifier is therefore always rejected; send it with explicit sender
+keys or pre-sign it instead.
+
+Fedify also refuses to send an activity with portable objects if any map in it
+already carries a proof set, which happens, for example, when `signObject()`
+is called twice on the same object.  The error names the JSON Pointer of the
+offending `proof`.  For the same reason, it refuses to send one in which an
+embedded map carries a proof but not its own `@context`, which Fedify inboxes
+reject however valid the proof is.  An object that you signed with
+`signObject()` is embedded with its own `@context`, but one parsed from
+a received document is rebuilt under the activity's context, so its proof no
+longer covers it (see the warning below).  This typically happens to
+an `Accept` that embeds the `Follow` it accepts, as Fedify signs activities
+with Object Integrity Proofs by default, so refer to such an object by its ID
+instead, e.g., `new Accept({ object: follow.id })`.  These checks only prevent
+unsupported proof shapes.  They
+do not otherwise validate a proof created with a single key.
+
+> [!WARNING]
+> Several things take a signed child outside this supported path, and each
+> one falls back to ordinary serialization, which rebuilds the child under the
+> parent's context and leaves it unable to verify on its own:
+>
+>  -  An object parsed with `fromJsonLd()`.  Parsing does not establish which
+>     representation was signed, so nothing is captured.  When forwarding an
+>     already signed payload, use
+>     [`forwardActivity()`](./outbox.md#federating-posted-activities) to avoid
+>     a vocabulary-object round trip.
+>  -  An object that already carried a proof.  The profile accepts exactly one
+>     direct proof per map, so sign each object with exactly one key.  Fedify
+>     refuses to send an activity whose portable content carries a proof set;
+>     see [*Choosing the proof key*](#choosing-the-proof-key).
+>  -  A `toJsonLd()` call whose `context` option could hide the marker Fedify
+>     uses to place the captured document, for example a context that aliases
+>     `@id` under a term other than `id`, declares `@nest`, uses an `@id` or
+>     `@type` container, or cannot be resolved from Fedify's preloaded
+>     contexts.
+>  -  A mutation applied to the returned object in place, through a plural
+>     accessor's array or a `proofValue` byte.  The snapshot still holds what
+>     was signed, so the embedded child keeps verifying while the typed object
+>     no longer matches it.
 
 > [!TIP]
 > HTTPS Signatures, Linked Data Signatures, and Object Integrity Proofs can
@@ -1153,10 +1438,6 @@ activity does not authenticate portable objects nested inside it.
 > To support HTTP Signatures, Linked Data Signatures, and Object Integrity
 > Proofs simultaneously, you need to generate both RSA-PKCS#1-v1.5 and Ed25519
 > key pairs for each actor, and store them in the database.
-
-[FEP-8b32]: https://w3id.org/fep/8b32
-[FEP-ef61]: https://w3id.org/fep/ef61
-[FEP-fe34]: https://w3id.org/fep/fe34
 
 
 Activity transformers

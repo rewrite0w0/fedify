@@ -89,6 +89,7 @@ export async function* generateConstructor(
       documentLoader?: DocumentLoader,
       contextLoader?: DocumentLoader,
       tracerProvider?: TracerProvider,
+      verifyPortableObject?: PortableObjectVerifier,
     } = {},
   ) {
   `;
@@ -97,6 +98,7 @@ export async function* generateConstructor(
     this.#documentLoader = options.documentLoader;
     this.#contextLoader = options.contextLoader;
     this.#tracerProvider = options.tracerProvider;
+    this.#verifyPortableObject = options.verifyPortableObject;
     const baseUrl = (options as { baseUrl?: URL }).baseUrl;
     this.#_baseUrl = baseUrl == null ? undefined : new URL(baseUrl.href);
     if ("$warning" in options) {
@@ -208,6 +210,13 @@ export async function* generateCloner(
   yield `
   /**
    * Clones this instance, optionally updating it with the given values.
+   *
+   * A clone never inherits a signed JSON-LD representation retained by
+   * \`signObject()\`: the clone may differ from the document that the proof
+   * covers, so embedding the original secured JSON in a parent document
+   * would be wrong.  Sign the clone again if it has to be embedded as a
+   * secured child.
+   *
    * @param values The values to update the clone with.
    * @param options The options to use for cloning.
    * @returns The cloned instance.
@@ -221,6 +230,7 @@ export async function* generateCloner(
     options: {
       documentLoader?: DocumentLoader,
       contextLoader?: DocumentLoader,
+      verifyPortableObject?: PortableObjectVerifier,
     } = {}
   ): ${type.name} {
     if (this._warning != null) {
@@ -239,6 +249,7 @@ export async function* generateCloner(
       { id: values.id ?? this.id },
       options
     );
+    copyPortableProvenance(this, clone);
     `;
   } else {
     yield `const clone = super.clone(values, options) as unknown as ${type.name};`;

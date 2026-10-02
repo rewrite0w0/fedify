@@ -1,8 +1,104 @@
 import type { DocumentLoader } from "../docloader.ts";
 import jsonld from "../jsonld.ts";
-import { formatIri, haveSameFe34Origin, haveSameIriOrigin } from "../url.ts";
+import {
+  formatIri,
+  fromCompatibleEf61Id,
+  getFe34Origin,
+  haveSameFe34Origin,
+  haveSameIriOrigin,
+  parseIri,
+} from "../url.ts";
+
+/**
+ * Reads expanded gateways, including an unmapped term on portable actors.
+ * The original values and their order are preserved for URL validation by
+ * the caller.  An explicitly mapped FEP-ef61 property always takes precedence.
+ * @internal Used by generated vocabulary classes and portable proof checks.
+ */
+export function getPortableActorGateways(
+  node: Record<string, unknown>,
+  allowUnmapped = true,
+): unknown[] | undefined {
+  const property = "https://w3id.org/fep/ef61/gateways";
+  if (globalThis.Object.hasOwn(node, property)) {
+    return Array.isArray(node[property]) ? node[property] : undefined;
+  }
+  if (
+    !allowUnmapped || typeof node["@id"] !== "string" ||
+    !("http://www.w3.org/ns/ldp#inbox" in node) ||
+    !("https://www.w3.org/ns/activitystreams#outbox" in node)
+  ) return undefined;
+  try {
+    const id = fromCompatibleEf61Id(node["@id"]) ?? node["@id"];
+    if (!getFe34Origin(parseIri(id)).startsWith("did:")) return undefined;
+  } catch (error) {
+    if (error instanceof TypeError) return undefined;
+    throw error;
+  }
+  return Array.isArray(node["_:gateways"]) ? node["_:gateways"] : undefined;
+}
 
 const noJsonLdContext = Symbol("noJsonLdContext");
+
+const documentLoaderWrappers = new WeakMap<
+  DocumentLoader,
+  { readonly base: DocumentLoader; released: boolean }
+>();
+
+/**
+ * Registers a loader wrapper with the shared released-wrapper registry.
+ * Both suppression and snapshot wrappers must use this registry so mixed
+ * chains can be unwrapped.  The caller updates the state on release.
+ * @internal Not a public API.
+ */
+export function registerDocumentLoaderWrapper(
+  loader: DocumentLoader,
+  state: { readonly base: DocumentLoader; released: boolean },
+): void {
+  documentLoaderWrappers.set(loader, state);
+}
+
+/**
+ * Removes released loader wrappers, stopping at the first active wrapper.
+ * Active wrappers retain their operation's suppression or snapshot cache.
+ * @internal Not a public API.
+ */
+export function unwrapReleasedDocumentLoader(
+  base: DocumentLoader,
+): DocumentLoader {
+  for (
+    let state = documentLoaderWrappers.get(base);
+    state?.released;
+    state = documentLoaderWrappers.get(base)
+  ) {
+    base = state.base;
+  }
+  return base;
+}
+
+/**
+ * Lowers context loading failure logs for one accessor operation.  Parsed
+ * objects retain the loader, so release it before returning to the caller.
+ * Released wrappers are unwrapped to avoid accumulating loader chains.
+ * @internal Used by generated vocabulary accessors; not a public API.
+ */
+export function createScopedContextLoader(
+  base: DocumentLoader,
+  suppressError?: boolean,
+): { loader: DocumentLoader; release: () => void } {
+  base = unwrapReleasedDocumentLoader(base);
+  if (!suppressError) return { loader: base, release: () => {} };
+  const state = { base, released: false };
+  const loader: DocumentLoader = (url, options) =>
+    base(url, state.released ? options : { ...options, suppressError: true });
+  registerDocumentLoaderWrapper(loader, state);
+  return {
+    loader,
+    release: () => {
+      state.released = true;
+    },
+  };
+}
 
 /**
  * Options for deciding whether two IRIs should be treated as same-origin.

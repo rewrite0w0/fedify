@@ -1,6 +1,7 @@
 import { createTestMeterProvider, test } from "@fedify/fixture";
 import type { Actor } from "@fedify/vocab";
 import { Image, Link, Person, Tombstone } from "@fedify/vocab";
+import { parseIri } from "@fedify/vocab-runtime";
 import { assertEquals, assertNotEquals } from "@std/assert";
 import type {
   ActorAliasMapper,
@@ -874,4 +875,235 @@ test("handleWebFinger() records webfinger.handle counter and duration", async (t
       );
     },
   );
+});
+
+test("handleWebFinger() for FEP-ef61 portable actors", async (t) => {
+  const did = "did:key:z6Mkabc";
+  const compatibleId = `https://example.com/.well-known/apgateway/${did}/actor`;
+  const gateways: Record<string, URL[]> = {
+    alice: [new URL("https://example.com")],
+    secondary: [
+      new URL("https://primary.example"),
+      new URL("https://example.com"),
+    ],
+    anonymous: [new URL("https://example.com")],
+    nogateway: [],
+  };
+  const actorDispatcher: ActorDispatcher<void> = (_ctx, identifier) => {
+    if (!(identifier in gateways)) return null;
+    return new Person({
+      id: parseIri(`ap://${did}/actor`),
+      preferredUsername: identifier === "anonymous" ? null : "alice",
+      gateways: gateways[identifier],
+    });
+  };
+  const actorAliasMapper: ActorAliasMapper<void> = (_ctx, resource) => {
+    if (resource.href === compatibleId) return { identifier: "alice" };
+    if (resource.protocol === "ap+ef61:") return { identifier: "anonymous" };
+    if (resource.href === "acct:anonymous") return { identifier: "anonymous" };
+    return null;
+  };
+
+  async function query(
+    resource: string,
+    host = "example.com",
+  ): Promise<Response> {
+    const url = new URL(`https://${host}/.well-known/webfinger`);
+    url.searchParams.set("resource", resource);
+    const context = createRequestContext<void>({
+      federation: createFederation<void>({ kv: new MemoryKvStore() }),
+      url,
+      data: undefined,
+      getActorUri(identifier) {
+        return new URL(`${url.origin}/users/${identifier}`);
+      },
+      parseUri: () => null,
+    });
+    return await handleWebFinger(context.request, {
+      context,
+      actorDispatcher,
+      actorAliasMapper,
+      onNotFound: () => new Response("Not found", { status: 404 }),
+    });
+  }
+
+  const selfLink = {
+    rel: "self",
+    href: compatibleId,
+    type: "application/activity+json",
+  };
+
+  await t.step("acct: on the first gateway", async () => {
+    const response = await query("acct:alice@example.com");
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: "acct:alice@example.com",
+      aliases: [compatibleId],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("acct: on a secondary gateway", async () => {
+    const response = await query("acct:secondary@example.com");
+    assertEquals(response.status, 200);
+    const primaryCompatibleId =
+      `https://primary.example/.well-known/apgateway/${did}/actor`;
+    assertEquals(await response.json(), {
+      subject: "acct:alice@primary.example",
+      aliases: [primaryCompatibleId, "acct:secondary@example.com"],
+      links: [{ ...selfLink, href: primaryCompatibleId }],
+    });
+  });
+
+  await t.step("compatible identifier", async () => {
+    const response = await query(compatibleId);
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: "acct:alice@example.com",
+      aliases: [compatibleId],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("portable ID without preferredUsername", async () => {
+    const response = await query(`ap://${did}/actor`);
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: compatibleId,
+      aliases: [],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("acct: without preferredUsername", async () => {
+    const response = await query("acct:anonymous@example.com");
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: "acct:anonymous@example.com",
+      aliases: [compatibleId],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("acct: without a host or preferredUsername", async () => {
+    const response = await query("acct:anonymous");
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: "acct:anonymous",
+      aliases: [compatibleId],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("no gateways", async () => {
+    const response = await query("acct:nogateway@example.com");
+    assertEquals(response.status, 404);
+  });
+
+  await t.step("another host", async () => {
+    const response = await query("acct:alice@primary.example");
+    assertEquals(response.status, 404);
+  });
+});
+
+test("handleWebFinger() for FEP-ef61 compatible-ID actors", async (t) => {
+  const did = "did:key:z6Mkabc";
+  const compatibleId = `https://example.com/.well-known/apgateway/${did}/actor`;
+  const actors: Record<string, { id: string; gateways: URL[] }> = {
+    alice: { id: compatibleId, gateways: [new URL("https://example.com")] },
+    // The compatible identifier is not on the first gateway, which FEP-ef61
+    // does not allow, but the actor is still discoverable:
+    secondary: {
+      id: compatibleId,
+      gateways: [
+        new URL("https://primary.example"),
+        new URL("https://example.com"),
+      ],
+    },
+    // FEP-ef61 forbids location hints in compatible identifiers:
+    malformed: {
+      id: `${compatibleId}?@gateway=https%3A%2F%2Fexample.com`,
+      gateways: [new URL("https://example.com")],
+    },
+    nogateway: { id: compatibleId, gateways: [] },
+  };
+  const actorDispatcher: ActorDispatcher<void> = (_ctx, identifier) => {
+    const actor = actors[identifier];
+    if (actor == null) return null;
+    return new Person({
+      id: new URL(actor.id),
+      preferredUsername: "alice",
+      gateways: actor.gateways,
+    });
+  };
+  const actorAliasMapper: ActorAliasMapper<void> = (_ctx, resource) =>
+    resource.href === compatibleId ? { identifier: "alice" } : null;
+
+  async function query(resource: string): Promise<Response> {
+    const url = new URL("https://example.com/.well-known/webfinger");
+    url.searchParams.set("resource", resource);
+    const context = createRequestContext<void>({
+      federation: createFederation<void>({ kv: new MemoryKvStore() }),
+      url,
+      data: undefined,
+      getActorUri(identifier) {
+        return new URL(`${url.origin}/users/${identifier}`);
+      },
+      parseUri: () => null,
+    });
+    return await handleWebFinger(context.request, {
+      context,
+      actorDispatcher,
+      actorAliasMapper,
+      onNotFound: () => new Response("Not found", { status: 404 }),
+    });
+  }
+
+  const selfLink = {
+    rel: "self",
+    href: compatibleId,
+    type: "application/activity+json",
+  };
+
+  await t.step("acct: on the first gateway", async () => {
+    const response = await query("acct:alice@example.com");
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: "acct:alice@example.com",
+      aliases: [compatibleId],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("compatible identifier", async () => {
+    const response = await query(compatibleId);
+    assertEquals(response.status, 200);
+    assertEquals(await response.json(), {
+      subject: "acct:alice@example.com",
+      aliases: [compatibleId],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("compatible identifier not on the first gateway", async () => {
+    const response = await query("acct:secondary@example.com");
+    assertEquals(response.status, 200);
+    // The self link is the actor's own ID, which the actor document has,
+    // while the domain of the address comes from the first gateway:
+    assertEquals(await response.json(), {
+      subject: "acct:alice@primary.example",
+      aliases: [compatibleId, "acct:secondary@example.com"],
+      links: [selfLink],
+    });
+  });
+
+  await t.step("malformed compatible identifier", async () => {
+    const response = await query("acct:malformed@example.com");
+    assertEquals(response.status, 404);
+  });
+
+  await t.step("no gateways", async () => {
+    const response = await query("acct:nogateway@example.com");
+    assertEquals(response.status, 404);
+  });
 });

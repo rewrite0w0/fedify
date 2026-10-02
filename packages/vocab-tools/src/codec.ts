@@ -6,12 +6,14 @@ import {
   areAllScalarTypes,
   emitOverride,
   getAllProperties,
+  getDataCheck,
   getDecoder,
   getDecoders,
   getEncoders,
   getSubtypes,
   getTypeNames,
   isCompactableType,
+  skipsUnparsable,
 } from "./type.ts";
 
 function* generatePreprocessorBlock(
@@ -43,6 +45,7 @@ function* generatePreprocessorBlock(
             documentLoader: options.documentLoader,
             contextLoader: options.contextLoader,
             tracerProvider: options.tracerProvider,
+            verifyPortableObject: options.verifyPortableObject,
             baseUrl: ${baseUrlExpr},
           });
           if (_result instanceof Error) throw _result;
@@ -95,6 +98,10 @@ export async function* generateEncoder(
       ...options,
       contextLoader: options.contextLoader ?? getDocumentLoader(),
     };
+    // Joins the enclosing frame's signed-value scope, or starts one when this
+    // frame is the outermost.  Only the owning frame puts retained signed
+    // child documents back in place of their placeholders.
+    const signedValues = enterSignedValueScope(options);
   `;
   if (isCompactableType(typeUri, types)) {
     yield `
@@ -127,6 +134,7 @@ export async function* generateEncoder(
         const item = (
       `;
       if (!areAllScalarTypes(property.range, types)) {
+        yield "retainedSignedValueRef(v, signedValues.scope) ?? (";
         yield "v instanceof URL ? formatIri(v) : ";
       }
       const encoders = getEncoders(
@@ -137,6 +145,7 @@ export async function* generateEncoder(
         true,
       );
       for (const code of encoders) yield code;
+      if (!areAllScalarTypes(property.range, types)) yield ")";
       yield `
         );
         compactItems.push(item);
@@ -180,7 +189,9 @@ export async function* generateEncoder(
     }
       if (this.id != null) result["id"] = formatIri(this.id);
       result["@context"] = ${JSON.stringify(type.defaultContext)};
-      return result;
+      return signedValues.owner
+        ? resolveSignedValues(result, signedValues.scope)
+        : result;
     }
     `;
   }
@@ -210,11 +221,13 @@ export async function* generateEncoder(
       let element = (
     `;
     if (!areAllScalarTypes(property.range, types)) {
+      yield "retainedSignedValueRef(v, signedValues.scope) ?? (";
       yield 'v instanceof URL ? { "@id": formatIri(v) } : ';
     }
     for (const code of getEncoders(property.range, types, "v", "options")) {
       yield code;
     }
+    if (!areAllScalarTypes(property.range, types)) yield ")";
     yield `
       );
       if (Array.isArray(element)) {
@@ -265,13 +278,35 @@ export async function* generateEncoder(
         },
       );
     }
-    const docContext = options.context ??
+    let docContext: Parameters<typeof jsonld.compact>[1] = options.context ??
       ${JSON.stringify(type.defaultContext)};
-    const compacted = await jsonld.compact(
+    let compacted = await jsonld.compact(
       values,
       docContext,
       { documentLoader: options.contextLoader },
     );
+  `;
+  if (
+    Object.values(types).some((t) =>
+      t.properties.some((p) => p.extraContext != null)
+    )
+  ) {
+    yield `
+    if (options.context == null) {
+      const currentContexts = Array.isArray(docContext) ? docContext : [docContext];
+      const additionalContexts = getExtraContexts(compacted).filter(
+        context => !currentContexts.includes(context)
+      );
+      if (additionalContexts.length > 0) {
+        docContext = [...currentContexts, ...additionalContexts];
+        compacted = await jsonld.compact(values, docContext, {
+          documentLoader: options.contextLoader,
+        });
+      }
+    }
+    `;
+  }
+  yield `
     if (docContext != null) {
       // Embed context
   `;
@@ -303,13 +338,18 @@ export async function* generateEncoder(
   }
   yield `
     }
-    return compacted;
+    return signedValues.owner
+      ? resolveSignedValues(compacted, signedValues.scope)
+      : compacted;
   }
 
   protected ${emitOverride(typeUri, types)} isCompactable(): boolean {
 `;
   for (const property of type.properties) {
-    if (!property.range.every((r) => isCompactableType(r, types))) {
+    if (
+      property.extraContext != null ||
+      !property.range.every((r) => isCompactableType(r, types))
+    ) {
       yield `
       if (
         this.${await getFieldName(property.uri)} != null &&
@@ -339,6 +379,10 @@ export async function* generateDecoder(
    *                - \`contextLoader\`: The loader for remote JSON-LD contexts.
    *                - \`tracerProvider\`: The OpenTelemetry tracer provider to use.
    *                  If omitted, the global tracer provider is used.
+   *                - \`verifyPortableObject\`: The default FEP-ef61 portable
+   *                  object verifier for the property accessors of the
+   *                  returned object and the objects obtained from it.  It
+   *                  does not verify the given \`json\` itself.
    * @returns The object of this type.
    * @throws {TypeError} If the given \`json\` is invalid.
    */
@@ -348,6 +392,7 @@ export async function* generateDecoder(
       documentLoader?: DocumentLoader,
       contextLoader?: DocumentLoader,
       tracerProvider?: TracerProvider,
+      verifyPortableObject?: PortableObjectVerifier,
       baseUrl?: URL,
     } = {},
   ): Promise<${type.name}> {
@@ -386,6 +431,7 @@ export async function* generateDecoder(
       documentLoader?: DocumentLoader,
       contextLoader?: DocumentLoader,
       tracerProvider?: TracerProvider,
+      verifyPortableObject?: PortableObjectVerifier,
       baseUrl?: URL,
     } = {},
   ): Promise<${type.name}> {
@@ -492,8 +538,11 @@ export async function* generateDecoder(
     const variable = await getFieldName(property.uri, "");
     yield await generateField(property, types, "const ");
     const arrayVariable = `${variable}__array`;
+    const propertyValues = property.uri === "https://w3id.org/fep/ef61/gateways"
+      ? "getPortableActorGateways(values) as typeof values[string]"
+      : `values[${JSON.stringify(property.uri)}]`;
     yield `
-    let ${arrayVariable} = values[${JSON.stringify(property.uri)}];
+    let ${arrayVariable} = ${propertyValues};
     `;
     if (property.functional && property.redundantProperties != null) {
       for (const prop of property.redundantProperties) {
@@ -547,7 +596,13 @@ export async function* generateDecoder(
     yield `
       const decoded =
     `;
+    const lenient = property.range.length == 1 &&
+      skipsUnparsable(property.range[0]);
     if (property.range.length == 1) {
+      if (lenient) {
+        yield getDataCheck(property.range[0], types, "v");
+        yield " ? ";
+      }
       yield getDecoder(
         property.range[0],
         types,
@@ -555,6 +610,7 @@ export async function* generateDecoder(
         "options",
         propertyBaseUrl,
       );
+      if (lenient) yield " : undefined";
     } else {
       const decoders = getDecoders(
         property.range,

@@ -11,7 +11,10 @@ import type {
   Tombstone,
   TraverseCollectionOptions,
 } from "@fedify/vocab";
-import type { DocumentLoader } from "@fedify/vocab-runtime";
+import type {
+  DocumentLoader,
+  PortableObjectVerifier,
+} from "@fedify/vocab-runtime";
 import type {
   LookupWebFingerOptions,
   ResourceDescriptor,
@@ -88,6 +91,29 @@ export interface Context<TContextData> {
   readonly contextLoader: DocumentLoader;
 
   /**
+   * The [FEP-ef61] portable object policy that this context applies to
+   * portable objects it dereferences.  It is `verifyPortableObject()` with
+   * this context's document loader, context loader, and tracer provider as
+   * defaults, which the options passed to it override.
+   *
+   * Since its name is the same as the `verifyPortableObject` option of
+   * property accessors, `lookupObject()`, and `traverseCollection()`, passing
+   * a context as their options applies the policy, e.g.,
+   * `await create.getObject(ctx)`.  Objects parsed with a context as options,
+   * such as activities that inboxes receive, and objects that accessors
+   * fetch with a context as options also use it by default for their
+   * property accessors.  It never verifies an object by itself being
+   * there: it only applies to objects that are dereferenced.
+   *
+   * It is optional only so that custom implementations of this interface
+   * keep working; contexts that Fedify creates always have it.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  readonly verifyPortableObject?: PortableObjectVerifier;
+
+  /**
    * The federation object that this context belongs to.
    * @since 1.6.0
    */
@@ -120,6 +146,38 @@ export interface Context<TContextData> {
   getActorUri(identifier: string): URL;
 
   /**
+   * Builds the [FEP-ef61] portable ID of an actor with the given identifier
+   * under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getActorUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice`.  Such an actor can be served
+   * through the FEP-ef61 gateway endpoint,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice`, by the same actor
+   * dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice`.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.  A `did:key` DID must be
+   *                  encoded in base58-btc, as FEP-ef61 requires; see
+   *                  `exportDidKey()` from `@fedify/vocab-runtime`.
+   * @returns The actor's portable ID.
+   * @throws {RouterError} If no actor dispatcher is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableActorUri(identifier: string, authority: string): URL;
+
+  /**
    * Builds the URI of an object with the given class and values.
    * @param cls The class of the object.
    * @param values The values to pass to the object dispatcher.
@@ -134,12 +192,109 @@ export interface Context<TContextData> {
   ): URL;
 
   /**
+   * Builds the [FEP-ef61] portable ID of an object with the given class and
+   * values under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getObjectUri} builds from
+   * the object dispatcher's path, but the result is an `ap+ef61:` URI whose
+   * authority is the DID, e.g., `ap+ef61://did:key:z6Mk.../notes/123`.
+   * Such an object can be served through the FEP-ef61 gateway endpoint,
+   * `/.well-known/apgateway/did:key:z6Mk.../notes/123`, by the same object
+   * dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string, e.g.,
+   * `ap+ef61://did:key:z6Mk.../notes/123`.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param cls The class of the object.
+   * @param values The values to pass to the object dispatcher.
+   * @param authority The DID that controls the object, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The object's portable ID.
+   * @throws {RouterError} If no object dispatcher is available for the class.
+   * @throws {TypeError} If values are invalid, or the authority is not a DID
+   *                     or is a `did:key` DID that is not encoded in
+   *                     base58-btc.
+   * @since 2.4.0
+   */
+  getPortableObjectUri<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    authority: string,
+  ): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's inbox with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getInboxUri} builds from
+   * the inbox path, but the result is an `ap+ef61:` URI whose authority is
+   * the DID, e.g., `ap+ef61://did:key:z6Mk.../users/alice/inbox`.  If
+   * a portable actor has it as its `inbox` and lists this server in its
+   * `gateways`, this server accepts deliveries to the inbox through
+   * the FEP-ef61 gateway endpoint, e.g.,
+   * `POST /.well-known/apgateway/did:key:z6Mk.../users/alice/inbox`, and
+   * dispatches them to the inbox listeners.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The inbox's portable ID.
+   * @throws {RouterError} If no inbox path is registered.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableInboxUri(identifier: string, authority: string): URL;
+
+  /**
    * Builds the URI of an actor's outbox with the given identifier.
    * @param identifier The actor's identifier.
    * @returns The actor's outbox URI.
    * @throws {RouterError} If no outbox dispatcher is available.
    */
   getOutboxUri(identifier: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's outbox with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getOutboxUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/outbox`.  If a portable actor has
+   * it as its `outbox` and its ID is under the same DID, the collection is
+   * served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/outbox`, by the same
+   * collection dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The outbox's portable ID.
+   * @throws {RouterError} If no outbox dispatcher is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableOutboxUri(identifier: string, authority: string): URL;
 
   /**
    * Builds the URI of an actor's media upload endpoint with the given
@@ -177,6 +332,36 @@ export interface Context<TContextData> {
   getFollowingUri(identifier: string): URL;
 
   /**
+   * Builds the [FEP-ef61] portable ID of an actor's following collection with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getFollowingUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/following`.  If a portable actor has
+   * it as its `following` and its ID is under the same DID, the collection is
+   * served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/following`, by the same
+   * collection dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The following collection's portable ID.
+   * @throws {RouterError} If no following collection is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableFollowingUri(identifier: string, authority: string): URL;
+
+  /**
    * Builds the URI of an actor's followers collection with the given
    * identifier.
    * @param identifier The actor's identifier.
@@ -184,6 +369,36 @@ export interface Context<TContextData> {
    * @throws {RouterError} If no followers collection is available.
    */
   getFollowersUri(identifier: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's followers collection with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getFollowersUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/followers`.  If a portable actor has
+   * it as its `followers` and its ID is under the same DID, the collection is
+   * served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/followers`, by the same
+   * collection dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The followers collection's portable ID.
+   * @throws {RouterError} If no followers collection is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableFollowersUri(identifier: string, authority: string): URL;
 
   /**
    * Builds the URI of an actor's liked collection with the given identifier.
@@ -195,6 +410,36 @@ export interface Context<TContextData> {
   getLikedUri(identifier: string): URL;
 
   /**
+   * Builds the [FEP-ef61] portable ID of an actor's liked collection with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getLikedUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/liked`.  If a portable actor has
+   * it as its `liked` and its ID is under the same DID, the collection is
+   * served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/liked`, by the same
+   * collection dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The liked collection's portable ID.
+   * @throws {RouterError} If no liked collection is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableLikedUri(identifier: string, authority: string): URL;
+
+  /**
    * Builds the URI of an actor's featured collection with the given identifier.
    * @param identifier The actor's identifier.
    * @returns The actor's featured collection URI.
@@ -202,6 +447,36 @@ export interface Context<TContextData> {
    * @since 0.11.0
    */
   getFeaturedUri(identifier: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's featured collection with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getFeaturedUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/featured`.  If a portable actor has
+   * it as its `featured` and its ID is under the same DID, the collection is
+   * served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/featured`, by the same
+   * collection dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The featured collection's portable ID.
+   * @throws {RouterError} If no featured collection is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableFeaturedUri(identifier: string, authority: string): URL;
 
   /**
    * Builds the URI of an actor's featured tags collection with the given
@@ -214,13 +489,69 @@ export interface Context<TContextData> {
   getFeaturedTagsUri(identifier: string): URL;
 
   /**
+   * Builds the [FEP-ef61] portable ID of an actor's featured tags collection with the given
+   * identifier under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getFeaturedTagsUri} builds, but
+   * the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/tags`.  If a portable actor has
+   * it as its `featuredTags` and its ID is under the same DID, the collection is
+   * served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/tags`, by the same
+   * collection dispatcher.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The featured tags collection's portable ID.
+   * @throws {RouterError} If no featured tags collection is available.
+   * @throws {TypeError} If the authority is not a DID, or it is a `did:key`
+   *                     DID that is not encoded in base58-btc.
+   * @since 2.4.0
+   */
+  getPortableFeaturedTagsUri(identifier: string, authority: string): URL;
+
+  /**
    * Determines the type of the URI and extracts the associated data.
+   *
+   * By default, only URIs on this server's origin are recognized.  With
+   * the `portable` option, [FEP-ef61] portable IDs, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice`, and their compatible
+   * identifiers on any gateway, e.g.,
+   * `https://example.com/.well-known/apgateway/did:key:z6Mk.../users/alice`,
+   * are also recognized by the same paths that the gateway endpoint routes
+   * to the dispatchers, and the result has the DID in its `authority`
+   * property.
+   *
+   * The DID of a portable ID is anyone's to choose, so recognizing it does
+   * not mean that this server hosts anything for the DID.  Check that
+   * `authority` is the DID that the application stores for the actor or
+   * object before acting on it:
+   *
+   * ~~~~ typescript
+   * const parsed = ctx.parseUri(follow.objectId, { portable: true });
+   * if (parsed?.type !== "actor") return;
+   * const user = await getUser(parsed.identifier);
+   * if (user == null) return;
+   * if (parsed.authority != null && parsed.authority !== user.did) return;
+   * ~~~~
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
    * @param uri The URI to parse.
+   * @param options Options for parsing the URI.  Since 2.4.0.
    * @returns The result of parsing the URI.  If `null` is given or
    *          the URI is not recognized, `null` is returned.
    * @since 0.9.0
    */
-  parseUri(uri: URL | null): ParseUriResult | null;
+  parseUri(uri: URL | null, options?: ParseUriOptions): ParseUriResult | null;
 
   /**
    * Gets the key pairs for an actor.
@@ -291,7 +622,16 @@ export interface Context<TContextData> {
    * ```
    *
    * It's almost the same as the {@link lookupObject} function, but it uses
-   * the context's document loader and context loader by default.
+   * the context's document loader and context loader by default.  It also
+   * uses {@link Context.verifyPortableObject} as the `verifyPortableObject`
+   * option by default (since 2.4.0), so [FEP-ef61] portable objects,
+   * including portable actors found through WebFinger, are looked up through
+   * their gateways and returned only if they have valid proofs, or, for
+   * collections without proofs, if they are served by gateways that their
+   * owners list.  The returned object uses the same policy by default for
+   * its property accessors.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
    *
    * @param identifier The URI or fediverse handle to look up.
    * @param options Lookup options.
@@ -319,7 +659,9 @@ export interface Context<TContextData> {
    * ```
    *
    * It's almost the same as the {@link traverseCollection} function, but it
-   * uses the context's document loader and context loader by default.
+   * uses the context's document loader and context loader by default.  It
+   * also uses {@link Context.verifyPortableObject} as the
+   * `verifyPortableObject` option by default (since 2.4.0).
    * @param collection The collection to traverse.
    * @param options Options for traversing the collection.
    * @returns An async iterable of each item in the collection.
@@ -506,6 +848,68 @@ export interface Context<TContextData> {
     name: string | symbol,
     values: TParam,
   ): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of a custom collection with the given
+   * name and values under the given DID authority.
+   *
+   * The path is the same as the one {@link Context.getCollectionUri} builds,
+   * but the result is an `ap+ef61:` URI whose authority is the DID, e.g.,
+   * `ap+ef61://did:key:z6Mk.../users/alice/bookmarks`.  If the collection
+   * dispatcher maps the collection to a portable actor under the same DID
+   * with `CustomCollectionCallbackSetters.mapPortableOwner()`, the
+   * collection is served through the FEP-ef61 gateway endpoint, e.g.,
+   * `/.well-known/apgateway/did:key:z6Mk.../users/alice/bookmarks`.
+   *
+   * The returned `URL` keeps the DID authority percent-encoded, because
+   * the `URL` class cannot represent the canonical form.  Use `formatIri()`
+   * from `@fedify/vocab-runtime` to get the canonical string.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param name The name of the collection, which can be a string or a symbol.
+   * @param values The values of the URI parameters.
+   * @param authority The DID that controls the collection, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.
+   * @returns The collection's portable ID.
+   * @throws {RouterError} If no collection dispatcher is available for
+   *                       the name.
+   * @throws {TypeError} If values are invalid, or the authority is not a DID
+   *                     or is a `did:key` DID that is not encoded in
+   *                     base58-btc.
+   * @since 2.4.0
+   */
+  getPortableCollectionUri<TParam extends Record<string, string>>(
+    name: string | symbol,
+    values: TParam,
+    authority: string,
+  ): URL;
+}
+
+/**
+ * Information about an [FEP-ef61] portable object requested through
+ * the gateway endpoint.  See {@link RequestContext.portableRequest}.
+ *
+ * [FEP-ef61]: https://w3id.org/fep/ef61
+ * @since 2.4.0
+ */
+export interface PortableRequest {
+  /**
+   * The DID authority of the requested portable object, e.g.,
+   * `did:key:z6Mk...`.  It comes from the request path, so it is not
+   * evidence that this server hosts objects for the DID.
+   */
+  readonly authority: string;
+
+  /**
+   * The ID of the requested portable object or collection, e.g.,
+   * `ap+ef61://did:key:z6Mk.../notes/123`, without a query.  Like other
+   * portable IDs, the `URL` keeps the DID authority percent-encoded; use
+   * `formatIri()` from `@fedify/vocab-runtime` to get the canonical string.
+   * Each access returns a new `URL` instance.
+   */
+  readonly id: URL;
 }
 
 /**
@@ -523,6 +927,24 @@ export interface GetActorOptions {
 }
 
 /**
+ * Options for {@link RequestContext.getObject}.
+ * @since 2.4.0
+ */
+export interface GetObjectOptions {
+  /**
+   * Controls how tombstoned objects are returned.
+   *
+   * By default, or if set to `"suppress"`, a {@link Tombstone} is returned as
+   * `null`, unless it is an instance of the requested class, e.g., when
+   * the requested class is `Object` or `Tombstone` itself.  In that case,
+   * the tombstone is returned as is, as it is an object of the requested
+   * class.  Set this to `"passthrough"` to always receive a {@link Tombstone}
+   * result instead of `null`.
+   */
+  readonly tombstone?: "suppress" | "passthrough";
+}
+
+/**
  * A context for a request.
  */
 export interface RequestContext<TContextData> extends Context<TContextData> {
@@ -535,6 +957,262 @@ export interface RequestContext<TContextData> extends Context<TContextData> {
    * The URL of the request.
    */
   readonly url: URL;
+
+  /**
+   * Information about the [FEP-ef61] portable object requested through
+   * the gateway endpoint, e.g.,
+   * `GET /.well-known/apgateway/did:key:z6Mk.../notes/123`, which is served
+   * by an object dispatcher, the actor dispatcher, or a collection
+   * dispatcher.  It is `undefined` for ordinary requests.
+   *
+   * The authority comes from the request path, so it is not evidence that
+   * this server hosts objects for the DID.  An object dispatcher or the actor
+   * dispatcher has to check that by itself.  A portable collection is served
+   * only if its owner, which the actor dispatcher looks up without this
+   * property, is a portable actor under the DID.
+   *
+   * It describes the incoming request, so it stays the same in contexts
+   * derived from this one, e.g., by {@link RequestContext.getObject}.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @since 2.4.0
+   */
+  readonly portableRequest?: PortableRequest;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor with the given identifier.
+   * It works the same as {@link Context.getPortableActorUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * The DID in the request comes from the request path, so the default is
+   * only a convenience for building IDs; it is not evidence that this server
+   * hosts the actor for the DID.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.  Defaults to the DID of
+   *                  the requested portable object.
+   * @returns The actor's portable ID.
+   * @throws {RouterError} If no actor dispatcher is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableActorUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an object with the given class and
+   * values.  It works the same as {@link Context.getPortableObjectUri}, except
+   * that the authority can be omitted while handling a portable gateway
+   * request.  In that case, the DID in {@link RequestContext.portableRequest}
+   * is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param cls The class of the object.
+   * @param values The values to pass to the object dispatcher.
+   * @param authority The DID that controls the object, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.  Defaults to the DID of
+   *                  the requested portable object.
+   * @returns The object's portable ID.
+   * @throws {RouterError} If no object dispatcher is available for the class.
+   * @throws {TypeError} If values are invalid, the authority is not a DID,
+   *                     it is a `did:key` DID that is not encoded in
+   *                     base58-btc, or the authority is omitted outside
+   *                     a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableObjectUri<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    authority?: string,
+  ): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's inbox with the given
+   * identifier.  It works the same as {@link Context.getPortableInboxUri},
+   * except that the authority can be omitted while handling a portable object
+   * request, i.e., when {@link RequestContext.portableRequest} is set.  In
+   * that case, its DID is used.  Deliveries to portable inboxes do not set
+   * {@link RequestContext.portableRequest}, so pass the authority explicitly
+   * while handling them.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  It must be a bare DID, without
+   *                  a path, query, or fragment.  Defaults to the DID of
+   *                  the requested portable object, if any.
+   * @returns The inbox's portable ID.
+   * @throws {RouterError} If no inbox path is registered.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableInboxUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's outbox with the given
+   * identifier.  It works the same as {@link Context.getPortableOutboxUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The outbox's portable ID.
+   * @throws {RouterError} If no outbox dispatcher is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableOutboxUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's following collection with the given
+   * identifier.  It works the same as {@link Context.getPortableFollowingUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The following collection's portable ID.
+   * @throws {RouterError} If no following collection is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableFollowingUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's followers collection with the given
+   * identifier.  It works the same as {@link Context.getPortableFollowersUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The followers collection's portable ID.
+   * @throws {RouterError} If no followers collection is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableFollowersUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's liked collection with the given
+   * identifier.  It works the same as {@link Context.getPortableLikedUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The liked collection's portable ID.
+   * @throws {RouterError} If no liked collection is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableLikedUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's featured collection with the given
+   * identifier.  It works the same as {@link Context.getPortableFeaturedUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The featured collection's portable ID.
+   * @throws {RouterError} If no featured collection is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableFeaturedUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of an actor's featured tags collection with the given
+   * identifier.  It works the same as {@link Context.getPortableFeaturedTagsUri}, except that
+   * the authority can be omitted while handling a portable gateway request.
+   * In that case, the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param identifier The actor's identifier.
+   * @param authority The DID that controls the actor, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The featured tags collection's portable ID.
+   * @throws {RouterError} If no featured tags collection is available.
+   * @throws {TypeError} If the authority is not a DID, it is a `did:key` DID
+   *                     that is not encoded in base58-btc, or the authority
+   *                     is omitted outside a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableFeaturedTagsUri(identifier: string, authority?: string): URL;
+
+  /**
+   * Builds the [FEP-ef61] portable ID of a custom collection with the given
+   * name and values.  It works the same as
+   * {@link Context.getPortableCollectionUri}, except that the authority can
+   * be omitted while handling a portable gateway request.  In that case,
+   * the DID in {@link RequestContext.portableRequest} is used.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param name The name of the collection, which can be a string or a symbol.
+   * @param values The values of the URI parameters.
+   * @param authority The DID that controls the collection, e.g.,
+   *                  `did:key:z6Mk...`.  Defaults to the DID of the requested
+   *                  portable object or collection.
+   * @returns The collection's portable ID.
+   * @throws {RouterError} If no collection dispatcher is available for
+   *                       the name.
+   * @throws {TypeError} If values are invalid, the authority is not a DID,
+   *                     it is a `did:key` DID that is not encoded in
+   *                     base58-btc, or the authority is omitted outside
+   *                     a portable gateway request.
+   * @since 2.4.0
+   */
+  getPortableCollectionUri<TParam extends Record<string, string>>(
+    name: string | symbol,
+    values: TParam,
+    authority?: string,
+  ): URL;
 
   /**
    * Creates a new context with the same properties as this one,
@@ -608,7 +1286,8 @@ export interface RequestContext<TContextData> extends Context<TContextData> {
    * @param cls The class to instantiate.
    * @param values The values to pass to the object dispatcher.
    * @returns The object of the given class with the given values, or `null`
-   *          if the object is not found.
+   *          if the object is not found.  Tombstoned objects are suppressed
+   *          unless the tombstone is an instance of `cls`.
    * @throws {Error} If no object dispatcher is available for the class.
    * @throws {TypeError} If values are invalid.
    * @since 0.7.0
@@ -617,6 +1296,65 @@ export interface RequestContext<TContextData> extends Context<TContextData> {
     cls: ConstructorWithTypeId<TObject>,
     values: Record<string, string>,
   ): Promise<TObject | null>;
+
+  /**
+   * Gets an object of the given class, or a {@link Tombstone}, with the given
+   * values.
+   * @param cls The class to instantiate.
+   * @param values The values to pass to the object dispatcher.
+   * @param options Options for getting the object.  Set `options.tombstone`
+   *                to `"passthrough"` to receive tombstoned objects instead
+   *                of `null`.
+   * @returns The object of the given class with the given values,
+   *          a tombstone, or `null` if the object is not found.
+   * @throws {Error} If no object dispatcher is available for the class.
+   * @throws {TypeError} If values are invalid.
+   * @since 2.4.0
+   */
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    options: GetObjectOptions & { readonly tombstone: "passthrough" },
+  ): Promise<TObject | Tombstone | null>;
+
+  /**
+   * Gets an object of the given class with the given values.
+   * @param cls The class to instantiate.
+   * @param values The values to pass to the object dispatcher.
+   * @param options Options for getting the object.
+   * @returns The object of the given class with the given values, or `null`
+   *          if the object is not found.  Tombstoned objects are suppressed
+   *          unless `options.tombstone` is `"passthrough"` or the tombstone
+   *          is an instance of `cls`.
+   * @throws {Error} If no object dispatcher is available for the class.
+   * @throws {TypeError} If values are invalid.
+   * @since 2.4.0
+   */
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    options: GetObjectOptions & { readonly tombstone?: "suppress" | undefined },
+  ): Promise<TObject | null>;
+
+  /**
+   * Gets an object of the given class, or a {@link Tombstone}, with the given
+   * values.
+   * @param cls The class to instantiate.
+   * @param values The values to pass to the object dispatcher.
+   * @param options Options for getting the object.
+   * @returns The object of the given class with the given values,
+   *          a tombstone, or `null` if the object is not found.  This broad
+   *          overload is used when the caller passes an options value whose
+   *          `tombstone` mode is not known statically.
+   * @throws {Error} If no object dispatcher is available for the class.
+   * @throws {TypeError} If values are invalid.
+   * @since 2.4.0
+   */
+  getObject<TObject extends Object>(
+    cls: ConstructorWithTypeId<TObject>,
+    values: Record<string, string>,
+    options: GetObjectOptions,
+  ): Promise<TObject | Tombstone | null>;
 
   /**
    * Gets the public key of the sender, if any exists and it is verified.
@@ -689,6 +1427,57 @@ export interface RequestContext<TContextData> extends Context<TContextData> {
   getSignedKeyOwner(
     options: GetKeyOwnerOptions,
   ): Promise<Actor | null>;
+
+  /**
+   * Checks whether the request is signed by an actor who belongs to
+   * the intended audience of an object, i.e., the owner of the signed key
+   * (see {@link RequestContext.getSignedKeyOwner}) is one of the object's
+   * `to`, `cc`, `bto`, `bcc`, and `audience`, or a member of one of them
+   * according to the `isMember` option.
+   *
+   * Everyone belongs to the audience of a publicly addressed object, so it
+   * returns `true` for such an object even if the request is not signed.
+   *
+   * This can be used in authorization predicates for serving non-public
+   * objects, which [FEP-ef61] requires of gateways serving portable objects.
+   * [FEP-ef61] portable IDs are compared by their canonical forms, so
+   * an `ap:` URI, an `ap+ef61:` URI, and a compatible identifier on any
+   * gateway refer to the same actor.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   *
+   * @param object The object whose audience is checked.
+   * @param options Options for checking the audience.
+   * @returns `true` if the object is publicly addressed, or the request is
+   *          signed by an actor who belongs to its audience.
+   * @since 2.4.0
+   */
+  isSignedByAudience(
+    object: Object,
+    options?: IsSignedByAudienceOptions,
+  ): Promise<boolean>;
+}
+
+/**
+ * Options for {@link RequestContext.isSignedByAudience} method.
+ * @since 2.4.0
+ */
+export interface IsSignedByAudienceOptions extends GetKeyOwnerOptions {
+  /**
+   * Checks whether the actor who signed the request is a member of
+   * an addressee of the object that is not the actor itself, e.g.,
+   * a followers collection.  Fedify does not resolve collections by itself,
+   * as only the application can tell their members reliably.
+   *
+   * It is called for each such addressee in order until it returns `true`.
+   * If it is omitted, only the actors that the object addresses directly
+   * belong to its audience.
+   * @param addressee The ID of the addressee, e.g., the ID of a followers
+   *                  collection.
+   * @param actor The actor who signed the request.
+   * @returns `true` if the actor is a member of the addressee.
+   */
+  isMember?: (addressee: URL, actor: Actor) => boolean | Promise<boolean>;
 }
 
 /**
@@ -840,6 +1629,31 @@ export interface OutboxContext<TContextData> extends Context<TContextData> {
 }
 
 /**
+ * Options for {@link Context.parseUri}.
+ * @since 2.4.0
+ */
+export interface ParseUriOptions {
+  /**
+   * Whether to also recognize [FEP-ef61] portable IDs, i.e., `ap:` and
+   * `ap+ef61:` URIs, and their compatible identifiers on any gateway.
+   * The result of a portable ID has its DID, without percent-encoding, in
+   * the `authority` property, which the caller has to compare with the DID
+   * that it stores for the actor or object, since anyone can make a portable
+   * ID with the same path under another DID.
+   *
+   * Like URIs on this server's origin, a portable ID is recognized by its
+   * path, and its query, e.g., location hints, and fragment are ignored.
+   * A shared inbox is never recognized in a portable ID, and a portable ID
+   * with a malformed DID, or with a `did:key` DID that is not encoded in
+   * base58-btc, is not recognized either.
+   *
+   * [FEP-ef61]: https://w3id.org/fep/ef61
+   * @default `false`
+   */
+  readonly portable?: boolean;
+}
+
+/**
  * A result of parsing an URI.
  */
 export type ParseUriResult =
@@ -849,6 +1663,12 @@ export type ParseUriResult =
   | {
     readonly type: "actor";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of an object URI.
@@ -858,6 +1678,12 @@ export type ParseUriResult =
     readonly class: ConstructorWithTypeId<Object>;
     readonly typeId: URL;
     readonly values: Record<string, string>;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of an shared inbox URI.
@@ -865,6 +1691,7 @@ export type ParseUriResult =
   | {
     readonly type: "inbox";
     readonly identifier: undefined;
+    readonly authority?: undefined;
   }
   /**
    * The case of an personal inbox URI.
@@ -872,6 +1699,12 @@ export type ParseUriResult =
   | {
     readonly type: "inbox";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of an outbox collection URI.
@@ -879,6 +1712,12 @@ export type ParseUriResult =
   | {
     readonly type: "outbox";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a following collection URI.
@@ -886,6 +1725,12 @@ export type ParseUriResult =
   | {
     readonly type: "following";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a followers collection URI.
@@ -893,6 +1738,12 @@ export type ParseUriResult =
   | {
     readonly type: "followers";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a liked collection URI.
@@ -901,6 +1752,12 @@ export type ParseUriResult =
   | {
     readonly type: "liked";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a featured collection URI.
@@ -909,6 +1766,12 @@ export type ParseUriResult =
   | {
     readonly type: "featured";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a featured tags collection URI.
@@ -917,6 +1780,12 @@ export type ParseUriResult =
   | {
     readonly type: "featuredTags";
     readonly identifier: string;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a custom collection URI.
@@ -928,6 +1797,12 @@ export type ParseUriResult =
     readonly class: ConstructorWithTypeId<Object>;
     readonly typeId: URL;
     readonly values: Record<string, string>;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   }
   /**
    * The case of a custom ordered collection URI.
@@ -939,6 +1814,12 @@ export type ParseUriResult =
     readonly class: ConstructorWithTypeId<Object>;
     readonly typeId: URL;
     readonly values: Record<string, string>;
+    /**
+     * The DID of the portable ID, e.g., `did:key:z6Mk...`, or `undefined`
+     * for a URI on this server's origin.  See {@link ParseUriOptions.portable}.
+     * @since 2.4.0
+     */
+    readonly authority?: string;
   };
 
 /**

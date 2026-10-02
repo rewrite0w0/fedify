@@ -1,3 +1,10 @@
+import {
+  observeAttempt,
+  observeCheck,
+  triedKey,
+  verificationObservation,
+  type VerificationObservationOptions,
+} from "./verification.ts";
 import { CryptographicKey } from "@fedify/vocab";
 import { type DocumentLoader, FetchError } from "@fedify/vocab-runtime";
 import { getLogger } from "@logtape/logtape";
@@ -18,6 +25,7 @@ import { encodeHex } from "byte-encodings/hex";
 import {
   decodeDict,
   type Dictionary,
+  encodeDict,
   encodeItem,
   Item,
 } from "structured-field-values";
@@ -37,11 +45,21 @@ import {
   validateAcceptSignature,
 } from "./accept.ts";
 import {
+  bypassKeyCacheReads,
   fetchKeyDetailed,
+  type FetchKeyDetailedResult,
   type FetchKeyErrorResult,
   type KeyCache,
+  type PortableKeyResolvers,
   validateCryptoKey,
 } from "./key.ts";
+import { promoteKeyOwnerEvidence } from "./key-owner-evidence.ts";
+import {
+  type PortableGatewayKeyOptions,
+  resolvePortableActorKey,
+  verifyPortableGatewayKeyDocument,
+} from "./portable-key.ts";
+import { parseKeyIdString } from "./portable-key-id.ts";
 
 const DEFAULT_MAX_REDIRECTION = 20;
 const DOUBLE_KNOCK_TRANSPORT_RETRY_DELAY_MS = 100;
@@ -480,6 +498,115 @@ export function parseRfc9421Signature(
   return result;
 }
 
+/**
+ * Parses the `Signature` header of draft-cavage HTTP Signatures into its
+ * fields, e.g., `keyId` and `headers`.
+ */
+function parseDraftSignature(signature: string): Record<string, string> {
+  return Object.fromEntries(
+    signature.split(",").map((pair) =>
+      pair.match(/^\s*([A-Za-z]+)=(?:"([^"]*)"|(\d+))\s*$/)
+    ).filter((m) => m != null).map((m) =>
+      [m![1], m![2] ?? m![3]] as [string, string]
+    ),
+  );
+}
+
+/**
+ * A signature that a request claims to carry, which is not verified yet.
+ * @internal
+ */
+export interface RequestSignature {
+  /** The ID of the key that the signature claims to be made with. */
+  readonly keyId: URL;
+  /**
+   * The label of an RFC 9421 signature, or `null` for a draft-cavage
+   * signature.
+   */
+  readonly label: string | null;
+  /**
+   * The components that the signature covers, as they are spelled in the
+   * request.  The header names of a draft-cavage signature have no
+   * parameters.
+   */
+  readonly components: readonly AcceptSignatureComponent[];
+}
+
+/**
+ * Lists the HTTP Signatures that a request claims to carry, without verifying
+ * any of them.  Signatures whose key IDs are not URLs are left out.
+ * @param request The request.
+ * @param maxSignatures The maximum number of RFC 9421 signatures to consider,
+ *                      counted the same way as by {@link verifyRequest}, so
+ *                      that the signatures it ignores are not listed either.
+ * @returns The signatures; RFC 9421 ones if the request has
+ *          a `Signature-Input` header, or a draft-cavage one otherwise.
+ * @internal
+ */
+export function listRequestSignatures(
+  request: Request,
+  maxSignatures: number = DEFAULT_MAX_RFC9421_SIGNATURES,
+): RequestSignature[] {
+  const signatureInput = request.headers.get("Signature-Input");
+  if (signatureInput != null) {
+    const signatures: RequestSignature[] = [];
+    const inputs = Object.entries(parseRfc9421SignatureInput(signatureInput));
+    for (const [label, input] of inputs.slice(0, maxSignatures)) {
+      const keyId = parseKeyId(input.keyId);
+      if (keyId == null) continue;
+      signatures.push({ keyId, label, components: input.components });
+    }
+    return signatures;
+  }
+  const signature = request.headers.get("Signature");
+  if (signature == null) return [];
+  const values = parseDraftSignature(signature);
+  const keyId = parseKeyId(values.keyId);
+  if (keyId == null) return [];
+  const components = (values.headers ?? "").split(/\s+/g)
+    .filter((name) => name !== "")
+    .map((name) => ({ value: name, params: {} }));
+  return [{ keyId, label: null, components }];
+}
+
+/**
+ * Makes a copy of a request that carries only one of its RFC 9421 signatures,
+ * so that verifying the copy verifies that signature and no other.
+ * A draft-cavage signature is the only one in its request, so the request is
+ * just copied.
+ * @param request The request, whose body must not be consumed.
+ * @param signature One of the signatures that {@link listRequestSignatures}
+ *                  lists for the request.
+ * @returns The copy of the request.
+ * @internal
+ */
+export function selectRequestSignature(
+  request: Request,
+  signature: RequestSignature,
+): Request {
+  const copy = request.clone() as Request;
+  if (signature.label == null) return copy;
+  const { label } = signature;
+  const pick = (header: string | null): string => {
+    if (header == null) return "";
+    let dict: Dictionary;
+    try {
+      dict = decodeDict(header);
+    } catch {
+      return "";
+    }
+    return Object.hasOwn(dict, label)
+      ? encodeDict(
+        { [label]: (dict as Record<string, Item>)[label] } as Dictionary,
+      )
+      : "";
+  };
+  const headers = new Headers(copy.headers);
+  headers.set("Signature-Input", pick(headers.get("Signature-Input")));
+  headers.set("Signature", pick(headers.get("Signature")));
+  return new Request(copy, { headers });
+}
+
 async function signRequestRfc9421(
   request: Request,
   privateKey: CryptoKey,
@@ -608,6 +735,25 @@ async function signRequestRfc9421(
   return new Request(request, { headers, body });
 }
 
+/**
+ * The default maximum number of RFC 9421 signatures of a request to verify.
+ * @internal
+ */
+export const DEFAULT_MAX_RFC9421_SIGNATURES = 3;
+
+/**
+ * Checks that a maximum number of signatures to verify is a positive safe
+ * integer or `Infinity`.
+ * @param value The value to check.
+ * @param name The name of the option, used in the error message.
+ * @throws {RangeError} Thrown if the value is not valid.
+ * @internal
+ */
+export function validateMaxSignatures(value: number, name: string): void {
+  if (value === Infinity || Number.isSafeInteger(value) && value >= 1) return;
+  throw new RangeError(`${name} must be a positive integer or Infinity.`);
+}
+
 const supportedHashAlgorithms: Record<string, string> = {
   "sha": "SHA-1",
   "sha-256": "SHA-256",
@@ -617,7 +763,7 @@ const supportedHashAlgorithms: Record<string, string> = {
 /**
  * Options for {@link verifyRequest}.
  */
-export interface VerifyRequestOptions {
+export interface VerifyRequestOptions extends VerificationObservationOptions {
   /**
    * The document loader to use for fetching the public key.
    */
@@ -655,6 +801,31 @@ export interface VerifyRequestOptions {
    * @since 1.6.0
    */
   spec?: HttpMessageSignaturesSpec;
+
+  /**
+   * The maximum number of [RFC 9421] signatures of a request to verify.
+   * A request can carry several signatures, each of which may make Fedify
+   * fetch the key that it names, so only the first ones in the order of
+   * the `Signature-Input` header are verified, and the rest are ignored as
+   * if they were absent.  Every signature among the first ones counts, even
+   * if it fails before its key is fetched, e.g., because it is too old, or
+   * names the same key as another one.  The key of a key ID is looked up
+   * only once for all the signatures that name it.
+   *
+   * It has to be a positive integer, or `Infinity` to verify every
+   * signature, which lets a single request make Fedify fetch any number of
+   * keys.  Draft-cavage HTTP Signatures carry a single signature, so this
+   * option does not affect them.
+   *
+   * Three by default.
+   *
+   * [RFC 9421]: https://www.rfc-editor.org/rfc/rfc9421
+   * @throws {RangeError} Thrown by {@link verifyRequest} and
+   *         {@link verifyRequestDetailed} if the value is not a positive
+   *         integer or `Infinity`.
+   * @since 2.4.0
+   */
+  maxSignatures?: number;
 
   /**
    * The OpenTelemetry tracer provider.  If omitted, the global tracer provider
@@ -735,13 +906,22 @@ function keyFetchErrorResult(
   };
 }
 
+/**
+ * Creates the resolvers of keys of FEP-ef61 portable actors, which HTTP
+ * Signature verification alone passes to key lookups.
+ */
+function createPortableKeyResolvers(
+  options: PortableGatewayKeyOptions,
+): PortableKeyResolvers {
+  return {
+    gatewayKey: (document, actor, keyId) =>
+      verifyPortableGatewayKeyDocument(document, actor, keyId, options),
+    actorKey: (keyId) => resolvePortableActorKey(keyId, options),
+  };
+}
+
 function parseKeyId(value: string | undefined): URL | null {
-  if (value == null) return null;
-  try {
-    return new URL(value);
-  } catch {
-    return null;
-  }
+  return value == null ? null : parseKeyIdString(value);
 }
 
 function getKeyFetchErrorName(error: Error): string {
@@ -816,6 +996,8 @@ function recordVerificationResult(
  * @param options Options for verifying the request.
  * @returns The public key of the verified signature, or `null` if the signature
  *          could not be verified.
+ * @throws {RangeError} Thrown if {@link VerifyRequestOptions.maxSignatures}
+ *         is not a positive integer or `Infinity`.
  */
 export async function verifyRequest(
   request: Request,
@@ -832,12 +1014,34 @@ export async function verifyRequest(
  * @param request The request to verify.
  * @param options Options for verifying the request.
  * @returns The verified public key, or a structured verification failure.
+ * @throws {RangeError} Thrown if {@link VerifyRequestOptions.maxSignatures}
+ *         is not a positive integer or `Infinity`.
  * @since 2.1.0
  */
 export async function verifyRequestDetailed(
   request: Request,
   options: VerifyRequestOptions = {},
 ): Promise<VerifyRequestDetailedResult> {
+  if (
+    options[verificationObservation] != null &&
+    options[verificationObservation]?.attempt == null
+  ) {
+    return await observeAttempt(options, "http", async (observation) => {
+      const result = await verifyRequestDetailed(request, {
+        ...options,
+        [verificationObservation]: observation,
+      });
+      if (!result.verified) {
+        observation.attempt!.reason = result.reason.type === "noSignature"
+          ? { type: "noSignature" }
+          : { type: "signatureVerificationFailed" };
+      }
+      return result;
+    }, (result) => result.verified);
+  }
+  if (options.maxSignatures !== undefined) {
+    validateMaxSignatures(options.maxSignatures, "maxSignatures");
+  }
   const tracerProvider = options.tracerProvider ?? trace.getTracerProvider();
   const tracer = tracerProvider.getTracer(
     metadata.name,
@@ -883,7 +1087,11 @@ export async function verifyRequestDetailed(
         }
 
         recordVerificationResult(span, result);
-        if (!result.verified) {
+        if (result.verified) {
+          // Only now that the key has verified the signature may the owner
+          // checks reuse what its portable actor's document told about it:
+          promoteKeyOwnerEvidence(result.key);
+        } else {
           span.setStatus({ code: SpanStatusCode.ERROR });
         }
         return result;
@@ -928,6 +1136,43 @@ async function verifyRequestDraft(
   request: Request,
   span: Span,
   metricsContext: HttpSignatureMetricsContext,
+  options: VerifyRequestOptions = {},
+): Promise<VerifyRequestDetailedResult> {
+  if (options[verificationObservation]?.check != null) {
+    return await verifyRequestDraftInternal(
+      request,
+      span,
+      metricsContext,
+      options,
+    );
+  }
+  let result: VerifyRequestDetailedResult = noSignatureResult();
+  const raw = request.headers.get("Signature");
+  const declared = raw == null ? null : parseDraftSignature(raw)?.keyId ?? null;
+  if (raw == null) return result;
+  await observeCheck(
+    options,
+    { mechanism: "http", spec: "draft-cavage-http-signatures-12", label: null },
+    declared,
+    async (observation) => {
+      result = await verifyRequestDraftInternal(request, span, metricsContext, {
+        ...options,
+        [verificationObservation]: observation,
+      });
+      if (
+        !result.verified && result.reason.type === "keyFetchError" &&
+        observation.check != null
+      ) observation.check.reason = result.reason;
+      return result.verified ? result.key : null;
+    },
+  );
+  return result;
+}
+
+async function verifyRequestDraftInternal(
+  request: Request,
+  span: Span,
+  metricsContext: HttpSignatureMetricsContext,
   {
     documentLoader,
     contextLoader,
@@ -936,6 +1181,7 @@ async function verifyRequestDraft(
     keyCache,
     meterProvider,
     tracerProvider,
+    [verificationObservation]: observation,
   }: VerifyRequestOptions = {},
 ): Promise<VerifyRequestDetailedResult> {
   const logger = getLogger(["fedify", "sig", "http"]);
@@ -962,13 +1208,7 @@ async function verifyRequestDraft(
     );
     return noSignatureResult();
   }
-  const sigValues = Object.fromEntries(
-    sigHeader.split(",").map((pair) =>
-      pair.match(/^\s*([A-Za-z]+)=(?:"([^"]*)"|(\d+))\s*$/)
-    ).filter((m) => m != null).map((m) =>
-      [m![1], m![2] ?? m![3]] as [string, string]
-    ),
-  );
+  const sigValues = parseDraftSignature(sigHeader);
   const parsedKeyId = parseKeyId(sigValues.keyId);
   const dateHeader = request.headers.get("Date");
   if (dateHeader == null) {
@@ -1158,6 +1398,13 @@ async function verifyRequestDraft(
         keyCache,
         tracerProvider,
         meterProvider,
+        portableKeyResolvers: createPortableKeyResolvers({
+          documentLoader,
+          contextLoader,
+          keyCache,
+          tracerProvider,
+          meterProvider,
+        }),
       }),
   );
   const { key, cached, fetchError } = fetchResult;
@@ -1199,6 +1446,7 @@ async function verifyRequestDraft(
   const sig = decodeBase64(signature);
   span?.setAttribute("http_signatures.signature", encodeHex(sig));
   // TODO: support other than RSASSA-PKCS1-v1_5:
+  triedKey({ [verificationObservation]: observation }, key);
   const verified = await crypto.subtle.verify(
     "RSASSA-PKCS1-v1_5",
     key.publicKey,
@@ -1225,12 +1473,10 @@ async function verifyRequestDraft(
           contextLoader,
           timeWindow,
           currentTime,
-          keyCache: {
-            get: () => Promise.resolve(undefined),
-            set: async (keyId, key) => await keyCache?.set(keyId, key),
-          },
+          keyCache: bypassKeyCacheReads(keyCache),
           meterProvider,
           tracerProvider,
+          [verificationObservation]: observation,
         },
       );
     }
@@ -1312,6 +1558,142 @@ async function verifyRfc9421ContentDigest(
   return false;
 }
 
+/**
+ * The result of {@link verifyRfc9421SignatureWithKey}.
+ */
+type Rfc9421SignatureVerification =
+  | {
+    readonly verified: true;
+    readonly algorithm: HttpSignatureMetricAlgorithm;
+  }
+  | {
+    readonly verified: false;
+    readonly algorithm?: HttpSignatureMetricAlgorithm;
+    /**
+     * Whether the signature is well-formed and just does not match the key,
+     * so that another version of the key, e.g., a fresh one instead of
+     * a cached one, might verify it.
+     */
+    readonly mismatched: boolean;
+  };
+
+/**
+ * Verifies one RFC 9421 signature of a request with a key.
+ * @param request The request, whose body may be consumed already.
+ * @param sigInput The parsed `Signature-Input` member of the signature.
+ * @param sigBytes The bytes of the signature.
+ * @param key The public key named by the signature.
+ * @param span The span to record the algorithm and the signature on.
+ * @returns Whether the signature is verified, and the algorithm of the
+ *          signature if it is supported.
+ */
+async function verifyRfc9421SignatureWithKey(
+  request: Request,
+  sigInput: ReturnType<typeof parseRfc9421SignatureInput>[string],
+  sigBytes: Uint8Array,
+  key: CryptographicKey & { publicKey: CryptoKey },
+  span: Span,
+  observationOptions: VerificationObservationOptions = {},
+): Promise<Rfc9421SignatureVerification> {
+  const logger = getLogger(["fedify", "sig", "http"]);
+  // Map algorithm name to WebCrypto algorithm
+  let alg = sigInput.alg?.toLowerCase();
+  if (alg == null) {
+    if (key.publicKey.algorithm.name === "RSASSA-PKCS1-v1_5") {
+      alg = "hash" in key.publicKey.algorithm
+        ? (key.publicKey.algorithm.hash === "SHA-512"
+          ? "rsa-v1_5-sha512"
+          : "rsa-v1_5-sha256")
+        : "rsa-v1_5-sha256";
+    } else if (key.publicKey.algorithm.name === "RSA-PSS") {
+      alg = "rsa-pss-sha512";
+    } else if (key.publicKey.algorithm.name === "ECDSA") {
+      alg = "namedCurve" in key.publicKey.algorithm &&
+          key.publicKey.algorithm.namedCurve === "P-256"
+        ? "ecdsa-p256-sha256"
+        : "ecdsa-p384-sha384";
+    } else if (key.publicKey.algorithm.name === "Ed25519") {
+      alg = "ed25519";
+    }
+  }
+  if (alg) {
+    span?.setAttribute("http_signatures.algorithm", alg);
+  }
+  const algorithm = alg && rfc9421AlgorithmMap[alg];
+  if (!algorithm) {
+    logger.debug(
+      "Failed to verify; unsupported algorithm: {algorithm}",
+      {
+        algorithm: sigInput.alg,
+        supported: Object.keys(rfc9421AlgorithmMap),
+      },
+    );
+    return { verified: false, mismatched: false };
+  }
+  // Only record the algorithm metric attribute after the value matches the
+  // RFC 9421 algorithm map, so attacker-supplied `alg` strings cannot
+  // inflate `http_signatures.algorithm` cardinality.  The cast is safe by
+  // construction: every key of `rfc9421AlgorithmMap` is a member of
+  // `HttpSignatureMetricAlgorithm`.
+  const metricAlgorithm = alg as HttpSignatureMetricAlgorithm;
+
+  // Rebuild the signature base for verification
+  let signatureBase: string;
+  try {
+    signatureBase = createRfc9421SignatureBase(
+      request,
+      sigInput.components,
+      sigInput.parameters,
+    );
+  } catch (error) {
+    logger.debug(
+      "Failed to create signature base for verification: {error}",
+      { error, signatureInput: sigInput },
+    );
+    return { verified: false, algorithm: metricAlgorithm, mismatched: false };
+  }
+  const signatureBaseBytes = new TextEncoder().encode(signatureBase);
+
+  // Verify the signature
+  span?.setAttribute("http_signatures.signature", encodeHex(sigBytes));
+  // A key of another algorithm family cannot verify the signature, and
+  // WebCrypto throws for it rather than returning false, but it may be
+  // a stale copy of a key that has since been rotated, e.g., from RSA to
+  // Ed25519, which a fresh copy of the key could verify:
+  const algorithmName = typeof algorithm === "string"
+    ? algorithm
+    : algorithm.name;
+  if (key.publicKey.algorithm.name !== algorithmName) {
+    logger.debug(
+      "Failed to verify; key {keyId} is not a key for algorithm {algorithm}.",
+      { keyId: sigInput.keyId, algorithm: alg },
+    );
+    return { verified: false, algorithm: metricAlgorithm, mismatched: true };
+  }
+  let verified: boolean;
+  try {
+    triedKey(observationOptions, key);
+    verified = await crypto.subtle.verify(
+      algorithm,
+      key.publicKey,
+      sigBytes.slice(),
+      signatureBaseBytes,
+    );
+  } catch (error) {
+    logger.debug(
+      "Error during signature verification: {error}",
+      { error, keyId: sigInput.keyId, algorithm: sigInput.alg },
+    );
+    return { verified: false, algorithm: metricAlgorithm, mismatched: false };
+  }
+  if (verified) return { verified: true, algorithm: metricAlgorithm };
+  logger.debug(
+    "Failed to verify signature with key {keyId}; signature invalid.",
+    { keyId: sigInput.keyId, signatureBase },
+  );
+  return { verified: false, algorithm: metricAlgorithm, mismatched: true };
+}
+
 async function verifyRequestRfc9421(
   request: Request,
   span: Span,
@@ -1322,6 +1704,8 @@ async function verifyRequestRfc9421(
     timeWindow,
     currentTime,
     keyCache,
+    maxSignatures = DEFAULT_MAX_RFC9421_SIGNATURES,
+    [verificationObservation]: observation,
     meterProvider,
     tracerProvider,
   }: VerifyRequestOptions = {},
@@ -1341,7 +1725,6 @@ async function verifyRequestRfc9421(
     return noSignatureResult();
   }
 
-  const originalRequest = request;
   request = request.clone() as Request;
 
   // Check for required headers
@@ -1380,6 +1763,48 @@ async function verifyRequestRfc9421(
     );
     return invalidSignatureResult(null);
   }
+  // Each signature may make us fetch the key it names, so only the first ones
+  // are verified:
+  if (signatureNames.length > maxSignatures) {
+    logger.debug(
+      "Verifying only the first {maxSignatures} of the {count} signatures " +
+        "in the Signature-Input header; the rest are ignored.",
+      { maxSignatures, count: signatureNames.length },
+    );
+    signatureNames.splice(maxSignatures);
+  }
+
+  // The results of the key lookups for this request by key ID, so that
+  // signatures naming the same key do not look it up again:
+  const keyLookups = new Map<
+    string,
+    FetchKeyDetailedResult<CryptographicKey>
+  >();
+  // The key IDs whose cached keys have been looked up again without the cache:
+  const refreshedKeyIds = new Set<string>();
+  const lookUpKey = (
+    keyId: URL,
+    keyCache: KeyCache | undefined,
+  ): Promise<FetchKeyDetailedResult<CryptographicKey>> =>
+    measureSignatureKeyFetch(
+      meterProvider,
+      "http",
+      () =>
+        fetchKeyDetailed(keyId, CryptographicKey, {
+          documentLoader,
+          contextLoader,
+          keyCache,
+          tracerProvider,
+          meterProvider,
+          portableKeyResolvers: createPortableKeyResolvers({
+            documentLoader,
+            contextLoader,
+            keyCache,
+            tracerProvider,
+            meterProvider,
+          }),
+        }),
+    );
 
   let failure: VerifyRequestDetailedResult = noSignatureResult();
   // Tracks the bounded algorithm of the candidate that ended up as the final
@@ -1399,250 +1824,175 @@ async function verifyRequestRfc9421(
     failure = result;
     failureAlgorithm = algorithm;
   };
+  let body: ArrayBuffer | null = null;
+  let digestValid: boolean | null = null;
 
   for (const sigName of signatureNames) {
-    // Skip if we don't have the signature bytes
-    if (!signatures[sigName]) {
-      setFailure(
-        invalidSignatureResult(parseKeyId(signatureInputs[sigName]?.keyId)),
-      );
-      continue;
-    }
+    let winning: VerifyRequestDetailedResult | undefined;
+    await observeCheck(
+      { [verificationObservation]: observation },
+      { mechanism: "http", spec: "rfc9421", label: sigName },
+      signatureInputs[sigName]?.keyId ?? null,
+      async (candidateObservation) => {
+        // Skip if we don't have the signature bytes
+        if (!signatures[sigName]) {
+          setFailure(
+            invalidSignatureResult(parseKeyId(signatureInputs[sigName]?.keyId)),
+          );
+          return null;
+        }
 
-    const sigInput = signatureInputs[sigName];
-    const sigBytes = signatures[sigName];
-    const keyId = parseKeyId(sigInput.keyId);
+        const sigInput = signatureInputs[sigName];
+        const sigBytes = signatures[sigName];
+        const keyId = parseKeyId(sigInput.keyId);
 
-    // Validate signature input parameters
-    if (!sigInput.keyId) {
-      logger.debug(
-        "Failed to verify; missing keyId in signature {signatureName}.",
-        { signatureName: sigName, signatureInput: signatureInputHeader },
-      );
-      setFailure(invalidSignatureResult(null));
-      continue;
-    }
+        // Validate signature input parameters
+        if (!sigInput.keyId) {
+          logger.debug(
+            "Failed to verify; missing keyId in signature {signatureName}.",
+            { signatureName: sigName, signatureInput: signatureInputHeader },
+          );
+          setFailure(invalidSignatureResult(null));
+          return null;
+        }
 
-    if (!sigInput.created) {
-      logger.debug(
-        "Failed to verify; missing created timestamp in signature {signatureName}.",
-        { signatureName: sigName, signatureInput: signatureInputHeader },
-      );
-      setFailure(invalidSignatureResult(keyId));
-      continue;
-    }
+        if (!sigInput.created) {
+          logger.debug(
+            "Failed to verify; missing created timestamp in signature {signatureName}.",
+            { signatureName: sigName, signatureInput: signatureInputHeader },
+          );
+          setFailure(invalidSignatureResult(keyId));
+          return null;
+        }
 
-    // Check timestamp validity
-    const signatureCreated = Temporal.Instant.fromEpochMilliseconds(
-      sigInput.created * 1000,
+        // Check timestamp validity
+        const signatureCreated = Temporal.Instant.fromEpochMilliseconds(
+          sigInput.created * 1000,
+        );
+        const now = currentTime ?? Temporal.Now.instant();
+
+        if (timeWindow !== false) {
+          const tw: Temporal.Duration | Temporal.DurationLike = timeWindow ??
+            { hours: 1 };
+          if (Temporal.Instant.compare(signatureCreated, now.add(tw)) > 0) {
+            logger.debug(
+              "Failed to verify; signature created time is too far in the future.",
+              { created: signatureCreated.toString(), now: now.toString() },
+            );
+            setFailure(invalidSignatureResult(keyId));
+            return null;
+          } else if (
+            Temporal.Instant.compare(signatureCreated, now.subtract(tw)) < 0
+          ) {
+            logger.debug(
+              "Failed to verify; signature created time is too far in the past.",
+              { created: signatureCreated.toString(), now: now.toString() },
+            );
+            setFailure(invalidSignatureResult(keyId));
+            return null;
+          }
+        }
+
+        // Verify Content-Digest if present and required
+        if (
+          request.method !== "GET" &&
+          request.method !== "HEAD" &&
+          sigInput.components.some((c) => c.value === "content-digest")
+        ) {
+          const contentDigestHeader = request.headers.get("Content-Digest");
+          if (!contentDigestHeader) {
+            logger.debug(
+              "Failed to verify; Content-Digest header required but not found.",
+              { components: sigInput.components },
+            );
+            setFailure(invalidSignatureResult(keyId));
+            return null;
+          }
+
+          // Every signature covers the same body and Content-Digest header.
+          body ??= await request.arrayBuffer();
+          digestValid ??= await verifyRfc9421ContentDigest(
+            contentDigestHeader,
+            body,
+          );
+
+          if (!digestValid) {
+            logger.debug(
+              "Failed to verify; Content-Digest verification failed.",
+              { contentDigest: contentDigestHeader },
+            );
+            setFailure(invalidSignatureResult(keyId));
+            return null;
+          }
+        }
+
+        // Fetch the public key
+        span?.setAttribute("http_signatures.key_id", sigInput.keyId);
+        span?.setAttribute(
+          "http_signatures.created",
+          sigInput.created.toString(),
+        );
+        if (keyId == null) {
+          setFailure(invalidSignatureResult(null));
+          return null;
+        }
+
+        let lookup = keyLookups.get(keyId.href);
+        if (lookup == null) {
+          lookup = await lookUpKey(keyId, keyCache);
+          keyLookups.set(keyId.href, lookup);
+        }
+        while (true) {
+          const { key, cached, fetchError } = lookup;
+          if (fetchError != null) {
+            setFailure(keyFetchErrorResult(keyId, fetchError));
+            break;
+          }
+          if (!key) {
+            logger.debug("Failed to fetch key: {keyId}", {
+              keyId: sigInput.keyId,
+            });
+            setFailure(invalidSignatureResult(keyId));
+            break;
+          }
+          const result = await verifyRfc9421SignatureWithKey(
+            request,
+            sigInput,
+            sigBytes,
+            key,
+            span,
+            { [verificationObservation]: candidateObservation },
+          );
+          if (result.verified) {
+            metricsContext.algorithm = result.algorithm;
+            winning = { verified: true, key, signatureLabel: sigName };
+            return key;
+          }
+          if (result.mismatched && cached && !refreshedKeyIds.has(keyId.href)) {
+            // The cached key may be stale, so look it up again without the cache,
+            // but only once for each key ID, and only for this signature; the
+            // other signatures naming the same key use the fresh one:
+            logger.debug(
+              "Failed to verify with cached key {keyId}; retrying with fresh " +
+                "key...",
+              { keyId: sigInput.keyId },
+            );
+            refreshedKeyIds.add(keyId.href);
+            lookup = await lookUpKey(keyId, bypassKeyCacheReads(keyCache));
+            keyLookups.set(keyId.href, lookup);
+            continue;
+          }
+          setFailure(invalidSignatureResult(keyId), result.algorithm);
+          break;
+        }
+        if (
+          !failure.verified && failure.reason.type === "keyFetchError" &&
+          candidateObservation.check != null
+        ) candidateObservation.check.reason = failure.reason;
+        return null;
+      },
     );
-    const now = currentTime ?? Temporal.Now.instant();
-
-    if (timeWindow !== false) {
-      const tw: Temporal.Duration | Temporal.DurationLike = timeWindow ??
-        { hours: 1 };
-      if (Temporal.Instant.compare(signatureCreated, now.add(tw)) > 0) {
-        logger.debug(
-          "Failed to verify; signature created time is too far in the future.",
-          { created: signatureCreated.toString(), now: now.toString() },
-        );
-        setFailure(invalidSignatureResult(keyId));
-        continue;
-      } else if (
-        Temporal.Instant.compare(signatureCreated, now.subtract(tw)) < 0
-      ) {
-        logger.debug(
-          "Failed to verify; signature created time is too far in the past.",
-          { created: signatureCreated.toString(), now: now.toString() },
-        );
-        setFailure(invalidSignatureResult(keyId));
-        continue;
-      }
-    }
-
-    // Verify Content-Digest if present and required
-    if (
-      request.method !== "GET" &&
-      request.method !== "HEAD" &&
-      sigInput.components.some((c) => c.value === "content-digest")
-    ) {
-      const contentDigestHeader = request.headers.get("Content-Digest");
-      if (!contentDigestHeader) {
-        logger.debug(
-          "Failed to verify; Content-Digest header required but not found.",
-          { components: sigInput.components },
-        );
-        setFailure(invalidSignatureResult(keyId));
-        continue;
-      }
-
-      const body = await request.arrayBuffer();
-      const digestValid = await verifyRfc9421ContentDigest(
-        contentDigestHeader,
-        body,
-      );
-
-      if (!digestValid) {
-        logger.debug(
-          "Failed to verify; Content-Digest verification failed.",
-          { contentDigest: contentDigestHeader },
-        );
-        setFailure(invalidSignatureResult(keyId));
-        continue;
-      }
-    }
-
-    // Fetch the public key
-    span?.setAttribute("http_signatures.key_id", sigInput.keyId);
-    span?.setAttribute("http_signatures.created", sigInput.created.toString());
-    if (keyId == null) {
-      setFailure(invalidSignatureResult(null));
-      continue;
-    }
-
-    const rfcFetchResult = await measureSignatureKeyFetch(
-      meterProvider,
-      "http",
-      () =>
-        fetchKeyDetailed(keyId, CryptographicKey, {
-          documentLoader,
-          contextLoader,
-          keyCache,
-          tracerProvider,
-          meterProvider,
-        }),
-    );
-    const { key, cached, fetchError } = rfcFetchResult;
-
-    if (fetchError != null) {
-      setFailure(keyFetchErrorResult(keyId, fetchError));
-      continue;
-    }
-    if (!key) {
-      logger.debug("Failed to fetch key: {keyId}", { keyId: sigInput.keyId });
-      setFailure(invalidSignatureResult(keyId));
-      continue;
-    }
-
-    // Map algorithm name to WebCrypto algorithm
-    let alg = sigInput.alg?.toLowerCase();
-    if (alg == null) {
-      if (key.publicKey.algorithm.name === "RSASSA-PKCS1-v1_5") {
-        alg = "hash" in key.publicKey.algorithm
-          ? (key.publicKey.algorithm.hash === "SHA-512"
-            ? "rsa-v1_5-sha512"
-            : "rsa-v1_5-sha256")
-          : "rsa-v1_5-sha256";
-      } else if (key.publicKey.algorithm.name === "RSA-PSS") {
-        alg = "rsa-pss-sha512";
-      } else if (key.publicKey.algorithm.name === "ECDSA") {
-        alg = "namedCurve" in key.publicKey.algorithm &&
-            key.publicKey.algorithm.namedCurve === "P-256"
-          ? "ecdsa-p256-sha256"
-          : "ecdsa-p384-sha384";
-      } else if (key.publicKey.algorithm.name === "Ed25519") {
-        alg = "ed25519";
-      }
-    }
-    if (alg) {
-      span?.setAttribute("http_signatures.algorithm", alg);
-    }
-    const algorithm = alg && rfc9421AlgorithmMap[alg];
-    // Only record the algorithm metric attribute after the value matches the
-    // RFC 9421 algorithm map, so attacker-supplied `alg` strings cannot
-    // inflate `http_signatures.algorithm` cardinality.  The cast is safe by
-    // construction: every key of `rfc9421AlgorithmMap` is a member of
-    // `HttpSignatureMetricAlgorithm`.
-    const candidateAlgorithm: HttpSignatureMetricAlgorithm | undefined =
-      algorithm ? (alg as HttpSignatureMetricAlgorithm) : undefined;
-    if (!algorithm) {
-      logger.debug(
-        "Failed to verify; unsupported algorithm: {algorithm}",
-        {
-          algorithm: sigInput.alg,
-          supported: Object.keys(rfc9421AlgorithmMap),
-        },
-      );
-      setFailure(invalidSignatureResult(keyId));
-      continue;
-    }
-
-    // Rebuild the signature base for verification
-    let signatureBase: string;
-    try {
-      signatureBase = createRfc9421SignatureBase(
-        request,
-        sigInput.components,
-        sigInput.parameters,
-      );
-    } catch (error) {
-      logger.debug(
-        "Failed to create signature base for verification: {error}",
-        { error, signatureInput: sigInput },
-      );
-      setFailure(invalidSignatureResult(keyId), candidateAlgorithm);
-      continue;
-    }
-    const signatureBaseBytes = new TextEncoder().encode(signatureBase);
-
-    // Verify the signature
-    span?.setAttribute("http_signatures.signature", encodeHex(sigBytes));
-
-    try {
-      const verified = await crypto.subtle.verify(
-        algorithm,
-        key.publicKey,
-        sigBytes.slice(),
-        signatureBaseBytes,
-      );
-
-      if (verified) {
-        metricsContext.algorithm = candidateAlgorithm;
-        return { verified: true, key, signatureLabel: sigName };
-      } else if (cached) {
-        // If we used a cached key and verification failed, try fetching fresh key
-        logger.debug(
-          "Failed to verify with cached key {keyId}; retrying with fresh key...",
-          { keyId: sigInput.keyId },
-        );
-
-        // Reuse the outer span and metricsContext so the cached-key retry
-        // stays a single observed verification operation: one
-        // `http_signatures.verify` span and one
-        // `activitypub.signature.verification.duration` measurement per
-        // public call.
-        return await verifyRequestRfc9421(
-          originalRequest,
-          span,
-          metricsContext,
-          {
-            documentLoader,
-            contextLoader,
-            timeWindow,
-            currentTime,
-            keyCache: {
-              get: () => Promise.resolve(undefined),
-              set: async (keyId, key) => await keyCache?.set(keyId, key),
-            },
-            spec: "rfc9421",
-            meterProvider,
-            tracerProvider,
-          },
-        );
-      } else {
-        logger.debug(
-          "Failed to verify signature with fetched key {keyId}; signature invalid.",
-          { keyId: sigInput.keyId, signatureBase },
-        );
-        setFailure(invalidSignatureResult(keyId), candidateAlgorithm);
-      }
-    } catch (error) {
-      logger.debug(
-        "Error during signature verification: {error}",
-        { error, keyId: sigInput.keyId, algorithm: sigInput.alg },
-      );
-      setFailure(invalidSignatureResult(keyId), candidateAlgorithm);
-    }
+    if (winning != null) return winning;
   }
 
   metricsContext.algorithm = failureAlgorithm;
@@ -1877,12 +2227,14 @@ async function doubleKnockInternal(
   visited = new Set<string>(),
 ): Promise<Response> {
   const { specDeterminer, log, tracerProvider, signal } = options;
+  signal?.throwIfAborted();
   const maximumRedirection = options.maxRedirection ?? DEFAULT_MAX_REDIRECTION;
   visited.add(request.url);
   const origin = new URL(request.url).origin;
   const firstTrySpec: HttpMessageSignaturesSpec = specDeterminer == null
     ? "rfc9421"
     : await specDeterminer.determineSpec(origin);
+  signal?.throwIfAborted();
 
   // Get the request body once at the top level to avoid multiple clones
   const body = options.body !== undefined
@@ -1897,6 +2249,7 @@ async function doubleKnockInternal(
     identity.keyId,
     { spec: firstTrySpec, tracerProvider, body },
   );
+  signal?.throwIfAborted();
   log?.(signedRequest);
   let response = await fetchDoubleKnockRequest(request, signedRequest, signal);
   // Follow redirects manually to get the final URL:
@@ -1958,6 +2311,7 @@ async function doubleKnockInternal(
       let fulfilled = false;
       let challengeRequest: Request | undefined;
       for (const entry of entries) {
+        signal?.throwIfAborted();
         const rfc9421 = fulfillAcceptSignature(entry, localKeyId, localAlg);
         if (rfc9421 == null) continue;
         logger.debug(
@@ -1989,6 +2343,7 @@ async function doubleKnockInternal(
         }
       }
       if (fulfilled && challengeRequest != null) {
+        signal?.throwIfAborted();
         signedRequest = challengeRequest;
         log?.(signedRequest);
         response = await fetch(signedRequest, { redirect: "manual", signal });
@@ -2037,12 +2392,14 @@ async function doubleKnockInternal(
         statusText: response.statusText,
       },
     );
+    signal?.throwIfAborted();
     signedRequest = await signRequest(
       request,
       identity.privateKey,
       identity.keyId,
       { spec, tracerProvider, body },
     );
+    signal?.throwIfAborted();
     log?.(signedRequest);
     response = await fetchDoubleKnockRequest(request, signedRequest, signal);
     // Follow redirects manually to get the final URL:
