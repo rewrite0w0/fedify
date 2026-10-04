@@ -8,6 +8,30 @@ Version 2.5.0
 
 To be released.
 
+### @fedify/cli
+
+ -  Changed the `fedify nodeinfo` favicon selector to pick a usable bitmap
+    icon more often.  It now skips SVG icons declared with
+    `type="image/svg+xml"`, not just those with a `.svg` URL, and it considers
+    every declared size instead of only the first, so an icon offering a large
+    size is no longer discarded because its smallest size is too small.
+    [[#893], [#1187] by Lee Jeongmin\]
+
+[#893]: https://github.com/fedify-dev/fedify/issues/893
+[#1187]: https://github.com/fedify-dev/fedify/pull/1187
+
+### @fedify/debugger
+
+ -  Added filtering controls to the debug dashboard.  The traces list can
+    now be narrowed down by activity type, and a trace's log table can be
+    narrowed down by category, level, or a free-text search of the message.
+    This makes it easier to find one failed activity or one noisy log
+    category once a federated app has produced more than a few traces.
+    [[#896], [#1204] by Jae-Hyuk-Jang\]
+
+[#896]: https://github.com/fedify-dev/fedify/issues/896
+[#1204]: https://github.com/fedify-dev/fedify/issues/1204
+
 
 Version 2.4.0
 -------------
